@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from threading import Lock
 from typing import Literal
+import urllib.error
+import urllib.request
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -28,6 +31,39 @@ app = FastAPI()
 _state_lock = Lock()
 _last: dict[str, Tick] = {}
 _best_profit_usd: dict[str, float] = {}
+
+
+def _post_opportunity(payload: dict) -> None:
+    url = os.environ.get("TRADER_URL", "").strip()
+    if not url:
+        return
+
+    timeout_s = float(os.environ.get("TRADER_TIMEOUT_SEC", "0.5"))
+
+    label = payload.get("label")
+    stake_usd = payload.get("stake_usd")
+    profit_usd = payload.get("profit_usd")
+    print(f"[TRADER] send label={label} stake_usd={stake_usd} profit_usd={profit_usd} url={url}")
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            try:
+                status = getattr(resp, "status", None)
+            except Exception:
+                status = None
+            print(f"[TRADER] sent label={label} status={status}")
+            return
+    except (urllib.error.URLError, ValueError):
+        print(f"[TRADER] send_failed label={label}")
+        return
 
 
 def _check_arbitrage() -> None:
@@ -64,30 +100,46 @@ def _check_arbitrage() -> None:
         if ask1 >= 1.0 or ask2 >= 1.0:
             continue
 
-        # Liquidity / pool: how many USD we can realistically spend on each leg
-        # (as user-defined approximation): pool_usd_leg = ask * ask_sz
-        # Use the lower pool as max stake, also capped by bankroll.
-        pool1_usd = ask1 * max(0.0, float(sz1))
-        pool2_usd = ask2 * max(0.0, float(sz2))
-
-        t1_bankroll = poly_bankroll_usd if t1.source == "polymarket" else pred_bankroll_usd
-        t2_bankroll = poly_bankroll_usd if t2.source == "polymarket" else pred_bankroll_usd
-
-        max_stake_usd = min(pool1_usd, pool2_usd, bankroll_usd, t1_bankroll, t2_bankroll)
-        if max_stake_usd < min_stake_usd:
-            continue
-
         s = ask1 + ask2
         edge = 1.0 - s
         if edge <= 0.0:
             continue
 
+        # Sizing model: buy the SAME number of shares Q on both legs.
+        # Then payout is the same regardless of which side wins (payout_usd = Q).
+        # Costs per leg differ: cost_leg = Q * ask.
+        sz1_f = max(0.0, float(sz1))
+        sz2_f = max(0.0, float(sz2))
+        pool1_usd = ask1 * sz1_f
+        pool2_usd = ask2 * sz2_f
+
+        t1_bankroll = poly_bankroll_usd if t1.source == "polymarket" else pred_bankroll_usd
+        t2_bankroll = poly_bankroll_usd if t2.source == "polymarket" else pred_bankroll_usd
+
+        q_limits = [
+            sz1_f,
+            sz2_f,
+            (t1_bankroll / ask1) if t1_bankroll > 0 else 0.0,
+            (t2_bankroll / ask2) if t2_bankroll > 0 else 0.0,
+            (bankroll_usd / s) if bankroll_usd > 0 else 0.0,
+        ]
+        q = min(q_limits)
+        if q <= 0.0:
+            continue
+
+        cost1_usd = q * ask1
+        cost2_usd = q * ask2
+        total_cost_usd = q * s
+        profit_usd = q * edge
+
+        if total_cost_usd < min_stake_usd:
+            continue
+        if profit_usd < min_profit_usd:
+            continue
+
         # Expected profit on total spend (stake) using bundle-arb model:
         # ROI on cost = (1 - s) / s
         roi = edge / s
-        profit_usd = max_stake_usd * roi
-        if profit_usd < min_profit_usd:
-            continue
 
         prev_best = _best_profit_usd.get(label)
         if prev_best is not None and profit_usd <= prev_best + 1e-6:
@@ -96,11 +148,51 @@ def _check_arbitrage() -> None:
         _best_profit_usd[label] = profit_usd
 
         if s < 1.0:
+            payload = {
+                "type": "arbitrage",
+                "label": label,
+                "sum": s,
+                "edge": edge,
+                "roi": roi,
+                "shares": q,
+                "stake_usd": total_cost_usd,
+                "payout_usd": q,
+                "profit_usd": profit_usd,
+                "bankroll_usd": bankroll_usd,
+                "min_stake_usd": min_stake_usd,
+                "min_profit_usd": min_profit_usd,
+                "legs": [
+                    {
+                        "source": t1.source,
+                        "side": side1,
+                        "ts": t1.ts.isoformat(),
+                        "ask": ask1,
+                        "ask_sz": float(sz1),
+                        "pool_usd": pool1_usd,
+                        "shares": q,
+                        "stake_usd": cost1_usd,
+                    },
+                    {
+                        "source": t2.source,
+                        "side": side2,
+                        "ts": t2.ts.isoformat(),
+                        "ask": ask2,
+                        "ask_sz": float(sz2),
+                        "pool_usd": pool2_usd,
+                        "shares": q,
+                        "stake_usd": cost2_usd,
+                    },
+                ],
+                "sent_at": datetime.utcnow().isoformat() + "Z",
+            }
+
+            _post_opportunity(payload)
+
             print(
                 f"[ARBITRAGE] {label} sum={s:.4f} edge={edge:.4f} roi={roi:.4f} "
-                f"stake=${max_stake_usd:.2f} profit=${profit_usd:.2f} "
-                f"| leg1 {t1.source}:{side1}@{t1.ts.isoformat()} ask={ask1} sz={float(sz1):.1f} pool=${pool1_usd:.2f} "
-                f"| leg2 {t2.source}:{side2}@{t2.ts.isoformat()} ask={ask2} sz={float(sz2):.1f} pool=${pool2_usd:.2f}"
+                f"shares={q:.2f} cost=${total_cost_usd:.2f} payout=${q:.2f} profit=${profit_usd:.2f} "
+                f"| leg1 {t1.source}:{side1}@{t1.ts.isoformat()} ask={ask1} sz={sz1_f:.1f} stake=${cost1_usd:.2f} pool=${pool1_usd:.2f} "
+                f"| leg2 {t2.source}:{side2}@{t2.ts.isoformat()} ask={ask2} sz={sz2_f:.1f} stake=${cost2_usd:.2f} pool=${pool2_usd:.2f}"
             )
 
 

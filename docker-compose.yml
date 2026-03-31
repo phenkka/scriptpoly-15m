@@ -11,8 +11,21 @@ services:
       PRED_BANKROLL_USD: ${PRED_BANKROLL_USD:-100}
       MIN_STAKE_USD: ${MIN_STAKE_USD:-1}
       MIN_PROFIT_USD: ${MIN_PROFIT_USD:-0}
+      TRADER_URL: ${TRADER_URL:-http://trader:9000/opportunity}
+      TRADER_TIMEOUT_SEC: ${TRADER_TIMEOUT_SEC:-0.5}
     ports:
       - "8000:8000"
+
+  trader:
+    build:
+      context: .
+      dockerfile: trader/Dockerfile
+    container_name: trader
+    restart: unless-stopped
+    environment:
+      TRADER_DRY_RUN: ${TRADER_DRY_RUN:-true}
+    ports:
+      - "9000:9000"
 
   collect_polymarket:
     build:
