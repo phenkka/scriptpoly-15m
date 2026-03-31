@@ -373,6 +373,15 @@ def run_loop(session: requests.Session) -> None:
             market_ends  = ends
             dp           = d or 2
             print_header(market_title, market_id, market_ends, dp)
+            # Пауза 2 сек после перехода на новый рынок
+            time.sleep(2.0)
+
+        # Пауза 2 сек до конца рынка (десинхрон с polymarket)
+        if market_ends is not None and now_utc < market_ends:
+            secs_to_end = (market_ends - now_utc).total_seconds()
+            if secs_to_end <= 2.0:
+                time.sleep(0.5)
+                continue
 
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 

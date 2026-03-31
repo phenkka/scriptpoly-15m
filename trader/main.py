@@ -73,19 +73,13 @@ def _cap_opportunity(opp: Opportunity) -> Opportunity:
     for l in opp.legs:
         legs.append(
             OpportunityLeg(
-                **l.model_dump(),
-                shares=l.shares * scale,
-                stake_usd=l.stake_usd * scale,
+                **{**l.model_dump(), "shares": l.shares * scale, "stake_usd": l.stake_usd * scale}
             )
         )
 
     return Opportunity(
-        **opp.model_dump(),
-        shares=opp.shares * scale,
-        stake_usd=opp.stake_usd * scale,
-        payout_usd=opp.payout_usd * scale,
-        profit_usd=opp.profit_usd * scale,
-        legs=legs,
+        **{**opp.model_dump(), "shares": opp.shares * scale, "stake_usd": opp.stake_usd * scale,
+           "payout_usd": opp.payout_usd * scale, "profit_usd": opp.profit_usd * scale, "legs": legs}
     )
 
 
