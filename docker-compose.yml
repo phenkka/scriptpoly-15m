@@ -22,10 +22,25 @@ services:
       dockerfile: trader/Dockerfile
     container_name: trader
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       TRADER_DRY_RUN: ${TRADER_DRY_RUN:-true}
+      TRADER_MAX_TRADE_USD: ${TRADER_MAX_TRADE_USD:-1}
+      TRADER_TIMEOUT_SEC: ${TRADER_TIMEOUT_SEC:-2.0}
+      TRADER_TRADES_FILE: ${TRADER_TRADES_FILE:-/data/trades.jsonl}
+      POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY}
+      POLY_FUNDER: ${POLY_FUNDER}
+      POLY_SIGNATURE_TYPE: ${POLY_SIGNATURE_TYPE:-0}
+      POLY_API_KEY: ${POLY_API_KEY}
+      POLY_SECRET: ${POLY_SECRET}
+      POLY_PASSPHRASE: ${POLY_PASSPHRASE}
+      PREDICT_API_KEY: ${PREDICT_API_KEY}
+      PREDICT_PRIVATE_KEY: ${PREDICT_PRIVATE_KEY}
     ports:
       - "9000:9000"
+    volumes:
+      - ./data:/data
 
   collect_polymarket:
     build:
@@ -43,6 +58,8 @@ services:
       dockerfile: collect/Dockerfile
     container_name: collect-predict
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       ANALYZER_URL: http://analyzer:8000/ingest
       PREDICT_API_KEY: ${PREDICT_API_KEY}

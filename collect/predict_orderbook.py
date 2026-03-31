@@ -385,7 +385,23 @@ def run_loop(session: requests.Session) -> None:
 
             up_payload = {"bid": data.get("up_bid"), "bid_sz": data.get("up_bid_sz", 0.0), "ask": data.get("up_ask"), "ask_sz": data.get("up_ask_sz", 0.0)}
             down_payload = {"bid": data.get("dn_bid"), "bid_sz": data.get("dn_bid_sz", 0.0), "ask": data.get("dn_ask"), "ask_sz": data.get("dn_ask_sz", 0.0)}
-            post_tick(up_payload, down_payload)
+
+            url = os.environ.get("ANALYZER_URL", "").strip()
+            if url:
+                payload = {
+                    "source": "predict",
+                    "ts": datetime.now(tz=timezone.utc).isoformat(),
+                    "up": up_payload,
+                    "down": down_payload,
+                    "meta": {
+                        "market_id": market_id,
+                        "title": market_title,
+                    },
+                }
+                try:
+                    requests.post(url, json=payload, timeout=0.5)
+                except requests.RequestException:
+                    pass
         except requests.HTTPError as e:
             print(f"  {ts}  HTTP {e.response.status_code}: {e}")
         except requests.RequestException as e:

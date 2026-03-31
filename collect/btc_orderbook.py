@@ -32,7 +32,15 @@ SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
 
 
-def post_tick(ts_str: str, question: str, up: dict, down: dict) -> None:
+def post_tick(
+    ts_str: str,
+    question: str,
+    up: dict,
+    down: dict,
+    *,
+    slot: int | None = None,
+    token_ids: dict[str, str | None] | None = None,
+) -> None:
     url = os.environ.get("ANALYZER_URL", "").strip()
     if not url:
         return
@@ -44,6 +52,11 @@ def post_tick(ts_str: str, question: str, up: dict, down: dict) -> None:
         "ts": datetime.now(tz=timezone.utc).isoformat(),
         "up": up,
         "down": down,
+        "meta": {
+            "question": question,
+            "slot": slot,
+            "token_ids": token_ids,
+        },
     }
 
     # Best-effort: do not crash collector on analyzer/network issues.
@@ -223,6 +236,8 @@ def run_loop() -> None:
 
         up_payload: dict = {"bid": None, "bid_sz": 0.0, "ask": None, "ask_sz": 0.0}
         down_payload: dict = {"bid": None, "bid_sz": 0.0, "ask": None, "ask_sz": 0.0}
+        up_token_id: str | None = None
+        down_token_id: str | None = None
 
         for outcome, token_id in token_map.items():
             try:
@@ -233,15 +248,24 @@ def run_loop() -> None:
                 outcome_norm = outcome.strip().lower()
                 if outcome_norm in {"up", "yes"}:
                     up_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz}
+                    up_token_id = token_id
                 elif outcome_norm in {"down", "no"}:
                     down_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz}
+                    down_token_id = token_id
             except requests.HTTPError as e:
                 print(f"  {ts_str}  [{outcome}]  HTTP {e.response.status_code}")
             except requests.RequestException as e:
                 print(f"  {ts_str}  [{outcome}]  Ошибка: {e}")
 
         # Push aggregated tick once per second (best-effort)
-        post_tick(ts_str, question, up_payload, down_payload)
+        post_tick(
+            ts_str,
+            question,
+            up_payload,
+            down_payload,
+            slot=active_slot,
+            token_ids={"up": up_token_id, "down": down_token_id},
+        )
 
         # Пустая строка-разделитель между тиками, если токенов > 1
         if len(token_map) > 1:

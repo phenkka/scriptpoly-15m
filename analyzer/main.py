@@ -19,11 +19,20 @@ class SideQuote(BaseModel):
     ask_sz: float = 0.0
 
 
+class TickMeta(BaseModel):
+    question: str | None = None
+    slot: int | None = None
+    token_ids: dict[str, str | None] | None = None
+    market_id: int | None = None
+    title: str | None = None
+
+
 class Tick(BaseModel):
     source: Literal["polymarket", "predict"]
     ts: datetime = Field(..., description="Event timestamp")
     up: SideQuote
     down: SideQuote
+    meta: TickMeta | None = None
 
 
 app = FastAPI()
@@ -148,6 +157,13 @@ def _check_arbitrage() -> None:
         _best_profit_usd[label] = profit_usd
 
         if s < 1.0:
+            t1_token_id = None
+            if t1.meta and t1.meta.token_ids:
+                t1_token_id = t1.meta.token_ids.get(side1)
+            t2_token_id = None
+            if t2.meta and t2.meta.token_ids:
+                t2_token_id = t2.meta.token_ids.get(side2)
+
             payload = {
                 "type": "arbitrage",
                 "label": label,
@@ -171,6 +187,9 @@ def _check_arbitrage() -> None:
                         "pool_usd": pool1_usd,
                         "shares": q,
                         "stake_usd": cost1_usd,
+                        "token_id": t1_token_id,
+                        "market_id": t1.meta.market_id if t1.meta else None,
+                        "title": t1.meta.title if t1.meta else None,
                     },
                     {
                         "source": t2.source,
@@ -181,6 +200,9 @@ def _check_arbitrage() -> None:
                         "pool_usd": pool2_usd,
                         "shares": q,
                         "stake_usd": cost2_usd,
+                        "token_id": t2_token_id,
+                        "market_id": t2.meta.market_id if t2.meta else None,
+                        "title": t2.meta.title if t2.meta else None,
                     },
                 ],
                 "sent_at": datetime.utcnow().isoformat() + "Z",
