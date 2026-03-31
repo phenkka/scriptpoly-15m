@@ -8,12 +8,26 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import httpx
 import requests
 
 from predict_sdk import BuildOrderInput, ChainId, LimitHelperInput, OrderBuilder, Side
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
+
+# Патч глобального httpx клиента py_clob_client для поддержки прокси
+_proxy_url = os.environ.get("PROXY_URL", "").strip()
+if _proxy_url:
+    import py_clob_client.http_helpers.helpers as _clob_helpers
+    _clob_helpers._http_client = httpx.Client(
+        http2=True,
+        mounts={
+            "http://": httpx.HTTPTransport(proxy=_proxy_url),
+            "https://": httpx.HTTPTransport(proxy=_proxy_url),
+        },
+    )
 
 
 class OpportunityLeg(BaseModel):
@@ -214,7 +228,7 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     )
 
     if poly_api_key and poly_secret and poly_passphrase:
-        client.set_api_creds({"apiKey": poly_api_key, "secret": poly_secret, "passphrase": poly_passphrase})
+        client.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
     else:
         client.set_api_creds(client.create_or_derive_api_creds())
 
@@ -245,6 +259,9 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
+    proxy_url = os.environ.get("PROXY_URL", "")
+    if proxy_url:
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     market = _predict_market(session, int(leg.market_id))
     fee_rate_bps = int(market.get("feeRateBps") or 0)
@@ -308,7 +325,8 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
         data=json.dumps(payload),
         timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
     out = r.json()
     if not out.get("success"):
         raise RuntimeError(f"predict_create_order_failed resp={out}")

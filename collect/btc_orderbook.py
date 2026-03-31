@@ -258,14 +258,16 @@ def run_loop() -> None:
                 print(f"  {ts_str}  [{outcome}]  Ошибка: {e}")
 
         # Push aggregated tick once per second (best-effort)
-        post_tick(
-            ts_str,
-            question,
-            up_payload,
-            down_payload,
-            slot=active_slot,
-            token_ids={"up": up_token_id, "down": down_token_id},
-        )
+        # Пропускаем тик если token_ids ещё не готовы (переход рынка)
+        if up_token_id is not None and down_token_id is not None:
+            post_tick(
+                ts_str,
+                question,
+                up_payload,
+                down_payload,
+                slot=active_slot,
+                token_ids={"up": up_token_id, "down": down_token_id},
+            )
 
         # Пустая строка-разделитель между тиками, если токенов > 1
         if len(token_map) > 1:
