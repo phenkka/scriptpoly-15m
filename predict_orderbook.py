@@ -127,47 +127,90 @@ def slot_end_utc(slot_et: datetime) -> datetime:
 #  Поиск рынка
 # ──────────────────────────────────────────────────────────────
 
-def find_market(session: requests.Session, slot_et: datetime) -> tuple[int, str, int] | tuple[None, None, None]:
+def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str, int, datetime] | tuple[None, None, None, None]:
     """
-    Ищет рынок по слоту. Возвращает (market_id, title, decimal_precision).
+    Ищет ближайший активный или предстоящий BTC/USD 15-мин рынок.
+    Возвращает (market_id, title, decimal_precision, ends_utc).
     """
-    query = slot_to_title(slot_et)
-    slug  = slot_to_slug(slot_et)
-    print(f"  Поиск: {CYAN}{query}{RESET}")
-    print(f"  Slug : {slug}")
+    now_utc = datetime.now(tz=timezone.utc)
 
     try:
         resp = session.get(
             f"{API_BASE}/search",
-            params={"query": query, "limit": "5"},
+            params={"query": "BTC/USD Up or Down 15 minutes", "limit": "20"},
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json().get("data", {})
     except requests.RequestException as e:
         print(f"  {RED}[ERROR] Поиск недоступен: {e}{RESET}")
-        return None, None, None
+        return None, None, None, None
 
-    # Ищем по slug или точному совпадению заголовка
-    all_markets = data.get("markets", [])
-    for m in data.get("categories", []):
-        all_markets.extend(m.get("markets", []))
+    # Собираем все BTC/USD CRYPTO_UP_DOWN рынки из категорий с временными метками
+    active:   list[tuple[datetime, int, str, int, datetime]] = []
+    upcoming: list[tuple[datetime, int, str, int, datetime]] = []
 
-    for m in all_markets:
-        cat_slug = m.get("categorySlug", "")
-        title    = m.get("title", "")
-        mid      = m.get("id")
-        dp       = m.get("decimalPrecision", 2)
-        if slug in cat_slug or slug in title.lower().replace(" ", "-") or query.lower() in title.lower():
-            return mid, title, dp
+    for c in data.get("categories", []):
+        if c.get("marketVariant") != "CRYPTO_UP_DOWN":
+            continue
+        title = c.get("title", "")
+        if "BTC/USD" not in title:
+            continue
+        starts_str = c.get("startsAt")
+        ends_str   = c.get("endsAt")
+        if not starts_str or not ends_str:
+            continue
+        starts = datetime.fromisoformat(starts_str.replace("Z", "+00:00"))
+        ends   = datetime.fromisoformat(ends_str.replace("Z", "+00:00"))
+        for m in c.get("markets", []):
+            mid = m.get("id")
+            dp  = m.get("decimalPrecision", 2)
+            if starts <= now_utc <= ends:
+                active.append((starts, mid, title, dp, ends))
+            elif starts > now_utc:
+                upcoming.append((starts, mid, title, dp, ends))
 
-    # Fallback: берём первый результат CRYPTO_UP_DOWN
-    for m in all_markets:
-        if m.get("marketVariant") == "CRYPTO_UP_DOWN" and "BTC" in m.get("title", "").upper():
-            return m.get("id"), m.get("title", ""), m.get("decimalPrecision", 2)
+    # Из top-level markets восстанавливаем время через categorySlug
+    for m in data.get("markets", []):
+        if m.get("marketVariant") != "CRYPTO_UP_DOWN" or "BTC/USD" not in m.get("title", ""):
+            continue
+        cs = m.get("categorySlug", "")
+        parts = cs.split("-")
+        try:
+            yr, mo, dy, hh, mm = int(parts[4]), int(parts[5]), int(parts[6]), int(parts[7]), int(parts[8])
+            start_et = datetime(yr, mo, dy, hh, mm, tzinfo=ET_ZONE)
+            end_et   = start_et + timedelta(minutes=SLOT_MIN)
+            starts   = start_et.astimezone(timezone.utc)
+            ends     = end_et.astimezone(timezone.utc)
+            mid = m.get("id")
+            dp  = m.get("decimalPrecision", 2)
+            title = m.get("title", "")
+            if starts <= now_utc <= ends:
+                if not any(x[1] == mid for x in active):
+                    active.append((starts, mid, title, dp, ends))
+            elif starts > now_utc:
+                if not any(x[1] == mid for x in upcoming):
+                    upcoming.append((starts, mid, title, dp, ends))
+        except (IndexError, ValueError):
+            pass
 
-    print(f"  {YELLOW}[WARN] Рынок не найден по запросу: {query}{RESET}")
-    return None, None, None
+    if active:
+        active.sort()
+        _, mid, title, dp, ends = active[0]
+        print(f"  {GREEN}Активный рынок: {title}{RESET}")
+        return mid, title, dp, ends
+
+    if upcoming:
+        upcoming.sort()
+        _, mid, title, dp, ends = upcoming[0]
+        start_dt = upcoming[0][0]
+        wait_s = max(0.0, (start_dt - now_utc).total_seconds())
+        local_start = start_dt.astimezone(ET_ZONE).strftime("%H:%M %Z")
+        print(f"  {YELLOW}Ближайший рынок: {title} (старт {local_start}, через {wait_s:.0f}с){RESET}")
+        return mid, title, dp, ends
+
+    print(f"  {YELLOW}[WARN] Рынок BTC/USD 15-мин не найден{RESET}")
+    return None, None, None, None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -226,8 +269,7 @@ SEP1 = "=" * 82
 SEP2 = "-" * 82
 
 
-def print_header(title: str, market_id: int, slot_et: datetime, decimal_precision: int) -> None:
-    end_utc = slot_end_utc(slot_et)
+def print_header(title: str, market_id: int, end_utc: datetime, decimal_precision: int) -> None:
     end_str = end_utc.strftime("%H:%M UTC")
     print(f"\n{SEP1}")
     print(f"  {CYAN}{title}{RESET}")
@@ -266,27 +308,28 @@ def print_row(ts: str, side: str, bid, bid_sz, ask, ask_sz, color_bid: str, colo
 # ──────────────────────────────────────────────────────────────
 
 def run_loop(session: requests.Session) -> None:
-    active_slot: datetime | None = None
-    market_id: int | None        = None
-    market_title: str            = ""
+    market_id:    int | None      = None
+    market_title: str             = ""
+    market_ends:  datetime | None = None
     dp: int                       = 2
 
     while True:
-        slot = current_et_slot()
+        now_utc = datetime.now(tz=timezone.utc)
 
-        # Обновляем рынок при смене слота
-        if slot != active_slot:
-            print(f"\n  New slot: {slot.strftime('%Y-%m-%d %H:%M %Z')}")
-            mid, title, d = find_market(session, slot)
+        # Ищем новый рынок если нет активного или текущий истёк
+        if market_id is None or (market_ends is not None and now_utc >= market_ends):
+            now_et_str = now_utc.astimezone(ET_ZONE).strftime("%Y-%m-%d %H:%M %Z")
+            print(f"\n  Поиск рынка ... ({now_et_str})")
+            mid, title, d, ends = find_market(session, now_utc.astimezone(ET_ZONE))
             if mid is None:
-                print("  Retrying in 5s...")
-                time.sleep(5)
+                print("  Retrying in 10s...")
+                time.sleep(10)
                 continue
-            active_slot  = slot
             market_id    = mid
             market_title = title
+            market_ends  = ends
             dp           = d or 2
-            print_header(market_title, market_id, active_slot, dp)
+            print_header(market_title, market_id, market_ends, dp)
 
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
