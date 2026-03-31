@@ -1,0 +1,18 @@
+services:
+  collect_polymarket:
+    build:
+      context: .
+      dockerfile: collect/Dockerfile
+    container_name: collect-polymarket
+    restart: unless-stopped
+    command: ["python", "-m", "collect.btc_orderbook"]
+
+  collect_predict:
+    build:
+      context: .
+      dockerfile: collect/Dockerfile
+    container_name: collect-predict
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "-m", "collect.predict_orderbook"]
