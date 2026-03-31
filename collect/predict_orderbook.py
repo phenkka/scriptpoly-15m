@@ -152,6 +152,31 @@ def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str
     """
     now_utc = datetime.now(tz=timezone.utc)
 
+    # 1. Пробуем текущий слот напрямую по slug
+    current_slot = current_et_slot()
+    slug = slot_to_slug(current_slot)
+    try:
+        resp = session.get(f"{API_BASE}/categories/{slug}", timeout=10)
+        if resp.status_code == 200:
+            cat = resp.json().get("data", {})
+            markets = cat.get("markets", [])
+            if markets:
+                end_et = current_slot + timedelta(minutes=SLOT_MIN)
+                ends = end_et.astimezone(timezone.utc)
+                ends_str = cat.get("endsAt")
+                if ends_str:
+                    ends = datetime.fromisoformat(ends_str.replace("Z", "+00:00"))
+                if now_utc <= ends:
+                    m = markets[0]
+                    mid = m.get("id")
+                    dp  = m.get("decimalPrecision", 2)
+                    title = cat.get("title", slot_to_title(current_slot))
+                    print(f"  {GREEN}Активный рынок: {title}{RESET}")
+                    return mid, title, dp, ends
+    except requests.RequestException:
+        pass
+
+    # 2. Fallback: поиск через /search
     try:
         resp = session.get(
             f"{API_BASE}/search",
