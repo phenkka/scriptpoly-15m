@@ -5,6 +5,12 @@ services:
       dockerfile: analyzer/Dockerfile
     container_name: analyzer
     restart: unless-stopped
+    environment:
+      BANKROLL_USD: ${BANKROLL_USD:-100}
+      POLY_BANKROLL_USD: ${POLY_BANKROLL_USD:-100}
+      PRED_BANKROLL_USD: ${PRED_BANKROLL_USD:-100}
+      MIN_STAKE_USD: ${MIN_STAKE_USD:-1}
+      MIN_PROFIT_USD: ${MIN_PROFIT_USD:-0}
     ports:
       - "8000:8000"
 
