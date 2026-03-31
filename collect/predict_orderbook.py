@@ -391,7 +391,7 @@ def run_loop(session: requests.Session) -> None:
         except requests.RequestException as e:
             print(f"  {ts}  Network error: {e}")
 
-        time.sleep(1)
+        time.sleep(0.5)
 
 
 # ──────────────────────────────────────────────────────────────

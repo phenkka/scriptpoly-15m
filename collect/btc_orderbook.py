@@ -247,7 +247,7 @@ def run_loop() -> None:
         if len(token_map) > 1:
             print()
 
-        time.sleep(1)
+        time.sleep(0.5)
 
 
 # ──────────────────────────────────────────────
