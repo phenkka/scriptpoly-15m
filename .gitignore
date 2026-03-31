@@ -1,1 +1,7 @@
-/.env
+.env
+.venv
+.idea
+.git
+__pycache__
+*.log
+*.json
