@@ -26,6 +26,7 @@ app = FastAPI()
 
 _state_lock = Lock()
 _last: dict[str, Tick] = {}
+_best_profit: dict[str, float] = {}
 
 
 def _check_arbitrage() -> None:
@@ -45,10 +46,24 @@ def _check_arbitrage() -> None:
     for label, ask1, ask2, t1, t2 in combos:
         if ask1 is None or ask2 is None:
             continue
+        if ask1 <= 0.0 or ask2 <= 0.0:
+            continue
+        if ask1 >= 1.0 or ask2 >= 1.0:
+            continue
         s = ask1 + ask2
+        profit = 1.0 - s
+        if profit <= 0.0:
+            continue
+
+        prev_best = _best_profit.get(label)
+        if prev_best is not None and profit <= prev_best + 1e-6:
+            continue
+
+        _best_profit[label] = profit
+
         if s < 1.0:
             print(
-                f"[ARBITRAGE] {label} sum={s:.4f} "
+                f"[ARBITRAGE] {label} sum={s:.4f} profit={profit:.4f} "
                 f"| {t1.source}@{t1.ts.isoformat()} "
                 f"UP(ask={t1.up.ask}) DOWN(ask={t1.down.ask}) "
                 f"| {t2.source}@{t2.ts.isoformat()} "
