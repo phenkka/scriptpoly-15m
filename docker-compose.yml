@@ -1,10 +1,21 @@
 services:
+  analyzer:
+    build:
+      context: .
+      dockerfile: analyzer/Dockerfile
+    container_name: analyzer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+
   collect_polymarket:
     build:
       context: .
       dockerfile: collect/Dockerfile
     container_name: collect-polymarket
     restart: unless-stopped
+    environment:
+      ANALYZER_URL: http://analyzer:8000/ingest
     command: ["python", "-m", "collect.btc_orderbook"]
 
   collect_predict:
@@ -13,6 +24,7 @@ services:
       dockerfile: collect/Dockerfile
     container_name: collect-predict
     restart: unless-stopped
-    env_file:
-      - .env
+    environment:
+      ANALYZER_URL: http://analyzer:8000/ingest
+      PREDICT_API_KEY: ${PREDICT_API_KEY}
     command: ["python", "-m", "collect.predict_orderbook"]
