@@ -7,7 +7,7 @@ RUN addgroup --system app && adduser --system --ingroup app app
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY collect/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY collect /app/collect

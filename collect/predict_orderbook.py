@@ -27,6 +27,24 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+
+def post_tick(up: dict, down: dict) -> None:
+    url = os.environ.get("ANALYZER_URL", "").strip()
+    if not url:
+        return
+
+    payload = {
+        "source": "predict",
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "up": up,
+        "down": down,
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=0.5)
+    except requests.RequestException:
+        return
+
 # ── UTF-8 вывод на Windows ──────────────────────────────────────
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -296,6 +314,10 @@ def run_loop(session: requests.Session) -> None:
             print_row(ts, "UP",   data["up_bid"], data["up_bid_sz"], data["up_ask"], data["up_ask_sz"], GREEN, RED)
             print_row(ts, "DOWN", data["dn_bid"], data["dn_bid_sz"], data["dn_ask"], data["dn_ask_sz"], GREEN, RED)
             print()
+
+            up_payload = {"bid": data.get("up_bid"), "bid_sz": data.get("up_bid_sz", 0.0), "ask": data.get("up_ask"), "ask_sz": data.get("up_ask_sz", 0.0)}
+            down_payload = {"bid": data.get("dn_bid"), "bid_sz": data.get("dn_bid_sz", 0.0), "ask": data.get("dn_ask"), "ask_sz": data.get("dn_ask_sz", 0.0)}
+            post_tick(up_payload, down_payload)
         except requests.HTTPError as e:
             print(f"  {ts}  HTTP {e.response.status_code}: {e}")
         except requests.RequestException as e:
