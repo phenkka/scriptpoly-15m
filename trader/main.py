@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import httpx
 import requests
 
-from predict_sdk import BuildOrderInput, ChainId, LimitHelperInput, OrderBuilder, Side
+from predict_sdk import BuildOrderInput, ChainId, LimitHelperInput, OrderBuilder, OrderBuilderOptions, Side
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
@@ -327,6 +327,47 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     }
 
 
+def _predict_get_jwt(
+    session: requests.Session,
+    private_key: str,
+    predict_account: str | None = None,
+    builder: OrderBuilder | None = None,
+) -> str:
+    """Получает JWT токен predict.fun через подпись auth/message.
+
+    Для Smart Wallet (predict_account задан): подписывает через
+    builder.sign_predict_account_message и передаёт predict_account как signer.
+    Для EOA: klassное подписание через eth_account.
+    """
+    r = session.get("https://api.predict.fun/v1/auth/message", timeout=10)
+    r.raise_for_status()
+    msg = r.json()["data"]["message"]
+
+    if predict_account and builder is not None:
+        # Smart Wallet flow — SDK сам формирует EIP-1271 подпись
+        signature = builder.sign_predict_account_message(msg)
+        signer = predict_account
+    else:
+        # EOA flow
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        acct = Account.from_key(private_key)
+        sig_hex = acct.sign_message(encode_defunct(text=msg)).signature.hex()
+        signature = "0x" + sig_hex if not sig_hex.startswith("0x") else sig_hex
+        signer = acct.address
+
+    if not str(signature).startswith("0x"):
+        signature = "0x" + str(signature)
+
+    r2 = session.post(
+        "https://api.predict.fun/v1/auth",
+        json={"signer": signer, "message": msg, "signature": signature},
+        timeout=10,
+    )
+    r2.raise_for_status()
+    return r2.json()["data"]["token"]
+
+
 def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     api_key = os.environ.get("PREDICT_API_KEY", "").strip()
     private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
@@ -344,14 +385,18 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     if predict_proxy_url:
         session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
 
+    chain_id = _get_predict_chain_id()
+    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+    builder = OrderBuilder.make(chain_id, private_key, OrderBuilderOptions(predict_account=predict_account) if predict_account else None)
+
+    jwt_token = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
+    session.headers.update({"Authorization": f"Bearer {jwt_token}"})
+
     market = _predict_market(session, int(leg.market_id))
     fee_rate_bps = int(market.get("feeRateBps") or 0)
     is_neg_risk = bool(market.get("isNegRisk"))
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
-
-    chain_id = _get_predict_chain_id()
-    builder = OrderBuilder.make(chain_id, private_key)
 
     price_per_share_wei = _wei_from_float(float(leg.ask))
     quantity_wei = _wei_from_float(float(leg.shares))
@@ -388,6 +433,8 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
         signature = signed_dump.get("signature")
     if not signature:
         raise RuntimeError("predict_missing_signature")
+    if not str(signature).startswith("0x"):
+        signature = "0x" + str(signature)
     if "signature" not in order_obj:
         order_obj["signature"] = signature
 
@@ -395,18 +442,14 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
 
     payload = {
         "data": {
-            "pricePerShare": str(leg.ask),
+            "pricePerShare": str(int(round(float(leg.ask) * 10**18))),
             "strategy": "LIMIT",
             "slippageBps": "0",
-            "isFillOrKill": True,
             "order": order_api,
         }
     }
 
     headers: dict[str, str] = {"Content-Type": "application/json"}
-    auth = os.environ.get("PREDICT_AUTHORIZATION", "").strip()
-    if auth:
-        headers["Authorization"] = auth
 
     r = session.post(
         "https://api.predict.fun/v1/orders",
@@ -480,6 +523,29 @@ def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
         "side": leg.side,
         "token_id": token_id,
     }
+
+
+@app.post("/test-predict")
+def test_predict(opp: Opportunity) -> dict:
+    """Выполняет только predict.fun ногу, polymarket — пропускается."""
+    opp = _cap_opportunity(opp)
+    pred_leg = next((l for l in opp.legs if l.source == "predict"), None)
+    if pred_leg is None:
+        raise HTTPException(status_code=400, detail="No predict leg found")
+    if pred_leg.market_id is None:
+        raise HTTPException(status_code=400, detail="predict leg missing market_id")
+
+    print(
+        f"[TEST-PREDICT] label={opp.label} shares={pred_leg.shares:.2f} "
+        f"stake=${pred_leg.stake_usd:.2f} ask={pred_leg.ask} market_id={pred_leg.market_id}"
+    )
+    try:
+        result = _place_predict_limit_buy(pred_leg)
+        print(f"[TEST-PREDICT] OK response={result.get('response')}")
+        return {"status": "ok", "predict": result}
+    except Exception as e:
+        print(f"[TEST-PREDICT] ERROR {e}")
+        return {"status": "error", "error": str(e)}
 
 
 @app.post("/opportunity")
