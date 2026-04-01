@@ -298,12 +298,16 @@ def _predict_resp_is_filled(resp: Any) -> bool:
     if not isinstance(resp, dict):
         return False
 
-    # New internal wrapper shape: {filled: bool, create: {...}, get: {...}, ...}
+    # Internal wrapper shape: {filled: bool, create: {...}, get: {...}, ...}
+    # Only early-return True — never short-circuit on False so we can check create.success below.
     filled_flag = resp.get("filled")
-    if isinstance(filled_flag, bool):
-        return filled_flag
-    if isinstance(filled_flag, (int, float)):
-        return bool(filled_flag)
+    if filled_flag is True:
+        return True
+
+    # For MARKET+FOK orders: if create returned success=True the order is accepted & filled.
+    create = resp.get("create")
+    if isinstance(create, dict) and create.get("success") is True:
+        return True
 
     for nested_key in ("get", "create"):
         nested = resp.get(nested_key)
@@ -335,6 +339,26 @@ def _predict_resp_is_filled(resp: Any) -> bool:
         if isinstance(v, str) and v.strip().lower() in {"filled", "matched", "executed"}:
             return True
     return False
+
+
+def _extract_predict_filled_shares(predict_result: dict[str, Any]) -> float | None:
+    """Возвращает фактически исполненные shares из результата predict ордера.
+
+    Парсит data.amountFilled (wei-строка) из GET /v1/orders/{hash} ответа.
+    Возвращает None если нельзя определить (вызывающий должен использовать исходные shares).
+    """
+    resp = predict_result.get("response") or {}
+    last_get = resp.get("get")
+    if isinstance(last_get, dict):
+        data = last_get.get("data")
+        if isinstance(data, dict):
+            amount_filled = data.get("amountFilled")
+            if amount_filled is not None:
+                try:
+                    return int(str(amount_filled)) / 10**18
+                except (ValueError, TypeError):
+                    pass
+    return None
 
 
 def _append_jsonl(path_s: str, row: dict[str, Any]) -> None:
@@ -740,11 +764,14 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     order_id = str(create_data.get("orderId") or "").strip() or None
     order_hash = str(create_data.get("orderHash") or "").strip() or None
 
+    # For MARKET+FOK: success=True from create means the order was accepted and filled immediately.
+    # We still poll to get actual fill details, but treat create.success=True as filled.
+    filled = out.get("success") is True
+
     fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "2.0"))
     poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     last_get: dict[str, Any] | None = None
-    filled = False
     if order_hash:
         while time.time() < t_deadline:
             last_get = _predict_get_order_by_hash(session, order_hash)
@@ -1044,6 +1071,28 @@ def opportunity(opp: Opportunity) -> dict:
             row["error"] = "predict_not_filled"
             _append_jsonl(trades_file, row)
             return {"status": "error", "error": "predict_not_filled"}
+
+        # Пересчитываем poly_leg под фактически исполненный объём predict ордера.
+        filled_shares = _extract_predict_filled_shares(predict_result)
+        row["predict_filled_shares"] = filled_shares
+        if filled_shares is not None:
+            if filled_shares < 1e-9:
+                row["error"] = "predict_filled_zero_shares"
+                _append_jsonl(trades_file, row)
+                return {"status": "error", "error": "predict_filled_zero_shares"}
+            original_shares = float(poly_leg.shares)
+            if abs(filled_shares - original_shares) / max(original_shares, 1e-9) > 1e-4:
+                scale = filled_shares / original_shares
+                poly_leg = OpportunityLeg(**{
+                    **poly_leg.model_dump(),
+                    "shares": filled_shares,
+                    "stake_usd": float(poly_leg.stake_usd) * scale,
+                })
+                print(
+                    f"[TRADER] predict_partial_fill requested={original_shares:.6f} "
+                    f"filled={filled_shares:.6f} scale={scale:.4f} -> poly hedge adjusted"
+                )
+                row["poly_leg_adjusted"] = poly_leg.model_dump()
 
         print("[TRADER] predict_filled -> placing_polymarket")
         row["timing"]["poly_start"] = time.time()
