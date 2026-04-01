@@ -43,6 +43,93 @@ if _proxy_url:
     )
 
 
+# ---------------------------------------------------------------------------
+# Predict client: persistent session, cached JWT and builder
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+
+class _PredictClient:
+    """Singleton с персистентной сессией, кешированным JWT и OrderBuilder.
+
+    Экономит 2-3 последовательных HTTP round-trip перед каждым ордером:
+      - GET /auth/message + POST /auth  (~800ms) — повторяется только по истечении JWT
+      - OrderBuilder.make()              (~мс)    — создаётся один раз
+      - GET /markets/{id}               (~400ms)  — кешируется по market_id
+    """
+
+    _JWT_TTL_SEC = 3 * 3600  # JWT живёт несколько часов; обновляем раз в 3ч
+
+    def __init__(self) -> None:
+        self._lock = _threading.RLock()  # RLock — реентрантный, safe для get() внутри get_market()
+        self._session: requests.Session | None = None
+        self._builder: OrderBuilder | None = None
+        self._jwt: str | None = None
+        self._jwt_ts: float = 0.0
+        self._market_cache: dict[int, dict[str, Any]] = {}
+
+    def _make_session(self) -> requests.Session:
+        s = requests.Session()
+        api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+        s.headers.update({"Accept": "application/json", "x-api-key": api_key})
+        proxy = os.environ.get("PREDICT_PROXY_URL", "").strip()
+        if proxy:
+            s.proxies.update({"http": proxy, "https": proxy})
+        return s
+
+    def _make_builder(self) -> OrderBuilder:
+        private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
+        predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+        chain_id = _get_predict_chain_id()
+        return OrderBuilder.make(
+            chain_id,
+            private_key,
+            OrderBuilderOptions(predict_account=predict_account) if predict_account else None,
+        )
+
+    def _refresh_jwt(self, session: requests.Session, builder: OrderBuilder) -> str:
+        private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
+        predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+        token = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        return token
+
+    def get(self) -> tuple[requests.Session, OrderBuilder]:
+        """Возвращает (session, builder) с актуальным JWT. Thread-safe."""
+        with self._lock:
+            if self._session is None:
+                self._session = self._make_session()
+            if self._builder is None:
+                self._builder = self._make_builder()
+            now = time.time()
+            if self._jwt is None or (now - self._jwt_ts) > self._JWT_TTL_SEC:
+                self._jwt = self._refresh_jwt(self._session, self._builder)
+                self._jwt_ts = now
+                print(f"[TRADER] predict_jwt_refreshed ts={self._jwt_ts:.0f}")
+            return self._session, self._builder
+
+    def get_market(self, market_id: int) -> dict[str, Any]:
+        """Возвращает данные рынка, кешируя по market_id."""
+        with self._lock:
+            if market_id not in self._market_cache:
+                session, _ = self.get()
+                self._market_cache[market_id] = _predict_market(session, market_id)
+            return self._market_cache[market_id]
+
+    def invalidate_jwt(self) -> None:
+        """Принудительное обновление JWT при следующем get()."""
+        with self._lock:
+            self._jwt = None
+            self._jwt_ts = 0.0
+
+    def invalidate_market(self, market_id: int) -> None:
+        with self._lock:
+            self._market_cache.pop(market_id, None)
+
+
+_predict_client = _PredictClient()
+
+
 class OpportunityLeg(BaseModel):
     source: str
     side: str
@@ -76,8 +163,26 @@ class Opportunity(BaseModel):
 app = FastAPI()
 
 
+@app.on_event("startup")
+def _startup_warmup() -> None:
+    """Прогреваем predict клиент при старте: получаем JWT и создаём builder заранее.
+    Это убирает задержку ~1s на первом реальном трейде.
+    """
+    import threading
+    def _warmup() -> None:
+        try:
+            _predict_client.get()
+            print("[TRADER] predict_client warmed up (JWT + builder ready)")
+        except Exception as e:
+            print(f"[TRADER] predict_client warmup failed (non-fatal): {e}")
+    threading.Thread(target=_warmup, daemon=True).start()
+
+
 # In-memory cooldown to prevent repeated buys during testing.
 _predict_market_last_buy_ts: dict[int, float] = {}
+# Набор market_id которые сейчас в процессе исполнения — блокирует параллельные трейды
+_predict_market_in_flight: set[int] = set()
+_predict_market_in_flight_lock = _threading.Lock()
 
 
 def _fmt_usd(x: float | int | None) -> str:
@@ -398,7 +503,7 @@ def _extract_predict_filled_shares(predict_result: dict[str, Any], requested_sha
                         order = data.get("order") or {}
                         maker_amt = int(str(order.get("makerAmount") or "0"))
                         taker_amt = int(str(order.get("takerAmount") or "0"))
-                        if maker_amt > 0 and taker_amt > 0 and maker_filled_wei >= 0:
+                        if maker_amt > 0 and taker_amt > 0 and maker_filled_wei > 0:
                             # Predict API docs are ambiguous about whether amountFilled is in maker or taker units.
                             # Compute both and pick the more plausible value.
                             shares_if_amount_is_taker = maker_filled_wei / 10**18
@@ -419,6 +524,20 @@ def _extract_predict_filled_shares(predict_result: dict[str, Any], requested_sha
                             return max(0.0, min(shares_if_amount_is_taker, shares_if_amount_is_maker))
                     except Exception:
                         pass
+
+    # Fallback: amountFilled ещё не пришёл в GET (blockchain latency),
+    # но для FOK с create.success=True takerAmount == фактически исполненные shares.
+    taker_wei_s = predict_result.get("taker_amount_wei")
+    if taker_wei_s is not None:
+        try:
+            shares = int(str(taker_wei_s)) / 10**18
+            if shares > 0:
+                if requested_shares is not None and requested_shares > 0:
+                    return min(shares, float(requested_shares))
+                return shares
+        except (ValueError, TypeError):
+            pass
+
     return None
 
 
@@ -718,47 +837,29 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
 
 
 def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None = None) -> dict[str, Any]:
-    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
-    private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
-    if not api_key:
-        raise RuntimeError("missing_env:PREDICT_API_KEY")
-    if not private_key:
-        raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
 
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-
-    if CFG.predict_proxy_url:
-        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
+    # Используем персистентный клиент — JWT и builder уже готовы, новый HTTP round-trip не нужен
+    session, builder = _predict_client.get()
+    market = _predict_client.get_market(int(leg.market_id))
 
     chain_id = _get_predict_chain_id()
-    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
-    builder = OrderBuilder.make(
-        chain_id,
-        private_key,
-        OrderBuilderOptions(predict_account=predict_account) if predict_account else None,
-    )
-
-    jwt_token = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
-    session.headers.update({"Authorization": f"Bearer {jwt_token}"})
-
-    market = _predict_market(session, int(leg.market_id))
     fee_rate_bps = int(market.get("feeRateBps") or 0)
     is_neg_risk = bool(market.get("isNegRisk"))
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
 
-    book = _predict_orderbook(session, int(leg.market_id))
+    # Строим Book с одним ask-уровнем из тика коллектора.
+    # Формат: [[price_float, size_float]] — именно такой возвращает predict API.
     book_obj = Book(
         market_id=int(leg.market_id),
-        update_timestamp_ms=int(book.get("updateTimestampMs") or 0),
-        bids=book.get("bids") or [],
-        asks=book.get("asks") or [],
+        update_timestamp_ms=0,
+        bids=[],
+        asks=[[float(leg.ask), float(leg.ask_sz)]],
     )
 
-    slippage_bps = int(CFG.predict_slippage_bps)
+    slippage_bps = int(os.environ.get("PREDICT_SLIPPAGE_BPS", "0") or "0")
     value_wei = _wei_from_float(float(leg.stake_usd))
 
     amounts = builder.get_market_order_amounts(
@@ -766,7 +867,6 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
         book_obj,
     )
 
-    # Derive pricePerShare (1e18) from amounts to avoid SDK field scaling issues.
     try:
         maker_amt = int(amounts.maker_amount)
         taker_amt = int(amounts.taker_amount)
@@ -825,9 +925,12 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
         "https://api.predict.fun/v1/orders",
         headers={"Content-Type": "application/json"},
         data=json.dumps(payload),
-        timeout=float(CFG.timeout_sec),
+        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
     )
     if not r.ok:
+        # 401 может означать истёкший JWT — инвалидируем для следующего запроса
+        if r.status_code == 401:
+            _predict_client.invalidate_jwt()
         raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
     out = r.json()
     if not out.get("success"):
@@ -837,50 +940,68 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
     order_id = str(create_data.get("orderId") or "").strip() or None
     order_hash = str(create_data.get("orderHash") or "").strip() or None
 
-    filled = False
+    # create.success=True для FOK = принят и исполнен
+    filled = out.get("success") is True
 
     last_get: dict[str, Any] | None = None
     remove_resp: dict[str, Any] | None = None
 
-    fill_timeout_sec = float(CFG.predict_fill_timeout_sec)
-    poll_interval_sec = float(CFG.predict_fill_poll_interval_sec)
-    t_deadline = time.time() + max(0.0, fill_timeout_sec)
+    fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "2.0"))
+    poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
 
     if order_hash:
-        while time.time() < t_deadline:
-            last_get = _predict_get_order_by_hash(session, order_hash)
-            out["get"] = last_get
-
-            # Filled only if we observe an actual fill in GET response.
-            if _predict_resp_is_filled(last_get):
-                filled = True
-                break
-
-            try:
-                data = (last_get or {}).get("data") or {}
-                status = str(data.get("status") or "").upper()
-                amount_filled = int(str(data.get("amountFilled") or "0"))
-            except Exception:
-                status = ""
-                amount_filled = 0
-
-            # If order is terminal and unfilled, stop polling early.
-            if status in {"CANCELLED", "EXPIRED", "REJECTED"} and amount_filled <= 0:
-                break
-            time.sleep(poll_interval_sec)
-
-        # One last read to reduce false negatives where the order fills slightly after our loop.
-        if not filled:
-            try:
-                time.sleep(min(0.25, max(0.0, poll_interval_sec)))
+        if filled:
+            # FOK create.success=True → ордер принят биржей.
+            # Статус обновляется асинхронно: сразу после POST может быть OPEN/CANCELLED.
+            # Делаем до 3 GET с паузой 300мс — этого обычно хватает для подтверждения.
+            _FOK_RETRY_PAUSE = 0.3
+            _FOK_MAX_RETRIES = 3
+            for _attempt in range(_FOK_MAX_RETRIES):
+                try:
+                    last_get = _predict_get_order_by_hash(session, order_hash)
+                except Exception:
+                    break
+                _data_tmp = (last_get or {}).get("data") or {}
+                _af = str(_data_tmp.get("amountFilled") or "0")
+                _st = str(_data_tmp.get("status") or "").upper()
+                # Подтверждение через amountFilled > 0 или status=FILLED
+                try:
+                    _af_int = int(_af)
+                except (ValueError, TypeError):
+                    _af_int = 0
+                if _af_int > 0 or _st in {"FILLED", "MATCHED", "COMPLETED", "SETTLED"}:
+                    break
+                if _attempt < _FOK_MAX_RETRIES - 1:
+                    time.sleep(_FOK_RETRY_PAUSE)
+        else:
+            # Ордер ещё не подтверждён — ждём polling (лимит-ордера и т.д.)
+            t_deadline = time.time() + max(0.0, fill_timeout_sec)
+            while time.time() < t_deadline:
                 last_get = _predict_get_order_by_hash(session, order_hash)
-                out["get_final"] = last_get
                 if _predict_resp_is_filled(last_get):
                     filled = True
-            except Exception:
-                pass
+                    break
+                try:
+                    data = (last_get or {}).get("data") or {}
+                    status = str(data.get("status") or "").upper()
+                    amount_filled = int(str(data.get("amountFilled") or "0"))
+                except Exception:
+                    status = ""
+                    amount_filled = 0
+                if status in {"CANCELLED", "EXPIRED", "REJECTED"} and amount_filled <= 0:
+                    break
+                time.sleep(poll_interval_sec)
 
-    # Best-effort cancel to avoid leaving OPEN orders in the book.
+            if not filled:
+                try:
+                    time.sleep(min(0.25, max(0.0, poll_interval_sec)))
+                    last_get = _predict_get_order_by_hash(session, order_hash)
+                    out["get_final"] = last_get
+                    if _predict_resp_is_filled(last_get):
+                        filled = True
+                except Exception:
+                    pass
+
     if not filled and order_id:
         try:
             remove_resp = _predict_remove_orders(session, [order_id])
@@ -906,63 +1027,29 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
             "isYieldBearing": is_yield_bearing,
         },
         "token_id": token_id,
-        "orderbook_ts_ms": book.get("updateTimestampMs"),
+        "taker_amount_wei": str(amounts.taker_amount),
         "request": payload,
         "response": response_obj,
     }
 
 
 def _predict_auth_preflight() -> None:
-    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("missing_env:PREDICT_API_KEY")
-
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-    if CFG.predict_proxy_url:
-        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
-
-    r = session.get(
-        "https://api.predict.fun/v1/auth/message",
-        timeout=float(CFG.timeout_sec),
-    )
-    if not r.ok:
-        raise RuntimeError(f"predict_auth_http_{r.status_code}: {r.text[:300]}")
+    # Через _predict_client — заодно прогревает кеш JWT
+    _predict_client.get()
 
 
 def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
-    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
-    private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
-    if not api_key:
-        raise RuntimeError("missing_env:PREDICT_API_KEY")
-    if not private_key:
-        raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
 
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-
-    if CFG.predict_proxy_url:
-        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
-
-    chain_id = _get_predict_chain_id()
-    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
-    builder = OrderBuilder.make(
-        chain_id,
-        private_key,
-        OrderBuilderOptions(predict_account=predict_account) if predict_account else None,
-    )
-
-    # Validate we can obtain a trading JWT (do not log the token itself)
-    _ = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
-    session.headers.update({"Authorization": "Bearer [redacted]"})
-
-    market = _predict_market(session, int(leg.market_id))
+    session, builder = _predict_client.get()
+    market = _predict_client.get_market(int(leg.market_id))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
     if token_id is None:
         raise RuntimeError("predict_missing_token_id")
 
+    chain_id = _get_predict_chain_id()
+    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
     return {
         "market_id": leg.market_id,
         "market_title": market.get("title"),
@@ -1196,6 +1283,8 @@ def opportunity(opp: Opportunity) -> dict:
         _append_jsonl(trades_file, row)
         return {"status": "ok", "mode": "dry_run"}
 
+    _market_id_int: int | None = int(pred_leg.market_id) if pred_leg.market_id is not None else None
+
     try:
         # Cooldown: do not buy the same Predict market more than once per window.
         cooldown_sec = _get_predict_market_cooldown_sec()
@@ -1222,11 +1311,71 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": "predict_market_cooldown"}
 
-            # For test safety: once we decide to attempt a trade on this market,
-            # lock it immediately so we don't start multiple buys concurrently.
-            _predict_market_last_buy_ts[int(pred_leg.market_id)] = now_ts
+        # In-flight lock: если этот market_id уже исполняется в другом потоке — пропускаем.
+        if _market_id_int is not None:
+            with _predict_market_in_flight_lock:
+                if _market_id_int in _predict_market_in_flight:
+                    print(
+                        "[TRADER][SKIP] "
+                        f"label={opp.label} reason=predict_market_in_flight market_id={_market_id_int}"
+                    )
+                    row["skipped"] = True
+                    row["skip_reason"] = {"code": "predict_market_in_flight", "market_id": _market_id_int}
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "predict_market_in_flight"
+                    row["summary"]["reason"] = row["skip_reason"]
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "predict_market_in_flight"}
+                _predict_market_in_flight.add(_market_id_int)
 
-        row["predict_preflight"] = _predict_preflight_for_leg(pred_leg)
+        # ────────────────────────────────────────────────────
+        # LIVE POLY PRICE CHECK — перед тем как коммитить
+        # predict-капитал, убеждаемся что цена poly ещё OK.
+        # Если poly сдвинулась и сумма >= порога — пропускаем.
+        # ────────────────────────────────────────────────────
+        poly_max_live_sum = float(os.environ.get("POLY_MAX_LIVE_SUM", "1.0"))
+        try:
+            live_book = _polymarket_book(str(poly_leg.token_id))
+            live_asks_raw = live_book.get("asks") or []
+            live_poly_ask: float | None = None
+            if live_asks_raw:
+                # asks: list of {"price": str, "size": str} — берём минимальную цену
+                live_poly_ask = min(float(x["price"]) for x in live_asks_raw if float(x.get("price", 0)) > 0)
+            if live_poly_ask is not None:
+                live_sum = live_poly_ask + float(pred_leg.ask)
+                row["live_poly_precheck"] = {
+                    "stale_poly_ask": float(poly_leg.ask),
+                    "live_poly_ask": live_poly_ask,
+                    "pred_ask": float(pred_leg.ask),
+                    "live_sum": round(live_sum, 6),
+                    "threshold": poly_max_live_sum,
+                }
+                print(
+                    "[TRADER] poly_live_precheck "
+                    f"stale={poly_leg.ask} live={live_poly_ask:.4f} "
+                    f"pred={pred_leg.ask} sum={live_sum:.4f} threshold={poly_max_live_sum}"
+                )
+                if live_sum >= poly_max_live_sum:
+                    row["skipped"] = True
+                    row["skip_reason"] = {
+                        "code": "poly_price_moved",
+                        "stale_poly_ask": float(poly_leg.ask),
+                        "live_poly_ask": live_poly_ask,
+                        "live_sum": round(live_sum, 6),
+                        "threshold": poly_max_live_sum,
+                    }
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "poly_price_moved"
+                    row["summary"]["reason"] = row["skip_reason"]
+                    print(
+                        "[TRADER][SKIP] "
+                        f"label={opp.label} reason=poly_price_moved "
+                        f"stale={poly_leg.ask} live={live_poly_ask:.4f} sum={live_sum:.4f}"
+                    )
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "poly_price_moved"}
+        except Exception as _e_poly_check:
+            print(f"[TRADER] poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
         row["timing"]["predict_start"] = time.time()
         try:
@@ -1351,6 +1500,36 @@ def opportunity(opp: Opportunity) -> dict:
                 )
                 row["poly_leg_adjusted"] = poly_leg.model_dump()
 
+        # POST-PREDICT контрольная проверка: логируем текущую poly цену.
+        # Если сумма >= 1.0 — фиксируем убыточный сценарий до размещения хеджа.
+        # Poly-ордер всё равно ставим: не хеджировать уже открытую predict позицию хуже.
+        actual_pred_price = float(pred_leg.ask)  # FOK с slippage=0 → исполнено по этой цене
+        try:
+            live_book_post = _polymarket_book(str(poly_leg.token_id))
+            live_asks_post = live_book_post.get("asks") or []
+            if live_asks_post:
+                live_poly_ask_post = min(float(x["price"]) for x in live_asks_post if float(x.get("price", 0)) > 0)
+                live_sum_post = live_poly_ask_post + actual_pred_price
+                row["live_poly_postcheck"] = {
+                    "live_poly_ask": live_poly_ask_post,
+                    "actual_pred_price": actual_pred_price,
+                    "live_sum": round(live_sum_post, 6),
+                    "at_loss": live_sum_post >= 1.0,
+                }
+                if live_sum_post >= 1.0:
+                    print(
+                        "[TRADER][WARN] post_predict_poly_moved_to_loss "
+                        f"live_poly={live_poly_ask_post:.4f} pred={actual_pred_price:.4f} "
+                        f"sum={live_sum_post:.4f} >= 1.0 — hedging anyway to close predict position"
+                    )
+                else:
+                    print(
+                        "[TRADER] post_predict_poly_ok "
+                        f"live_poly={live_poly_ask_post:.4f} pred={actual_pred_price:.4f} sum={live_sum_post:.4f}"
+                    )
+        except Exception as _e_post:
+            print(f"[TRADER] post_predict_poly_check_failed (non-fatal): {_e_post}")
+
         print("[TRADER] predict_filled -> placing_polymarket")
         row["timing"]["poly_start"] = time.time()
         polymarket_result = _place_polymarket_fok_market_buy(poly_leg)
@@ -1376,5 +1555,11 @@ def opportunity(opp: Opportunity) -> dict:
         row["summary"]["reason_code"] = "exception"
         row["summary"]["reason"] = str(e)
         print(f"[TRADER][ERROR] label={opp.label} exception={e}")
+        import traceback as _tb
+        print(_tb.format_exc())
         _append_jsonl(trades_file, row)
         return {"status": "error", "error": str(e)}
+    finally:
+        if _market_id_int is not None:
+            with _predict_market_in_flight_lock:
+                _predict_market_in_flight.discard(_market_id_int)
