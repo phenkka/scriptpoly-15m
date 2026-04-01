@@ -5,8 +5,9 @@ services:
       dockerfile: analyzer/Dockerfile
     container_name: analyzer
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      BANKROLL_USD: ${BANKROLL_USD:-100}
       POLY_BANKROLL_USD: ${POLY_BANKROLL_USD:-100}
       PRED_BANKROLL_USD: ${PRED_BANKROLL_USD:-100}
       MIN_STAKE_USD: ${MIN_STAKE_USD:-1}
@@ -49,6 +50,8 @@ services:
       dockerfile: collect/Dockerfile
     container_name: collect-polymarket
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       ANALYZER_URL: http://analyzer:8000/ingest
     command: ["python", "-m", "collect.btc_orderbook"]

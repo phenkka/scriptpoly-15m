@@ -151,6 +151,36 @@ def best_bid_ask(book: dict) -> tuple[float | None, float, float | None, float]:
     return bid_price, bid_size, ask_price, ask_size
 
 
+def _levels(book: dict, *, n: int) -> tuple[list[list[float]], list[list[float]]]:
+    """Returns (bids, asks) as [[price, qty], ...] with best levels first."""
+    bids_raw = book.get("bids", []) or []
+    asks_raw = book.get("asks", []) or []
+    bids: list[list[float]] = []
+    asks: list[list[float]] = []
+
+    try:
+        bids_sorted = sorted(bids_raw, key=lambda x: float(x.get("price")), reverse=True)
+    except Exception:
+        bids_sorted = bids_raw
+    try:
+        asks_sorted = sorted(asks_raw, key=lambda x: float(x.get("price")))
+    except Exception:
+        asks_sorted = asks_raw
+
+    for x in bids_sorted[: max(0, n)]:
+        try:
+            bids.append([float(x["price"]), float(x["size"])])
+        except Exception:
+            continue
+    for x in asks_sorted[: max(0, n)]:
+        try:
+            asks.append([float(x["price"]), float(x["size"])])
+        except Exception:
+            continue
+
+    return bids, asks
+
+
 # ──────────────────────────────────────────────
 #  Форматирование строки вывода
 # ──────────────────────────────────────────────
@@ -234,6 +264,11 @@ def run_loop() -> None:
 
         ts_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
+        try:
+            n_levels = int(os.environ.get("ORDERBOOK_LEVELS", "25") or "25")
+        except ValueError:
+            n_levels = 25
+
         up_payload: dict = {"bid": None, "bid_sz": 0.0, "ask": None, "ask_sz": 0.0}
         down_payload: dict = {"bid": None, "bid_sz": 0.0, "ask": None, "ask_sz": 0.0}
         up_token_id: str | None = None
@@ -243,14 +278,15 @@ def run_loop() -> None:
             try:
                 book = get_book(token_id)
                 bid, bid_sz, ask, ask_sz = best_bid_ask(book)
+                bids_lvls, asks_lvls = _levels(book, n=n_levels)
                 print_row(ts_str, outcome, bid, bid_sz, ask, ask_sz)
 
                 outcome_norm = outcome.strip().lower()
                 if outcome_norm in {"up", "yes"}:
-                    up_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz}
+                    up_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz, "bids": bids_lvls, "asks": asks_lvls}
                     up_token_id = token_id
                 elif outcome_norm in {"down", "no"}:
-                    down_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz}
+                    down_payload = {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz, "bids": bids_lvls, "asks": asks_lvls}
                     down_token_id = token_id
             except requests.HTTPError as e:
                 print(f"  {ts_str}  [{outcome}]  HTTP {e.response.status_code}")

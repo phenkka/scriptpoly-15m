@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import os
-from pathlib import Path
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -26,6 +26,8 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
+
+from trader.config import CONFIG as CFG
 
 # Патч глобального httpx клиента py_clob_client для поддержки прокси
 _proxy_url = os.environ.get("PROXY_URL", "").strip()
@@ -106,28 +108,19 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _test_mode() -> bool:
-    return _env_bool("TRADER_TEST_MODE", False)
+    return bool(CFG.test_mode)
 
 
 def _get_max_trade_usd() -> float:
-    try:
-        return float(os.environ.get("TRADER_MAX_TRADE_USD", "1"))
-    except ValueError:
-        return 1.0
+    return float(CFG.max_trade_usd)
 
 
 def _get_poly_min_order_usd() -> float:
-    try:
-        return float(os.environ.get("POLY_MIN_ORDER_USD", "1"))
-    except ValueError:
-        return 1.0
+    return float(CFG.poly_min_order_usd)
 
 
 def _get_predict_min_order_usd() -> float:
-    try:
-        return float(os.environ.get("PREDICT_MIN_ORDER_USD", "0.9"))
-    except ValueError:
-        return 0.9
+    return float(CFG.predict_min_order_usd)
 
 
 def _cap_opportunity(opp: Opportunity) -> Opportunity:
@@ -157,10 +150,7 @@ def _wei_from_float(x: float) -> int:
 
 
 def _get_predict_market_cooldown_sec() -> float:
-    try:
-        return float(os.environ.get("PREDICT_MARKET_COOLDOWN_SEC", "900"))
-    except ValueError:
-        return 900.0
+    return float(CFG.predict_market_cooldown_sec)
 
 
 def _normalize_hex_key(k: str) -> str:
@@ -578,9 +568,8 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
 
-    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
-    if predict_proxy_url:
-        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+    if CFG.predict_proxy_url:
+        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
 
     chain_id = _get_predict_chain_id()
     predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
@@ -652,7 +641,7 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
         "https://api.predict.fun/v1/orders",
         headers=headers,
         data=json.dumps(payload),
-        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
+        timeout=float(CFG.timeout_sec),
     )
     if not r.ok:
         raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
@@ -664,8 +653,8 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     order_id = str(create_data.get("orderId") or "").strip() or None
     order_hash = str(create_data.get("orderHash") or "").strip() or None
 
-    fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "1.2"))
-    poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
+    fill_timeout_sec = float(CFG.predict_fill_timeout_sec)
+    poll_interval_sec = float(CFG.predict_fill_poll_interval_sec)
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     last_get: dict[str, Any] | None = None
     filled = False
@@ -717,9 +706,8 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
 
-    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
-    if predict_proxy_url:
-        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+    if CFG.predict_proxy_url:
+        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
 
     chain_id = _get_predict_chain_id()
     predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
@@ -746,7 +734,7 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
         asks=book.get("asks") or [],
     )
 
-    slippage_bps = int(os.environ.get("PREDICT_SLIPPAGE_BPS", "0") or "0")
+    slippage_bps = int(CFG.predict_slippage_bps)
     value_wei = _wei_from_float(float(leg.stake_usd))
 
     amounts = builder.get_market_order_amounts(
@@ -810,7 +798,7 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
         "https://api.predict.fun/v1/orders",
         headers={"Content-Type": "application/json"},
         data=json.dumps(payload),
-        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
+        timeout=float(CFG.timeout_sec),
     )
     if not r.ok:
         raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
@@ -827,8 +815,8 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     last_get: dict[str, Any] | None = None
     remove_resp: dict[str, Any] | None = None
 
-    fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "6.0"))
-    poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
+    fill_timeout_sec = float(CFG.predict_fill_timeout_sec)
+    poll_interval_sec = float(CFG.predict_fill_poll_interval_sec)
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
 
     if order_hash:
@@ -904,13 +892,12 @@ def _predict_auth_preflight() -> None:
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
-    if predict_proxy_url:
-        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+    if CFG.predict_proxy_url:
+        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
 
     r = session.get(
         "https://api.predict.fun/v1/auth/message",
-        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
+        timeout=float(CFG.timeout_sec),
     )
     if not r.ok:
         raise RuntimeError(f"predict_auth_http_{r.status_code}: {r.text[:300]}")
@@ -929,9 +916,8 @@ def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
 
-    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
-    if predict_proxy_url:
-        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+    if CFG.predict_proxy_url:
+        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
 
     chain_id = _get_predict_chain_id()
     predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
@@ -989,8 +975,8 @@ def opportunity(opp: Opportunity) -> dict:
 
     t0 = time.time()
 
-    dry_run = _env_bool("TRADER_DRY_RUN", True)
-    trades_file = os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")
+    dry_run = bool(CFG.dry_run)
+    trades_file = str(CFG.trades_file)
     success_trades_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
     test_mode = _test_mode()
 
@@ -1151,9 +1137,8 @@ def opportunity(opp: Opportunity) -> dict:
             else:
                 session.headers.update({"Accept": "application/json"})
 
-            predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
-            if predict_proxy_url:
-                session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+            if CFG.predict_proxy_url:
+                session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
 
             row["predict_market"] = _predict_market(session, int(pred_leg.market_id))
             row["polymarket_book"] = _polymarket_book(str(poly_leg.token_id))

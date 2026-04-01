@@ -304,6 +304,41 @@ def extract_best(book: dict, decimal_precision: int = 2) -> dict:
     return result
 
 
+def _levels_up_down(book: dict, decimal_precision: int, *, n: int) -> tuple[dict, dict]:
+    """Return (up_payload, down_payload) including bids/asks level arrays."""
+    bids = book.get("bids", []) or []
+    asks = book.get("asks", []) or []
+
+    up_bids: list[list[float]] = []
+    up_asks: list[list[float]] = []
+    dn_bids: list[list[float]] = []
+    dn_asks: list[list[float]] = []
+
+    for lvl in bids[: max(0, n)]:
+        try:
+            p = float(lvl[0])
+            sz = float(lvl[1])
+        except Exception:
+            continue
+        up_bids.append([p, sz])
+        # DOWN ask comes from UP bid
+        dn_asks.append([complement(p, decimal_precision), sz])
+
+    for lvl in asks[: max(0, n)]:
+        try:
+            p = float(lvl[0])
+            sz = float(lvl[1])
+        except Exception:
+            continue
+        up_asks.append([p, sz])
+        # DOWN bid comes from UP ask
+        dn_bids.append([complement(p, decimal_precision), sz])
+
+    up_payload = {"bids": up_bids, "asks": up_asks}
+    down_payload = {"bids": dn_bids, "asks": dn_asks}
+    return up_payload, down_payload
+
+
 # ──────────────────────────────────────────────────────────────
 #  Вывод
 # ──────────────────────────────────────────────────────────────
@@ -390,14 +425,32 @@ def run_loop(session: requests.Session) -> None:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
         try:
+            n_levels = int(os.environ.get("ORDERBOOK_LEVELS", "25") or "25")
+        except ValueError:
+            n_levels = 25
+
+        try:
             book  = get_orderbook(session, market_id)
             data  = extract_best(book, dp)
             print_row(ts, "UP",   data["up_bid"], data["up_bid_sz"], data["up_ask"], data["up_ask_sz"], GREEN, RED)
             print_row(ts, "DOWN", data["dn_bid"], data["dn_bid_sz"], data["dn_ask"], data["dn_ask_sz"], GREEN, RED)
             print()
 
-            up_payload = {"bid": data.get("up_bid"), "bid_sz": data.get("up_bid_sz", 0.0), "ask": data.get("up_ask"), "ask_sz": data.get("up_ask_sz", 0.0)}
-            down_payload = {"bid": data.get("dn_bid"), "bid_sz": data.get("dn_bid_sz", 0.0), "ask": data.get("dn_ask"), "ask_sz": data.get("dn_ask_sz", 0.0)}
+            lv_up, lv_dn = _levels_up_down(book, dp, n=n_levels)
+            up_payload = {
+                "bid": data.get("up_bid"),
+                "bid_sz": data.get("up_bid_sz", 0.0),
+                "ask": data.get("up_ask"),
+                "ask_sz": data.get("up_ask_sz", 0.0),
+                **lv_up,
+            }
+            down_payload = {
+                "bid": data.get("dn_bid"),
+                "bid_sz": data.get("dn_bid_sz", 0.0),
+                "ask": data.get("dn_ask"),
+                "ask_sz": data.get("dn_ask_sz", 0.0),
+                **lv_dn,
+            }
 
             url = os.environ.get("ANALYZER_URL", "").strip()
             if url and market_id is not None:
