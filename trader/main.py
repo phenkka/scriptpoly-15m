@@ -1542,9 +1542,59 @@ def opportunity(opp: Opportunity) -> dict:
         row["ok"] = True
         row["summary"]["status"] = "ok"
         row["summary"]["reason_code"] = "ok"
+
+        # ── Реальные исполнения для статистики ──────────────────────────────
+        # Polymarket: makingAmount = потрачено USDC, takingAmount = получено shares
+        try:
+            poly_resp = (polymarket_result.get("response") or {})
+            poly_making = float(poly_resp.get("makingAmount") or 0)  # потрачено
+            poly_taking = float(poly_resp.get("takingAmount") or 0)  # получено shares
+            poly_actual_price = (poly_making / poly_taking) if poly_taking > 0 else None
+        except Exception:
+            poly_making = poly_taking = 0.0
+            poly_actual_price = None
+
+        # Predict: makerAmount = потрачено (wei/1e18), takerAmount = получено shares (wei/1e18)
+        try:
+            pred_req_order = (((predict_result.get("request") or {}).get("data") or {}).get("order") or {})
+            pred_making = int(str(pred_req_order.get("makerAmount") or "0")) / 10**18
+            pred_taking = int(str(pred_req_order.get("takerAmount") or "0")) / 10**18
+            pred_price_per_share = (pred_making / pred_taking) if pred_taking > 0 else None
+        except Exception:
+            pred_making = pred_taking = 0.0
+            pred_price_per_share = None
+
+        total_spent = poly_making + pred_making
+        bundle_sum = (poly_actual_price + pred_price_per_share) if (poly_actual_price and pred_price_per_share) else None
+        min_shares = min(poly_taking, pred_taking) if (poly_taking > 0 and pred_taking > 0) else None
+        actual_profit = (min_shares - total_spent) if (min_shares and total_spent > 0) else None
+
+        row["actual_execution"] = {
+            "poly": {
+                "spent_usd": round(poly_making, 6),
+                "shares_received": round(poly_taking, 6),
+                "price_per_share": round(poly_actual_price, 6) if poly_actual_price else None,
+                "side": poly_leg.side,
+            },
+            "pred": {
+                "spent_usd": round(pred_making, 6),
+                "shares_received": round(pred_taking, 6),
+                "price_per_share": round(pred_price_per_share, 6) if pred_price_per_share else None,
+                "side": pred_leg.side,
+            },
+            "total_spent_usd": round(total_spent, 6),
+            "bundle_sum": round(bundle_sum, 6) if bundle_sum else None,
+            "min_shares": round(min_shares, 6) if min_shares else None,
+            "actual_profit_usd": round(actual_profit, 6) if actual_profit else None,
+            "estimated_profit_usd": round(opp.profit_usd, 6),
+        }
+        row["summary"]["actual_execution"] = row["actual_execution"]
+        # ────────────────────────────────────────────────────────────────────
+
         print(
             "[TRADER][OK] "
-            f"label={opp.label} shares={opp.shares:.4f} stake={_fmt_usd(opp.stake_usd)} profit={_fmt_usd(opp.profit_usd)}"
+            f"label={opp.label} shares={opp.shares:.4f} stake={_fmt_usd(opp.stake_usd)} profit={_fmt_usd(opp.profit_usd)} "
+            f"actual_bundle={f'{bundle_sum:.4f}' if bundle_sum else 'n/a'} actual_profit={_fmt_usd(actual_profit)}"
         )
         _append_jsonl(trades_file, row)
         _append_jsonl(success_trades_file, row)
