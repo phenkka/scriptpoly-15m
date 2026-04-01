@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Literal
 import urllib.error
 import urllib.request
+import socket
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -70,8 +71,8 @@ def _post_opportunity(payload: dict) -> None:
                 status = None
             print(f"[TRADER] sent label={label} status={status}")
             return
-    except (urllib.error.URLError, ValueError):
-        print(f"[TRADER] send_failed label={label}")
+    except (urllib.error.URLError, ValueError, TimeoutError, socket.timeout) as e:
+        print(f"[TRADER] send_failed label={label} err={type(e).__name__}")
         return
 
 
@@ -82,6 +83,7 @@ def _check_arbitrage() -> None:
         return
 
     bankroll_usd = float(os.environ.get("BANKROLL_USD", "100"))
+    trader_max_trade_usd = float(os.environ.get("TRADER_MAX_TRADE_USD", "5"))
     poly_bankroll_usd = float(os.environ.get("POLY_BANKROLL_USD", str(bankroll_usd)))
     pred_bankroll_usd = float(os.environ.get("PRED_BANKROLL_USD", str(bankroll_usd)))
     min_stake_usd = float(os.environ.get("MIN_STAKE_USD", "1"))
@@ -139,6 +141,7 @@ def _check_arbitrage() -> None:
             (t1_bankroll / ask1) if t1_bankroll > 0 else 0.0,
             (t2_bankroll / ask2) if t2_bankroll > 0 else 0.0,
             (bankroll_usd / s) if bankroll_usd > 0 else 0.0,
+            (trader_max_trade_usd / s) if trader_max_trade_usd > 0 else 0.0,
         ]
         q = min(q_limits)
         if q <= 0.0:
@@ -215,15 +218,14 @@ def _check_arbitrage() -> None:
                 ],
                 "sent_at": datetime.utcnow().isoformat() + "Z",
             }
-
-            _post_opportunity(payload)
-
             print(
                 f"[ARBITRAGE] {label} sum={s:.4f} edge={edge:.4f} roi={roi:.4f} "
                 f"shares={q:.2f} cost=${total_cost_usd:.2f} payout=${q:.2f} profit=${profit_usd:.2f} "
                 f"| leg1 {t1.source}:{side1}@{t1.ts.isoformat()} ask={ask1} sz={sz1_f:.1f} stake=${cost1_usd:.2f} pool=${pool1_usd:.2f} "
                 f"| leg2 {t2.source}:{side2}@{t2.ts.isoformat()} ask={ask2} sz={sz2_f:.1f} stake=${cost2_usd:.2f} pool=${pool2_usd:.2f}"
             )
+
+            _post_opportunity(payload)
 
 
 @app.post("/ingest")

@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +12,16 @@ from pydantic import BaseModel
 import httpx
 import requests
 
-from predict_sdk import BuildOrderInput, ChainId, LimitHelperInput, OrderBuilder, OrderBuilderOptions, Side
+from predict_sdk import (
+    BuildOrderInput,
+    Book,
+    ChainId,
+    LimitHelperInput,
+    MarketHelperValueInput,
+    OrderBuilder,
+    OrderBuilderOptions,
+    Side,
+)
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
@@ -86,6 +96,13 @@ def _get_poly_min_order_usd() -> float:
         return 1.0
 
 
+def _get_predict_min_order_usd() -> float:
+    try:
+        return float(os.environ.get("PREDICT_MIN_ORDER_USD", "0.9"))
+    except ValueError:
+        return 0.9
+
+
 def _cap_opportunity(opp: Opportunity) -> Opportunity:
     max_usd = _get_max_trade_usd()
     if max_usd <= 0:
@@ -131,6 +148,49 @@ def _predict_market(session: requests.Session, market_id: int) -> dict[str, Any]
     if not isinstance(data, dict):
         raise RuntimeError(f"predict_get_market_bad_response market_id={market_id}")
     return data
+
+
+def _predict_orderbook(session: requests.Session, market_id: int) -> dict[str, Any]:
+    r = session.get(f"https://api.predict.fun/v1/markets/{market_id}/orderbook", timeout=5)
+    r.raise_for_status()
+    j = r.json()
+    if not isinstance(j, dict) or not j.get("success"):
+        raise RuntimeError(f"predict_get_orderbook_failed market_id={market_id}")
+    data = j.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"predict_get_orderbook_bad_response market_id={market_id}")
+    return data
+
+
+def _predict_get_order_by_hash(session: requests.Session, order_hash: str) -> dict[str, Any]:
+    order_hash = (order_hash or "").strip()
+    if not order_hash:
+        raise RuntimeError("predict_missing_order_hash")
+    r = session.get(f"https://api.predict.fun/v1/orders/{order_hash}", timeout=5)
+    if not r.ok:
+        raise RuntimeError(f"predict_get_order_http_{r.status_code}: {r.text[:500]}")
+    j = r.json()
+    if not isinstance(j, dict):
+        raise RuntimeError("predict_get_order_bad_response")
+    return j
+
+
+def _predict_remove_orders(session: requests.Session, ids: list[str]) -> dict[str, Any]:
+    ids = [str(x).strip() for x in (ids or []) if str(x).strip()]
+    if not ids:
+        raise RuntimeError("predict_missing_order_ids")
+    r = session.post(
+        "https://api.predict.fun/v1/orders/remove",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({"data": {"ids": ids}}),
+        timeout=10,
+    )
+    if not r.ok:
+        raise RuntimeError(f"predict_remove_order_http_{r.status_code}: {r.text[:500]}")
+    j = r.json()
+    if not isinstance(j, dict):
+        raise RuntimeError("predict_remove_order_bad_response")
+    return j
 
 
 def _polymarket_book(token_id: str) -> dict[str, Any]:
@@ -220,6 +280,61 @@ def _predict_order_to_api(order_obj: dict[str, Any]) -> dict[str, Any]:
             out[nkey] = int(out[nkey])
 
     return out
+
+
+def _parse_iso_dt(s: str) -> datetime | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s[:-1] + "+00:00")
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _predict_resp_is_filled(resp: Any) -> bool:
+    if not isinstance(resp, dict):
+        return False
+
+    # New internal wrapper shape: {filled: bool, create: {...}, get: {...}, ...}
+    filled_flag = resp.get("filled")
+    if isinstance(filled_flag, bool):
+        return filled_flag
+    if isinstance(filled_flag, (int, float)):
+        return bool(filled_flag)
+
+    for nested_key in ("get", "create"):
+        nested = resp.get(nested_key)
+        if isinstance(nested, dict) and _predict_resp_is_filled(nested):
+            return True
+
+    data = resp.get("data")
+    if isinstance(data, dict):
+        for k in ("status", "state"):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip().lower() in {"filled", "matched", "executed"}:
+                return True
+        order = data.get("order")
+        if isinstance(order, dict):
+            v = order.get("status") or order.get("state")
+            if isinstance(v, str) and v.strip().lower() in {"filled", "matched", "executed"}:
+                return True
+            filled = order.get("filledAmount") or order.get("filled")
+            if isinstance(filled, (int, float)) and float(filled) > 0:
+                return True
+            fills = order.get("fills")
+            if isinstance(fills, list) and len(fills) > 0:
+                return True
+        fills = data.get("fills")
+        if isinstance(fills, list) and len(fills) > 0:
+            return True
+    for k in ("status", "state"):
+        v = resp.get(k)
+        if isinstance(v, str) and v.strip().lower() in {"filled", "matched", "executed"}:
+            return True
+    return False
 
 
 def _append_jsonl(path_s: str, row: dict[str, Any]) -> None:
@@ -462,6 +577,36 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     out = r.json()
     if not out.get("success"):
         raise RuntimeError(f"predict_create_order_failed resp={out}")
+
+    create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
+    order_id = str(create_data.get("orderId") or "").strip() or None
+    order_hash = str(create_data.get("orderHash") or "").strip() or None
+
+    fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "1.2"))
+    poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
+    t_deadline = time.time() + max(0.0, fill_timeout_sec)
+    last_get: dict[str, Any] | None = None
+    filled = False
+    if order_hash:
+        while time.time() < t_deadline:
+            last_get = _predict_get_order_by_hash(session, order_hash)
+            if _predict_resp_is_filled(last_get):
+                filled = True
+                break
+            time.sleep(max(0.05, poll_interval_sec))
+
+    remove_resp: dict[str, Any] | None = None
+    if not filled and order_id:
+        remove_resp = _predict_remove_orders(session, [order_id])
+
+    response_obj: dict[str, Any] = {
+        "create": out,
+        "get": last_get,
+        "remove": remove_resp,
+        "filled": filled,
+        "orderId": order_id,
+        "orderHash": order_hash,
+    }
     return {
         "chain_id": str(chain_id),
         "market": {
@@ -473,7 +618,162 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
         },
         "token_id": token_id,
         "request": payload,
-        "response": out,
+        "response": response_obj,
+    }
+
+
+def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
+    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+    private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
+    if not api_key:
+        raise RuntimeError("missing_env:PREDICT_API_KEY")
+    if not private_key:
+        raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
+    if leg.market_id is None:
+        raise RuntimeError("predict_missing_market_id")
+
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
+
+    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
+    if predict_proxy_url:
+        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+
+    chain_id = _get_predict_chain_id()
+    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+    builder = OrderBuilder.make(
+        chain_id,
+        private_key,
+        OrderBuilderOptions(predict_account=predict_account) if predict_account else None,
+    )
+
+    jwt_token = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
+    session.headers.update({"Authorization": f"Bearer {jwt_token}"})
+
+    market = _predict_market(session, int(leg.market_id))
+    fee_rate_bps = int(market.get("feeRateBps") or 0)
+    is_neg_risk = bool(market.get("isNegRisk"))
+    is_yield_bearing = bool(market.get("isYieldBearing"))
+    token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
+
+    book = _predict_orderbook(session, int(leg.market_id))
+    book_obj = Book(
+        market_id=int(leg.market_id),
+        update_timestamp_ms=int(book.get("updateTimestampMs") or 0),
+        bids=book.get("bids") or [],
+        asks=book.get("asks") or [],
+    )
+
+    slippage_bps = int(os.environ.get("PREDICT_SLIPPAGE_BPS", "0") or "0")
+    value_wei = _wei_from_float(float(leg.stake_usd))
+
+    amounts = builder.get_market_order_amounts(
+        MarketHelperValueInput(side=Side.BUY, value_wei=value_wei),
+        book_obj,
+    )
+
+    # Derive pricePerShare (1e18) from amounts to avoid SDK field scaling issues.
+    try:
+        maker_amt = int(amounts.maker_amount)
+        taker_amt = int(amounts.taker_amount)
+    except Exception as e:
+        raise RuntimeError(f"predict_market_amounts_bad_amounts:{e}")
+    if maker_amt <= 0 or taker_amt <= 0:
+        raise RuntimeError("predict_market_amounts_zero")
+    price_per_share_wei = (maker_amt * 10**18) // taker_amt
+
+    order = builder.build_order(
+        "MARKET",
+        BuildOrderInput(
+            side=Side.BUY,
+            token_id=str(token_id),
+            maker_amount=str(amounts.maker_amount),
+            taker_amount=str(amounts.taker_amount),
+            fee_rate_bps=fee_rate_bps,
+        ),
+    )
+
+    typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
+    signed_order = builder.sign_typed_data_order(typed_data)
+
+    signed_dump = _dump_obj(signed_order)
+    if not isinstance(signed_dump, dict):
+        raise RuntimeError("predict_signed_order_bad")
+
+    order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
+    signature = signed_dump.get("signature")
+    if not order_obj or not signature:
+        order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+        signature = signed_dump.get("signature")
+    if not signature:
+        raise RuntimeError("predict_missing_signature")
+    if not str(signature).startswith("0x"):
+        signature = "0x" + str(signature)
+    if "signature" not in order_obj:
+        order_obj["signature"] = signature
+
+    order_api = _predict_order_to_api(order_obj)
+
+    payload = {
+        "data": {
+            "pricePerShare": str(int(price_per_share_wei)),
+            "strategy": "MARKET",
+            "slippageBps": str(slippage_bps),
+            "isFillOrKill": True,
+            "order": order_api,
+        }
+    }
+
+    r = session.post(
+        "https://api.predict.fun/v1/orders",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
+    )
+    if not r.ok:
+        raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
+    out = r.json()
+    if not out.get("success"):
+        raise RuntimeError(f"predict_create_order_failed resp={out}")
+
+    create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
+    order_id = str(create_data.get("orderId") or "").strip() or None
+    order_hash = str(create_data.get("orderHash") or "").strip() or None
+
+    fill_timeout_sec = float(os.environ.get("PREDICT_FILL_TIMEOUT_SEC", "2.0"))
+    poll_interval_sec = float(os.environ.get("PREDICT_FILL_POLL_INTERVAL_SEC", "0.2"))
+    t_deadline = time.time() + max(0.0, fill_timeout_sec)
+    last_get: dict[str, Any] | None = None
+    filled = False
+    if order_hash:
+        while time.time() < t_deadline:
+            last_get = _predict_get_order_by_hash(session, order_hash)
+            if _predict_resp_is_filled(last_get):
+                filled = True
+                break
+            time.sleep(max(0.05, poll_interval_sec))
+
+    response_obj: dict[str, Any] = {
+        "create": out,
+        "get": last_get,
+        "filled": filled,
+        "orderId": order_id,
+        "orderHash": order_hash,
+    }
+
+    return {
+        "chain_id": str(chain_id),
+        "market": {
+            "id": market.get("id"),
+            "title": market.get("title"),
+            "feeRateBps": fee_rate_bps,
+            "isNegRisk": is_neg_risk,
+            "isYieldBearing": is_yield_bearing,
+        },
+        "token_id": token_id,
+        "orderbook_ts_ms": book.get("updateTimestampMs"),
+        "request": payload,
+        "response": response_obj,
     }
 
 
@@ -498,8 +798,11 @@ def _predict_auth_preflight() -> None:
 
 def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
     api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+    private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
     if not api_key:
         raise RuntimeError("missing_env:PREDICT_API_KEY")
+    if not private_key:
+        raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
 
@@ -510,7 +813,17 @@ def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
     if predict_proxy_url:
         session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
 
-    _predict_auth_preflight()
+    chain_id = _get_predict_chain_id()
+    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+    builder = OrderBuilder.make(
+        chain_id,
+        private_key,
+        OrderBuilderOptions(predict_account=predict_account) if predict_account else None,
+    )
+
+    # Validate we can obtain a trading JWT (do not log the token itself)
+    _ = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
+    session.headers.update({"Authorization": "Bearer [redacted]"})
 
     market = _predict_market(session, int(leg.market_id))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
@@ -522,6 +835,8 @@ def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
         "market_title": market.get("title"),
         "side": leg.side,
         "token_id": token_id,
+        "chain_id": str(chain_id),
+        "predict_account": predict_account,
     }
 
 
@@ -552,6 +867,8 @@ def test_predict(opp: Opportunity) -> dict:
 def opportunity(opp: Opportunity) -> dict:
     opp = _cap_opportunity(opp)
 
+    t0 = time.time()
+
     dry_run = _env_bool("TRADER_DRY_RUN", True)
     trades_file = os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")
     success_trades_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
@@ -577,6 +894,43 @@ def opportunity(opp: Opportunity) -> dict:
     if pred_leg is None or poly_leg is None:
         raise HTTPException(status_code=400, detail="Expected both polymarket and predict legs")
 
+    # Apply min(bank, pool) across BOTH legs while preserving equal payout (same shares on both).
+    # We cap shares by each leg's available top-of-book size (ask_sz).
+    sizing: dict[str, Any] = {
+        "input": {
+            "shares": float(opp.shares),
+            "stake_usd": float(opp.stake_usd),
+            "poly": {"ask": float(poly_leg.ask), "ask_sz": float(poly_leg.ask_sz), "stake_usd": float(poly_leg.stake_usd)},
+            "pred": {"ask": float(pred_leg.ask), "ask_sz": float(pred_leg.ask_sz), "stake_usd": float(pred_leg.stake_usd)},
+        }
+    }
+    q0 = float(opp.shares)
+    q_caps = [q0]
+    if poly_leg.ask_sz > 0:
+        q_caps.append(float(poly_leg.ask_sz))
+    if pred_leg.ask_sz > 0:
+        q_caps.append(float(pred_leg.ask_sz))
+    q = max(0.0, min(q_caps))
+    if q + 1e-12 < q0:
+        poly_leg = OpportunityLeg(**{**poly_leg.model_dump(), "shares": q, "stake_usd": q * float(poly_leg.ask)})
+        pred_leg = OpportunityLeg(**{**pred_leg.model_dump(), "shares": q, "stake_usd": q * float(pred_leg.ask)})
+        opp = Opportunity(
+            **{
+                **opp.model_dump(),
+                "shares": q,
+                "stake_usd": float(poly_leg.stake_usd) + float(pred_leg.stake_usd),
+                "payout_usd": q,
+                "profit_usd": q * (1.0 - (float(poly_leg.ask) + float(pred_leg.ask))),
+                "legs": [poly_leg, pred_leg],
+            }
+        )
+    sizing["output"] = {
+        "shares": float(opp.shares),
+        "stake_usd": float(opp.stake_usd),
+        "poly_leg_stake_usd": float(poly_leg.stake_usd),
+        "pred_leg_stake_usd": float(pred_leg.stake_usd),
+    }
+
     row: dict[str, Any] = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "mode": "test" if test_mode else ("dry_run" if dry_run else "live"),
@@ -587,8 +941,24 @@ def opportunity(opp: Opportunity) -> dict:
         "payout_usd": opp.payout_usd,
         "profit_usd": opp.profit_usd,
         "legs": [l.model_dump() for l in opp.legs],
+        "sizing": sizing,
         "ok": False,
+        "timing": {
+            "t0": t0,
+            "recv_at": datetime.utcnow().isoformat() + "Z",
+            "sent_at": opp.sent_at,
+            "poly_quote_ts": poly_leg.ts,
+            "pred_quote_ts": pred_leg.ts,
+        },
     }
+
+    poly_dt = _parse_iso_dt(poly_leg.ts)
+    pred_dt = _parse_iso_dt(pred_leg.ts)
+    now_dt = datetime.utcnow()
+    if poly_dt is not None:
+        row["timing"]["poly_quote_age_ms"] = (now_dt - poly_dt.replace(tzinfo=None)).total_seconds() * 1000.0
+    if pred_dt is not None:
+        row["timing"]["pred_quote_age_ms"] = (now_dt - pred_dt.replace(tzinfo=None)).total_seconds() * 1000.0
 
     poly_min = _get_poly_min_order_usd()
     if not test_mode and not dry_run:
@@ -601,6 +971,17 @@ def opportunity(opp: Opportunity) -> dict:
             }
             _append_jsonl(trades_file, row)
             return {"status": "skipped", "reason": "poly_min_order_usd"}
+
+        pred_min = _get_predict_min_order_usd()
+        if pred_leg.stake_usd + 1e-9 < pred_min:
+            row["skipped"] = True
+            row["skip_reason"] = {
+                "code": "predict_min_order_usd",
+                "predict_leg_stake_usd": float(pred_leg.stake_usd),
+                "predict_min_order_usd": float(pred_min),
+            }
+            _append_jsonl(trades_file, row)
+            return {"status": "skipped", "reason": "predict_min_order_usd"}
 
     if test_mode:
         errs = _preflight_test(opp, poly_leg, pred_leg)
@@ -644,11 +1025,35 @@ def opportunity(opp: Opportunity) -> dict:
     try:
         row["predict_preflight"] = _predict_preflight_for_leg(pred_leg)
 
-        predict_result = _place_predict_limit_buy(pred_leg)
+        row["timing"]["predict_start"] = time.time()
+        predict_result = _place_predict_market_buy(pred_leg)
+        row["timing"]["predict_end"] = time.time()
         row["predict"] = predict_result
 
+        try:
+            pred_hash = (
+                (predict_result.get("response") or {}).get("data") or {}
+            ).get("orderHash")
+        except Exception:
+            pred_hash = None
+        print(
+            f"[TRADER] predict_done order_hash={pred_hash} filled={_predict_resp_is_filled(predict_result.get('response'))}"
+        )
+
+        if not _predict_resp_is_filled(predict_result.get("response")):
+            row["error"] = "predict_not_filled"
+            _append_jsonl(trades_file, row)
+            return {"status": "error", "error": "predict_not_filled"}
+
+        print("[TRADER] predict_filled -> placing_polymarket")
+        row["timing"]["poly_start"] = time.time()
         polymarket_result = _place_polymarket_fok_market_buy(poly_leg)
+        row["timing"]["poly_end"] = time.time()
         row["polymarket"] = polymarket_result
+        row["timing"]["t_end"] = time.time()
+        row["timing"]["total_ms"] = (row["timing"]["t_end"] - t0) * 1000.0
+        row["timing"]["predict_ms"] = (row["timing"]["predict_end"] - row["timing"]["predict_start"]) * 1000.0
+        row["timing"]["poly_ms"] = (row["timing"]["poly_end"] - row["timing"]["poly_start"]) * 1000.0
         row["ok"] = True
         _append_jsonl(trades_file, row)
         _append_jsonl(success_trades_file, row)
