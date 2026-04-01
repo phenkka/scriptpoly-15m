@@ -39,7 +39,7 @@ app = FastAPI()
 
 _state_lock = Lock()
 _last: dict[str, Tick] = {}
-_best_profit_usd: dict[str, float] = {}
+_best_profit_usd: dict[tuple[str, int], float] = {}
 
 
 def _post_opportunity(payload: dict) -> None:
@@ -99,6 +99,14 @@ def _check_arbitrage() -> None:
     ]
 
     for label, t1, side1, t2, side2 in combos:
+        t1_slot = t1.meta.slot if t1.meta else None
+        t2_slot = t2.meta.slot if t2.meta else None
+        if t1_slot is None or t2_slot is None or t1_slot != t2_slot:
+            continue
+
+        slot_key = int(t1_slot)
+        key = (label, slot_key)
+
         ask1, sz1 = _get_ask_and_sz(t1, side1)
         ask2, sz2 = _get_ask_and_sz(t2, side2)
 
@@ -150,11 +158,11 @@ def _check_arbitrage() -> None:
         # ROI on cost = (1 - s) / s
         roi = edge / s
 
-        prev_best = _best_profit_usd.get(label)
+        prev_best = _best_profit_usd.get(key)
         if prev_best is not None and profit_usd <= prev_best + 1e-6:
             continue
 
-        _best_profit_usd[label] = profit_usd
+        _best_profit_usd[key] = profit_usd
 
         if s < 1.0:
             t1_token_id = None

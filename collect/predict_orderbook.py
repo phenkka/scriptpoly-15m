@@ -354,6 +354,7 @@ def run_loop(session: requests.Session) -> None:
     market_id:    int | None      = None
     market_title: str             = ""
     market_ends:  datetime | None = None
+    market_slot:  int | None      = None
     dp: int                       = 2
 
     while True:
@@ -371,6 +372,9 @@ def run_loop(session: requests.Session) -> None:
             market_id    = mid
             market_title = title
             market_ends  = ends
+            if market_ends is not None:
+                slot_start_utc = (market_ends - timedelta(minutes=SLOT_MIN)).astimezone(timezone.utc)
+                market_slot = (int(slot_start_utc.timestamp()) // (SLOT_MIN * 60)) * (SLOT_MIN * 60)
             dp           = d or 2
             print_header(market_title, market_id, market_ends, dp)
             # Пауза 2 сек после перехода на новый рынок
@@ -403,6 +407,7 @@ def run_loop(session: requests.Session) -> None:
                     "up": up_payload,
                     "down": down_payload,
                     "meta": {
+                        "slot": market_slot,
                         "market_id": market_id,
                         "title": market_title,
                     },

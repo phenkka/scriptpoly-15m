@@ -68,9 +68,20 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _test_mode() -> bool:
+    return _env_bool("TRADER_TEST_MODE", False)
+
+
 def _get_max_trade_usd() -> float:
     try:
         return float(os.environ.get("TRADER_MAX_TRADE_USD", "1"))
+    except ValueError:
+        return 1.0
+
+
+def _get_poly_min_order_usd() -> float:
+    try:
+        return float(os.environ.get("POLY_MIN_ORDER_USD", "1"))
     except ValueError:
         return 1.0
 
@@ -122,6 +133,16 @@ def _predict_market(session: requests.Session, market_id: int) -> dict[str, Any]
     return data
 
 
+def _polymarket_book(token_id: str) -> dict[str, Any]:
+    r = requests.get("https://clob.polymarket.com/book", params={"token_id": token_id}, timeout=5)
+    if not r.ok:
+        raise RuntimeError(f"polymarket_book_http_{r.status_code}: {r.text[:500]}")
+    j = r.json()
+    if not isinstance(j, dict):
+        raise RuntimeError("polymarket_book_bad_response")
+    return j
+
+
 def _predict_token_id_for_side(market: dict[str, Any], side: str) -> str:
     outcomes = market.get("outcomes")
     if not isinstance(outcomes, list):
@@ -168,6 +189,39 @@ def _dump_obj(x: Any) -> Any:
     return x
 
 
+def _predict_order_to_api(order_obj: dict[str, Any]) -> dict[str, Any]:
+    # Predict REST expects camelCase fields (see dev.predict.fun "Create an order")
+    # while SDK objects can be snake_case depending on version.
+    mapping = {
+        "token_id": "tokenId",
+        "maker_amount": "makerAmount",
+        "taker_amount": "takerAmount",
+        "fee_rate_bps": "feeRateBps",
+        "signature_type": "signatureType",
+    }
+
+    out: dict[str, Any] = {}
+    for k, v in order_obj.items():
+        out[mapping.get(k, k)] = v
+
+    # Ensure mandatory keys are present in the expected naming.
+    if "tokenId" not in out and "token_id" in order_obj:
+        out["tokenId"] = order_obj["token_id"]
+    if "makerAmount" not in out and "maker_amount" in order_obj:
+        out["makerAmount"] = order_obj["maker_amount"]
+    if "takerAmount" not in out and "taker_amount" in order_obj:
+        out["takerAmount"] = order_obj["taker_amount"]
+    if "feeRateBps" not in out and "fee_rate_bps" in order_obj:
+        out["feeRateBps"] = order_obj["fee_rate_bps"]
+
+    # Convert some known numeric fields to int if they come as strings.
+    for nkey in ("side", "signatureType"):
+        if nkey in out and isinstance(out[nkey], str) and out[nkey].isdigit():
+            out[nkey] = int(out[nkey])
+
+    return out
+
+
 def _append_jsonl(path_s: str, row: dict[str, Any]) -> None:
     p = Path(path_s)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +250,33 @@ def _preflight(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: Opportunity
     if not os.environ.get("PREDICT_PRIVATE_KEY", "").strip():
         errs.append("missing_env:PREDICT_PRIVATE_KEY")
 
+    try:
+        _ = _get_predict_chain_id()
+    except Exception as e:
+        errs.append(f"predict_chain_id_invalid:{e}")
+
     return errs
+
+
+def _preflight_test(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: OpportunityLeg) -> list[str]:
+    errs: list[str] = []
+    if opp.type != "arbitrage":
+        errs.append(f"unsupported_type:{opp.type}")
+    if poly_leg.token_id is None or not str(poly_leg.token_id).strip():
+        errs.append("polymarket_missing_token_id")
+    if pred_leg.market_id is None:
+        errs.append("predict_missing_market_id")
+    return errs
+
+
+def _get_predict_chain_id() -> ChainId:
+    name = os.environ.get("PREDICT_CHAIN_ID", "BNB_MAINNET").strip()
+    if not name:
+        name = "BNB_MAINNET"
+    try:
+        return getattr(ChainId, name)
+    except AttributeError:
+        raise RuntimeError(f"unknown_chain_id:{name}")
 
 
 def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
@@ -255,13 +335,14 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     if not private_key:
         raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
     if leg.market_id is None:
-        raise RuntimeError("missing_market_id")
+        raise RuntimeError("predict_missing_market_id")
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-    proxy_url = os.environ.get("PROXY_URL", "")
-    if proxy_url:
-        session.proxies.update({"http": proxy_url, "https": proxy_url})
+
+    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
+    if predict_proxy_url:
+        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
 
     market = _predict_market(session, int(leg.market_id))
     fee_rate_bps = int(market.get("feeRateBps") or 0)
@@ -269,7 +350,8 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
 
-    builder = OrderBuilder.make(ChainId.BNB_MAINNET, private_key)
+    chain_id = _get_predict_chain_id()
+    builder = OrderBuilder.make(chain_id, private_key)
 
     price_per_share_wei = _wei_from_float(float(leg.ask))
     quantity_wei = _wei_from_float(float(leg.shares))
@@ -309,19 +391,26 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     if "signature" not in order_obj:
         order_obj["signature"] = signature
 
+    order_api = _predict_order_to_api(order_obj)
+
     payload = {
         "data": {
             "pricePerShare": str(leg.ask),
             "strategy": "LIMIT",
             "slippageBps": "0",
             "isFillOrKill": True,
-            "order": order_obj,
+            "order": order_api,
         }
     }
 
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    auth = os.environ.get("PREDICT_AUTHORIZATION", "").strip()
+    if auth:
+        headers["Authorization"] = auth
+
     r = session.post(
         "https://api.predict.fun/v1/orders",
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         data=json.dumps(payload),
         timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
     )
@@ -331,6 +420,7 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     if not out.get("success"):
         raise RuntimeError(f"predict_create_order_failed resp={out}")
     return {
+        "chain_id": str(chain_id),
         "market": {
             "id": market.get("id"),
             "title": market.get("title"),
@@ -344,12 +434,62 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     }
 
 
+def _predict_auth_preflight() -> None:
+    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("missing_env:PREDICT_API_KEY")
+
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
+    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
+    if predict_proxy_url:
+        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+
+    r = session.get(
+        "https://api.predict.fun/v1/auth/message",
+        timeout=float(os.environ.get("TRADER_TIMEOUT_SEC", "2.0")),
+    )
+    if not r.ok:
+        raise RuntimeError(f"predict_auth_http_{r.status_code}: {r.text[:300]}")
+
+
+def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
+    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("missing_env:PREDICT_API_KEY")
+    if leg.market_id is None:
+        raise RuntimeError("predict_missing_market_id")
+
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
+
+    predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
+    if predict_proxy_url:
+        session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+
+    _predict_auth_preflight()
+
+    market = _predict_market(session, int(leg.market_id))
+    token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
+    if token_id is None:
+        raise RuntimeError("predict_missing_token_id")
+
+    return {
+        "market_id": leg.market_id,
+        "market_title": market.get("title"),
+        "side": leg.side,
+        "token_id": token_id,
+    }
+
+
 @app.post("/opportunity")
 def opportunity(opp: Opportunity) -> dict:
     opp = _cap_opportunity(opp)
 
     dry_run = _env_bool("TRADER_DRY_RUN", True)
     trades_file = os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")
+    success_trades_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
+    test_mode = _test_mode()
 
     # Minimal audit log for operator.
     print(
@@ -373,7 +513,7 @@ def opportunity(opp: Opportunity) -> dict:
 
     row: dict[str, Any] = {
         "ts": datetime.utcnow().isoformat() + "Z",
-        "mode": "dry_run" if dry_run else "live",
+        "mode": "test" if test_mode else ("dry_run" if dry_run else "live"),
         "label": opp.label,
         "cap_max_trade_usd": _get_max_trade_usd(),
         "shares": opp.shares,
@@ -383,6 +523,47 @@ def opportunity(opp: Opportunity) -> dict:
         "legs": [l.model_dump() for l in opp.legs],
         "ok": False,
     }
+
+    poly_min = _get_poly_min_order_usd()
+    if not test_mode and not dry_run:
+        if poly_leg.stake_usd + 1e-9 < poly_min:
+            row["skipped"] = True
+            row["skip_reason"] = {
+                "code": "poly_min_order_usd",
+                "poly_leg_stake_usd": float(poly_leg.stake_usd),
+                "poly_min_order_usd": float(poly_min),
+            }
+            _append_jsonl(trades_file, row)
+            return {"status": "skipped", "reason": "poly_min_order_usd"}
+
+    if test_mode:
+        errs = _preflight_test(opp, poly_leg, pred_leg)
+        if errs:
+            row["preflight_errors"] = errs
+            _append_jsonl(trades_file, row)
+            return {"status": "error", "mode": "test", "preflight_errors": errs}
+
+        try:
+            session = requests.Session()
+            api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+            if api_key:
+                session.headers.update({"Accept": "application/json", "x-api-key": api_key})
+            else:
+                session.headers.update({"Accept": "application/json"})
+
+            predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip()
+            if predict_proxy_url:
+                session.proxies.update({"http": predict_proxy_url, "https": predict_proxy_url})
+
+            row["predict_market"] = _predict_market(session, int(pred_leg.market_id))
+            row["polymarket_book"] = _polymarket_book(str(poly_leg.token_id))
+            row["ok"] = True
+            _append_jsonl(trades_file, row)
+            return {"status": "ok", "mode": "test"}
+        except Exception as e:
+            row["error"] = str(e)
+            _append_jsonl(trades_file, row)
+            return {"status": "error", "mode": "test", "error": str(e)}
 
     errs = _preflight(opp, poly_leg, pred_leg)
     if errs:
@@ -395,15 +576,18 @@ def opportunity(opp: Opportunity) -> dict:
         return {"status": "ok", "mode": "dry_run"}
 
     try:
-        polymarket_result = _place_polymarket_fok_market_buy(poly_leg)
-        row["polymarket"] = polymarket_result
+        row["predict_preflight"] = _predict_preflight_for_leg(pred_leg)
 
         predict_result = _place_predict_limit_buy(pred_leg)
         row["predict"] = predict_result
+
+        polymarket_result = _place_polymarket_fok_market_buy(poly_leg)
+        row["polymarket"] = polymarket_result
         row["ok"] = True
         _append_jsonl(trades_file, row)
+        _append_jsonl(success_trades_file, row)
         return {"status": "ok"}
     except Exception as e:
         row["error"] = str(e)
         _append_jsonl(trades_file, row)
-        raise
+        return {"status": "error", "error": str(e)}
