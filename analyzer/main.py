@@ -264,6 +264,8 @@ def _check_arbitrage() -> None:
                 "profit_usd": profit_usd,
                 "min_stake_usd": min_stake_usd,
                 "min_profit_usd": min_profit_usd,
+                "analyzer_calc_at": datetime.utcnow().isoformat() + "Z",
+                "analyzer_tick_ts_max": max(t1.ts, t2.ts).isoformat(),
                 "legs": [
                     {
                         "source": t1.source,

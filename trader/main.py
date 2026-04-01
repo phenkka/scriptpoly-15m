@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Literal
 
@@ -68,6 +69,8 @@ class Opportunity(BaseModel):
     profit_usd: float
     legs: list[OpportunityLeg]
     sent_at: str
+    analyzer_calc_at: str | None = None
+    analyzer_tick_ts_max: str | None = None
 
 
 app = FastAPI()
@@ -261,6 +264,7 @@ def _predict_token_id_for_side(market: dict[str, Any], side: str) -> str:
 def _dump_obj(x: Any) -> Any:
     if x is None:
         return None
+
     if hasattr(x, "model_dump"):
         return x.model_dump()
     if hasattr(x, "dict"):
@@ -271,6 +275,15 @@ def _dump_obj(x: Any) -> Any:
     if hasattr(x, "__dict__"):
         return dict(x.__dict__)
     return x
+
+
+def _dt_to_epoch_s(dt: datetime | None) -> float | None:
+    if dt is None:
+        return None
+    try:
+        return dt.replace(tzinfo=None).timestamp()
+    except Exception:
+        return None
 
 
 def _predict_order_to_api(order_obj: dict[str, Any]) -> dict[str, Any]:
@@ -486,32 +499,43 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
     except ValueError:
         signature_type = 0
 
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        chain_id=137,
-        key=private_key,
-        signature_type=signature_type,
-        funder=funder,
-    )
+    host = "https://clob.polymarket.com"
+    try:
+        client = ClobClient(
+            host=host,
+            chain_id=137,
+            key=private_key,
+            signature_type=signature_type,
+            funder=funder,
+        )
 
-    if poly_api_key and poly_secret and poly_passphrase:
-        client.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
-    else:
-        client.set_api_creds(client.create_or_derive_api_creds())
+        if poly_api_key and poly_secret and poly_passphrase:
+            client.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
+        else:
+            client.set_api_creds(client.create_or_derive_api_creds())
 
-    mo = MarketOrderArgs(
-        token_id=str(leg.token_id),
-        amount=float(leg.stake_usd),
-        side=BUY,
-        order_type=OrderType.FOK,
-    )
-    signed = client.create_market_order(mo)
-    resp = client.post_order(signed, OrderType.FOK)
-    return {
-        "token_id": leg.token_id,
-        "amount_usd": float(leg.stake_usd),
-        "response": resp,
-    }
+        mo = MarketOrderArgs(
+            token_id=str(leg.token_id),
+            amount=float(leg.stake_usd),
+            side=BUY,
+            order_type=OrderType.FOK,
+        )
+        signed = client.create_market_order(mo)
+        resp = client.post_order(signed, OrderType.FOK)
+        return {
+            "token_id": leg.token_id,
+            "amount_usd": float(leg.stake_usd),
+            "response": resp,
+        }
+    except Exception as e:
+        proxy_url = os.environ.get("PROXY_URL", "").strip()
+        print(
+            "[TRADER][POLY][ERROR] "
+            f"host={host} token_id={leg.token_id} amount_usd={float(leg.stake_usd):.6f} "
+            f"proxy_set={bool(proxy_url)} err_type={type(e).__name__} err={e}"
+        )
+        print("[TRADER][POLY][TRACE]\n" + traceback.format_exc())
+        raise
 
 
 def _predict_get_jwt(
@@ -693,7 +717,7 @@ def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
     }
 
 
-def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
+def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None = None) -> dict[str, Any]:
     api_key = os.environ.get("PREDICT_API_KEY", "").strip()
     private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
     if not api_key:
@@ -793,6 +817,9 @@ def _place_predict_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
             "order": order_api,
         }
     }
+
+    if timing is not None:
+        timing["predict_create_request_ts"] = time.time()
 
     r = session.post(
         "https://api.predict.fun/v1/orders",
@@ -1069,6 +1096,8 @@ def opportunity(opp: Opportunity) -> dict:
 
     poly_dt = _parse_iso_dt(poly_leg.ts)
     pred_dt = _parse_iso_dt(pred_leg.ts)
+    analyzer_calc_dt = _parse_iso_dt(getattr(opp, "analyzer_calc_at", None))
+    analyzer_tick_max_dt = _parse_iso_dt(getattr(opp, "analyzer_tick_ts_max", None))
     now_dt = datetime.utcnow()
     if poly_dt is not None:
         row["timing"]["poly_quote_age_ms"] = (now_dt - poly_dt.replace(tzinfo=None)).total_seconds() * 1000.0
@@ -1193,11 +1222,15 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": "predict_market_cooldown"}
 
+            # For test safety: once we decide to attempt a trade on this market,
+            # lock it immediately so we don't start multiple buys concurrently.
+            _predict_market_last_buy_ts[int(pred_leg.market_id)] = now_ts
+
         row["predict_preflight"] = _predict_preflight_for_leg(pred_leg)
 
         row["timing"]["predict_start"] = time.time()
         try:
-            predict_result = _place_predict_market_buy(pred_leg)
+            predict_result = _place_predict_market_buy(pred_leg, timing=row["timing"])
         except RuntimeError as e:
             msg = str(e)
             if "create_order_insufficient_collateral_balance" in msg:
@@ -1220,6 +1253,16 @@ def opportunity(opp: Opportunity) -> dict:
             raise
         row["timing"]["predict_end"] = time.time()
         row["predict"] = predict_result
+
+        # Latency from analyzer decision/tick timestamps to the actual create-order request.
+        create_req_ts = row["timing"].get("predict_create_request_ts")
+        if isinstance(create_req_ts, (int, float)):
+            calc_epoch = _dt_to_epoch_s(analyzer_calc_dt)
+            tick_epoch = _dt_to_epoch_s(analyzer_tick_max_dt)
+            if calc_epoch is not None:
+                row["timing"]["analyzer_calc_to_predict_create_ms"] = (create_req_ts - calc_epoch) * 1000.0
+            if tick_epoch is not None:
+                row["timing"]["tick_ts_to_predict_create_ms"] = (create_req_ts - tick_epoch) * 1000.0
 
         resp_obj = predict_result.get("response") or {}
         pred_hash = resp_obj.get("orderHash")
