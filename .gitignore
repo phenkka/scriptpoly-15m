@@ -4,4 +4,4 @@
 .git
 __pycache__
 *.log
-*.json
+*.jsonl
