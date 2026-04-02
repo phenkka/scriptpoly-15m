@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import os
@@ -1377,33 +1378,122 @@ def opportunity(opp: Opportunity) -> dict:
         except Exception as _e_poly_check:
             print(f"[TRADER] poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
-        row["timing"]["predict_start"] = time.time()
-        try:
-            predict_result = _place_predict_market_buy(pred_leg, timing=row["timing"])
-        except RuntimeError as e:
-            msg = str(e)
-            if "create_order_insufficient_collateral_balance" in msg:
-                row["timing"]["predict_end"] = time.time()
-                row["skipped"] = True
-                row["skip_reason"] = {
-                    "code": "predict_insufficient_collateral_balance",
-                    "error": msg,
-                }
-                row["summary"]["status"] = "skipped"
-                row["summary"]["reason_code"] = "predict_insufficient_collateral_balance"
-                row["summary"]["reason"] = row["skip_reason"]
-                print(
-                    "[TRADER][SKIP] "
-                    f"label={opp.label} reason=predict_insufficient_collateral_balance "
-                    f"pred_stake={_fmt_usd(pred_leg.stake_usd)}"
-                )
-                _append_jsonl(trades_file, row)
-                return {"status": "skipped", "reason": "predict_insufficient_collateral_balance"}
-            raise
-        row["timing"]["predict_end"] = time.time()
-        row["predict"] = predict_result
+        # ════════════════════════════════════════════════════════════════
+        # ПАРАЛЛЕЛЬНАЯ отправка обеих ног через ThreadPoolExecutor.
+        # Predict = FOK market buy, Poly = FOK market buy.
+        # Обе ноги стартуют одновременно → submit gap ≈ 0.
+        # Реальный fill gap зависит от бирж — измеряем через fill_analysis.
+        # ════════════════════════════════════════════════════════════════
+        incidents_file = os.environ.get("TRADER_INCIDENTS_FILE", "/data/incidents.jsonl")
 
-        # Latency from analyzer decision/tick timestamps to the actual create-order request.
+        # book_age: сколько мс прошло от получения котировки до момента submit
+        _submit_wall = time.time()
+        _book_freshness: dict[str, Any] = {}
+        if poly_dt is not None:
+            _book_freshness["poly_book_age_at_submit_ms"] = (_submit_wall - poly_dt.replace(tzinfo=None).timestamp()) * 1000.0
+        if pred_dt is not None:
+            _book_freshness["pred_book_age_at_submit_ms"] = (_submit_wall - pred_dt.replace(tzinfo=None).timestamp()) * 1000.0
+        row["book_freshness"] = _book_freshness
+
+        _pred_timing: dict[str, Any] = {}
+        _poly_timing: dict[str, Any] = {}
+
+        def _run_predict_leg() -> dict[str, Any]:
+            _pred_timing["submit_ts"] = time.time()
+            try:
+                res = _place_predict_market_buy(pred_leg, timing=_pred_timing)
+                _pred_timing["ack_ts"] = time.time()
+                return res
+            except Exception:
+                _pred_timing["fail_ts"] = time.time()
+                raise
+            finally:
+                _pred_timing["end"] = time.time()
+
+        def _run_poly_leg() -> dict[str, Any]:
+            _poly_timing["submit_ts"] = time.time()
+            try:
+                res = _place_polymarket_fok_market_buy(poly_leg)
+                _poly_timing["ack_ts"] = time.time()
+                return res
+            except Exception:
+                _poly_timing["fail_ts"] = time.time()
+                raise
+            finally:
+                _poly_timing["end"] = time.time()
+
+        print(
+            f"[TRADER] parallel_exec_start label={opp.label} "
+            f"pred_stake={_fmt_usd(pred_leg.stake_usd)} poly_stake={_fmt_usd(poly_leg.stake_usd)} "
+            f"poly_book_age={_book_freshness.get('poly_book_age_at_submit_ms', 'n/a'):.0f}ms "
+            f"pred_book_age={_book_freshness.get('pred_book_age_at_submit_ms', 'n/a'):.0f}ms"
+        )
+
+        predict_result: dict[str, Any] | None = None
+        polymarket_result: dict[str, Any] | None = None
+        pred_exec_error: Exception | None = None
+        poly_exec_error: Exception | None = None
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="leg") as _pool:
+            _pred_future = _pool.submit(_run_predict_leg)
+            _poly_future = _pool.submit(_run_poly_leg)
+
+            try:
+                predict_result = _pred_future.result()
+            except Exception as _e:
+                pred_exec_error = _e
+                _pred_timing.setdefault("end", time.time())
+            try:
+                polymarket_result = _poly_future.result()
+            except Exception as _e:
+                poly_exec_error = _e
+                _poly_timing.setdefault("end", time.time())
+
+        # ── Timing ──────────────────────────────────────────────────────
+        row["timing"]["predict_start"] = _pred_timing.get("submit_ts")
+        row["timing"]["predict_end"] = _pred_timing.get("end")
+        row["timing"]["predict_ack_ts"] = _pred_timing.get("ack_ts")
+        row["timing"]["predict_create_request_ts"] = _pred_timing.get("predict_create_request_ts")
+        row["timing"]["poly_start"] = _poly_timing.get("submit_ts")
+        row["timing"]["poly_end"] = _poly_timing.get("end")
+        row["timing"]["poly_ack_ts"] = _poly_timing.get("ack_ts")
+        row["timing"]["t_end"] = time.time()
+        row["timing"]["total_ms"] = (row["timing"]["t_end"] - t0) * 1000.0
+
+        _ps = _pred_timing.get("submit_ts")
+        _pe = _pred_timing.get("end")
+        _pys = _poly_timing.get("submit_ts")
+        _pye = _poly_timing.get("end")
+        if _ps and _pe:
+            row["timing"]["predict_ms"] = (_pe - _ps) * 1000.0
+        if _pys and _pye:
+            row["timing"]["poly_ms"] = (_pye - _pys) * 1000.0
+        # submit_gap: разница старта двух submit (0 = идеально одновременно)
+        if _ps and _pys:
+            row["timing"]["submit_gap_ms"] = abs(_ps - _pys) * 1000.0
+        # overlap: сколько мс обе ноги работали одновременно
+        if _ps and _pe and _pys and _pye:
+            overlap_start = max(_ps, _pys)
+            overlap_end = min(_pe, _pye)
+            row["timing"]["overlap_ms"] = max(0.0, (overlap_end - overlap_start) * 1000.0)
+
+        # first_ack / second_ack / unhedged_ms
+        _pred_ack = _pred_timing.get("ack_ts")
+        _poly_ack = _poly_timing.get("ack_ts")
+        if _pred_ack and _poly_ack:
+            _first_ack_ts = min(_pred_ack, _poly_ack)
+            _submit_start = min(_ps or _pred_ack, _pys or _poly_ack)
+            row["timing"]["first_ack_ms"] = (_first_ack_ts - _submit_start) * 1000.0
+            row["timing"]["second_ack_ms"] = (max(_pred_ack, _poly_ack) - _submit_start) * 1000.0
+            row["timing"]["unhedged_ms"] = abs(_pred_ack - _poly_ack) * 1000.0
+            row["timing"]["first_fill_venue"] = "predict" if _pred_ack <= _poly_ack else "polymarket"
+        elif _pred_ack:
+            row["timing"]["first_fill_venue"] = "predict"
+            row["timing"]["unhedged_ms"] = ((_pye or time.time()) - _pred_ack) * 1000.0
+        elif _poly_ack:
+            row["timing"]["first_fill_venue"] = "polymarket"
+            row["timing"]["unhedged_ms"] = ((_pe or time.time()) - _poly_ack) * 1000.0
+
         create_req_ts = row["timing"].get("predict_create_request_ts")
         if isinstance(create_req_ts, (int, float)):
             calc_epoch = _dt_to_epoch_s(analyzer_calc_dt)
@@ -1413,148 +1503,242 @@ def opportunity(opp: Opportunity) -> dict:
             if tick_epoch is not None:
                 row["timing"]["tick_ts_to_predict_create_ms"] = (create_req_ts - tick_epoch) * 1000.0
 
-        resp_obj = predict_result.get("response") or {}
-        pred_hash = resp_obj.get("orderHash")
-        if not pred_hash:
+        # ── Predict result processing ───────────────────────────────────
+        pred_filled = False
+        pred_hash: str | None = None
+        filled_shares_dbg: float | None = None
+        _pred_filled_qty: float = 0.0
+
+        if predict_result is not None:
+            row["predict"] = predict_result
+            resp_obj = predict_result.get("response") or {}
+            pred_hash = resp_obj.get("orderHash")
+            if not pred_hash:
+                try:
+                    pred_hash = (((resp_obj.get("create") or {}).get("data") or {}) or {}).get("orderHash")
+                except Exception:
+                    pred_hash = None
+
+            filled_shares_dbg = _extract_predict_filled_shares(predict_result, requested_shares=float(pred_leg.shares))
+            _pred_filled_qty = filled_shares_dbg if (filled_shares_dbg is not None and filled_shares_dbg > 1e-9) else 0.0
             try:
-                pred_hash = (((resp_obj.get("create") or {}).get("data") or {}) or {}).get("orderHash")
+                last_get = resp_obj.get("get") or {}
+                data = (last_get.get("data") or {}) if isinstance(last_get, dict) else {}
+                status = str(data.get("status") or "")
+                amount_filled_usdt_wei = data.get("amountFilled")
             except Exception:
-                pred_hash = None
+                status = ""
+                amount_filled_usdt_wei = None
 
-        filled_shares_dbg = _extract_predict_filled_shares(predict_result, requested_shares=float(pred_leg.shares))
-        try:
-            last_get = resp_obj.get("get") or {}
-            data = (last_get.get("data") or {}) if isinstance(last_get, dict) else {}
-            status = str(data.get("status") or "")
-            amount_filled_usdt_wei = data.get("amountFilled")
-        except Exception:
-            status = ""
-            amount_filled_usdt_wei = None
-
-        row["summary"]["predict_exec"] = {
-            "order_hash": pred_hash,
-            "status": status,
-            "amountFilled_usdt_wei": amount_filled_usdt_wei,
-            "filled_shares": filled_shares_dbg,
-            "requested_shares": float(pred_leg.shares),
-            "requested_stake_usd": float(pred_leg.stake_usd),
-        }
-
-        try:
-            remove_obj = resp_obj.get("remove")
-        except Exception:
-            remove_obj = None
-        print(
-            "[TRADER] predict_done "
-            f"order_hash={pred_hash} status={status} "
-            f"amountFilled_usdt_wei={amount_filled_usdt_wei} "
-            f"filled_shares={filled_shares_dbg} filled={_predict_resp_is_filled(resp_obj)} "
-            f"remove={remove_obj}"
-        )
-
-        if filled_shares_dbg is not None and filled_shares_dbg > 1e-9:
-            if pred_leg.market_id is not None:
-                _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
-            print(
-                "[TRADER][PREDICT][BUY] "
-                f"label={opp.label} filled_shares={filled_shares_dbg:.6f} "
-                f"requested_shares={float(pred_leg.shares):.6f} "
-                f"requested_stake={_fmt_usd(pred_leg.stake_usd)} order_hash={pred_hash}"
-            )
-
-        if not _predict_resp_is_filled(predict_result.get("response")):
-            row["skipped"] = True
-            row["skip_reason"] = {
-                "code": "predict_not_filled",
+            row["summary"]["predict_exec"] = {
                 "order_hash": pred_hash,
                 "status": status,
                 "amountFilled_usdt_wei": amount_filled_usdt_wei,
+                "filled_shares": filled_shares_dbg,
+                "requested_shares": float(pred_leg.shares),
+                "requested_stake_usd": float(pred_leg.stake_usd),
             }
+
+            pred_filled = _predict_resp_is_filled(resp_obj)
+            print(
+                "[TRADER] predict_done "
+                f"order_hash={pred_hash} status={status} "
+                f"amountFilled_usdt_wei={amount_filled_usdt_wei} "
+                f"filled_shares={filled_shares_dbg} filled={pred_filled}"
+            )
+            if filled_shares_dbg is not None and filled_shares_dbg > 1e-9 and pred_leg.market_id is not None:
+                _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
+        else:
+            print(f"[TRADER] predict_error err={pred_exec_error}")
+
+        # ── Poly result processing ──────────────────────────────────────
+        poly_filled = False
+        _poly_filled_qty: float = 0.0
+        if polymarket_result is not None:
+            row["polymarket"] = polymarket_result
+            _poly_resp = (polymarket_result.get("response") or {})
+            poly_filled = _poly_resp.get("success") is True
+            try:
+                _poly_filled_qty = float(_poly_resp.get("takingAmount") or 0)
+            except (ValueError, TypeError):
+                _poly_filled_qty = 0.0
+            print(
+                "[TRADER] poly_done "
+                f"success={poly_filled} status={_poly_resp.get('status')} "
+                f"making={_poly_resp.get('makingAmount')} taking={_poly_resp.get('takingAmount')}"
+            )
+        else:
+            print(f"[TRADER] poly_error err={poly_exec_error}")
+
+        row["predict_filled_shares"] = filled_shares_dbg
+
+        # ── Fill analysis: 5 ключевых метрик ────────────────────────────
+        _first_fill_venue = row["timing"].get("first_fill_venue")
+        _first_fill_qty = _pred_filled_qty if _first_fill_venue == "predict" else _poly_filled_qty
+        _residual_qty = abs(_pred_filled_qty - _poly_filled_qty)
+
+        # hedge_drift_bps: насколько реальная цена хедж-ноги отклонилась от trigger
+        _hedge_drift_bps: float | None = None
+        if pred_filled and poly_filled:
+            try:
+                _pr = (polymarket_result.get("response") or {})
+                _poly_mk = float(_pr.get("makingAmount") or 0)
+                _poly_tk = float(_pr.get("takingAmount") or 0)
+                if _poly_tk > 0:
+                    _actual_poly_price = _poly_mk / _poly_tk
+                    _trigger_poly_price = float(poly_leg.ask)
+                    if _trigger_poly_price > 0:
+                        _hedge_drift_bps = ((_actual_poly_price - _trigger_poly_price) / _trigger_poly_price) * 10_000
+            except Exception:
+                pass
+
+        row["fill_analysis"] = {
+            "unhedged_ms": row["timing"].get("unhedged_ms"),
+            "first_fill_venue": _first_fill_venue,
+            "first_fill_qty": round(_first_fill_qty, 6),
+            "hedge_drift_bps": round(_hedge_drift_bps, 2) if _hedge_drift_bps is not None else None,
+            "residual_qty_after_abort": round(_residual_qty, 6),
+            "pred_filled_qty": round(_pred_filled_qty, 6),
+            "poly_filled_qty": round(_poly_filled_qty, 6),
+            "requested_qty": round(float(opp.shares), 6),
+        }
+
+        row["parallel_result"] = {
+            "pred_filled": pred_filled,
+            "poly_filled": poly_filled,
+            "pred_error": str(pred_exec_error) if pred_exec_error else None,
+            "poly_error": str(poly_exec_error) if poly_exec_error else None,
+        }
+
+        # ── Incident helper ─────────────────────────────────────────────
+        def _write_incident(incident_type: str, details: dict[str, Any]) -> None:
+            incident = {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "type": incident_type,
+                "label": opp.label,
+                "fill_analysis": row.get("fill_analysis"),
+                "book_freshness": row.get("book_freshness"),
+                "timing": {
+                    "total_ms": row["timing"].get("total_ms"),
+                    "unhedged_ms": row["timing"].get("unhedged_ms"),
+                    "submit_gap_ms": row["timing"].get("submit_gap_ms"),
+                    "predict_ms": row["timing"].get("predict_ms"),
+                    "poly_ms": row["timing"].get("poly_ms"),
+                },
+                "trigger_book": {
+                    "poly_ask": float(poly_leg.ask),
+                    "poly_ask_sz": float(poly_leg.ask_sz),
+                    "pred_ask": float(pred_leg.ask),
+                    "pred_ask_sz": float(pred_leg.ask_sz),
+                },
+                **details,
+            }
+            _append_jsonl(incidents_file, incident)
+
+        # ── Outcome routing ─────────────────────────────────────────────
+        if pred_filled and poly_filled:
+            # ✓ Обе ноги исполнены
+            row["ok"] = True
+            row["summary"]["status"] = "ok"
+            row["summary"]["reason_code"] = "ok"
+        elif not pred_filled and not poly_filled:
+            # Обе ноги не исполнены — чисто, ничего не потеряно
+            skip_code = "both_legs_failed"
+            if pred_exec_error and "insufficient_collateral_balance" in str(pred_exec_error):
+                skip_code = "predict_insufficient_collateral_balance"
+            row["skipped"] = True
+            row["skip_reason"] = {"code": skip_code, "pred_error": str(pred_exec_error), "poly_error": str(poly_exec_error)}
             row["summary"]["status"] = "skipped"
-            row["summary"]["reason_code"] = "predict_not_filled"
+            row["summary"]["reason_code"] = skip_code
             row["summary"]["reason"] = row["skip_reason"]
-            print(f"[TRADER][SKIP] label={opp.label} reason=predict_not_filled")
+            print(f"[TRADER][SKIP] label={opp.label} reason={skip_code}")
             _append_jsonl(trades_file, row)
-            return {"status": "skipped", "reason": "predict_not_filled"}
+            return {"status": "skipped", "reason": skip_code}
+        elif pred_filled and not poly_filled:
+            # ⚠ Predict исполнен, Poly нет — незахеджированная predict позиция
+            row["ok"] = False
+            row["summary"]["status"] = "incident"
+            row["summary"]["reason_code"] = "unhedged_predict"
+            row["summary"]["reason"] = {"poly_error": str(poly_exec_error)}
+            row["unhedged"] = {
+                "leg": "predict",
+                "side": pred_leg.side,
+                "market_id": pred_leg.market_id,
+                "filled_shares": _pred_filled_qty,
+                "stake_usd": float(pred_leg.stake_usd),
+                "residual_qty": _residual_qty,
+            }
+            _write_incident("unhedged_predict", {
+                "unhedged_leg": "predict",
+                "unhedged_side": pred_leg.side,
+                "unhedged_market_id": pred_leg.market_id,
+                "unhedged_qty": _pred_filled_qty,
+                "unhedged_stake_usd": float(pred_leg.stake_usd),
+                "poly_error": str(poly_exec_error),
+            })
+            print(
+                f"[TRADER][INCIDENT] UNHEDGED_PREDICT label={opp.label} "
+                f"pred_filled_qty={_pred_filled_qty:.6f} poly_error={poly_exec_error} "
+                f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
+            )
+            _append_jsonl(trades_file, row)
+            return {"status": "incident", "reason": "unhedged_predict", "unhedged": "predict"}
+        else:
+            # ⚠ Poly исполнен, Predict нет — незахеджированная poly позиция
+            _cancel_result: dict[str, Any] | None = None
+            if predict_result is not None:
+                _resp = predict_result.get("response") or {}
+                _oid = _resp.get("orderId")
+                if _oid:
+                    try:
+                        _cancel_result = _predict_remove_orders(session=_predict_client.get()[0], ids=[_oid])
+                        row["predict_cancel"] = _cancel_result
+                        print(f"[TRADER] predict_cancel_attempt order_id={_oid} result={_cancel_result}")
+                    except Exception as _ce:
+                        row["predict_cancel"] = {"error": str(_ce)}
+                        _cancel_result = {"error": str(_ce)}
+                        print(f"[TRADER] predict_cancel_failed order_id={_oid} err={_ce}")
 
-        # Пересчитываем poly_leg под фактически исполненный объём predict ордера.
-        filled_shares = _extract_predict_filled_shares(predict_result, requested_shares=float(pred_leg.shares))
-        row["predict_filled_shares"] = filled_shares
-        if filled_shares is not None:
-            if filled_shares < 1e-9:
-                row["error"] = "predict_filled_zero_shares"
-                _append_jsonl(trades_file, row)
-                return {"status": "error", "error": "predict_filled_zero_shares"}
-            original_shares = float(poly_leg.shares)
-            # Hedge can only be reduced (partial fill). Never upscale the Poly leg.
-            if filled_shares + 1e-9 < original_shares:
-                scale = filled_shares / max(original_shares, 1e-9)
-                poly_leg = OpportunityLeg(**{
-                    **poly_leg.model_dump(),
-                    "shares": filled_shares,
-                    "stake_usd": float(poly_leg.stake_usd) * scale,
-                })
-                print(
-                    f"[TRADER] predict_partial_fill requested={original_shares:.6f} "
-                    f"filled={filled_shares:.6f} scale={scale:.4f} -> poly hedge adjusted"
-                )
-                row["poly_leg_adjusted"] = poly_leg.model_dump()
+            row["ok"] = False
+            row["summary"]["status"] = "incident"
+            row["summary"]["reason_code"] = "unhedged_poly"
+            row["summary"]["reason"] = {"pred_error": str(pred_exec_error)}
+            row["unhedged"] = {
+                "leg": "polymarket",
+                "side": poly_leg.side,
+                "token_id": poly_leg.token_id,
+                "filled_shares": _poly_filled_qty,
+                "stake_usd": float(poly_leg.stake_usd),
+                "residual_qty": _residual_qty,
+                "predict_cancel": _cancel_result,
+            }
+            _write_incident("unhedged_poly", {
+                "unhedged_leg": "polymarket",
+                "unhedged_side": poly_leg.side,
+                "unhedged_token_id": poly_leg.token_id,
+                "unhedged_qty": _poly_filled_qty,
+                "unhedged_stake_usd": float(poly_leg.stake_usd),
+                "pred_error": str(pred_exec_error),
+                "predict_cancel": _cancel_result,
+            })
+            print(
+                f"[TRADER][INCIDENT] UNHEDGED_POLY label={opp.label} "
+                f"poly_filled_qty={_poly_filled_qty:.6f} pred_error={pred_exec_error} "
+                f"cancel={_cancel_result} unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
+            )
+            _append_jsonl(trades_file, row)
+            return {"status": "incident", "reason": "unhedged_poly", "unhedged": "polymarket"}
 
-        # POST-PREDICT контрольная проверка: логируем текущую poly цену.
-        # Если сумма >= 1.0 — фиксируем убыточный сценарий до размещения хеджа.
-        # Poly-ордер всё равно ставим: не хеджировать уже открытую predict позицию хуже.
-        actual_pred_price = float(pred_leg.ask)  # FOK с slippage=0 → исполнено по этой цене
+        # ── Реальные исполнения для статистики (обе ноги OK) ────────────
         try:
-            live_book_post = _polymarket_book(str(poly_leg.token_id))
-            live_asks_post = live_book_post.get("asks") or []
-            if live_asks_post:
-                live_poly_ask_post = min(float(x["price"]) for x in live_asks_post if float(x.get("price", 0)) > 0)
-                live_sum_post = live_poly_ask_post + actual_pred_price
-                row["live_poly_postcheck"] = {
-                    "live_poly_ask": live_poly_ask_post,
-                    "actual_pred_price": actual_pred_price,
-                    "live_sum": round(live_sum_post, 6),
-                    "at_loss": live_sum_post >= 1.0,
-                }
-                if live_sum_post >= 1.0:
-                    print(
-                        "[TRADER][WARN] post_predict_poly_moved_to_loss "
-                        f"live_poly={live_poly_ask_post:.4f} pred={actual_pred_price:.4f} "
-                        f"sum={live_sum_post:.4f} >= 1.0 — hedging anyway to close predict position"
-                    )
-                else:
-                    print(
-                        "[TRADER] post_predict_poly_ok "
-                        f"live_poly={live_poly_ask_post:.4f} pred={actual_pred_price:.4f} sum={live_sum_post:.4f}"
-                    )
-        except Exception as _e_post:
-            print(f"[TRADER] post_predict_poly_check_failed (non-fatal): {_e_post}")
-
-        print("[TRADER] predict_filled -> placing_polymarket")
-        row["timing"]["poly_start"] = time.time()
-        polymarket_result = _place_polymarket_fok_market_buy(poly_leg)
-        row["timing"]["poly_end"] = time.time()
-        row["polymarket"] = polymarket_result
-        row["timing"]["t_end"] = time.time()
-        row["timing"]["total_ms"] = (row["timing"]["t_end"] - t0) * 1000.0
-        row["timing"]["predict_ms"] = (row["timing"]["predict_end"] - row["timing"]["predict_start"]) * 1000.0
-        row["timing"]["poly_ms"] = (row["timing"]["poly_end"] - row["timing"]["poly_start"]) * 1000.0
-        row["ok"] = True
-        row["summary"]["status"] = "ok"
-        row["summary"]["reason_code"] = "ok"
-
-        # ── Реальные исполнения для статистики ──────────────────────────────
-        # Polymarket: makingAmount = потрачено USDC, takingAmount = получено shares
-        try:
-            poly_resp = (polymarket_result.get("response") or {})
-            poly_making = float(poly_resp.get("makingAmount") or 0)  # потрачено
-            poly_taking = float(poly_resp.get("takingAmount") or 0)  # получено shares
+            poly_resp_data = (polymarket_result.get("response") or {})
+            poly_making = float(poly_resp_data.get("makingAmount") or 0)
+            poly_taking = float(poly_resp_data.get("takingAmount") or 0)
             poly_actual_price = (poly_making / poly_taking) if poly_taking > 0 else None
         except Exception:
             poly_making = poly_taking = 0.0
             poly_actual_price = None
 
-        # Predict: makerAmount = потрачено (wei/1e18), takerAmount = получено shares (wei/1e18)
         try:
             pred_req_order = (((predict_result.get("request") or {}).get("data") or {}).get("order") or {})
             pred_making = int(str(pred_req_order.get("makerAmount") or "0")) / 10**18
@@ -1589,12 +1773,15 @@ def opportunity(opp: Opportunity) -> dict:
             "estimated_profit_usd": round(opp.profit_usd, 6),
         }
         row["summary"]["actual_execution"] = row["actual_execution"]
-        # ────────────────────────────────────────────────────────────────────
 
         print(
             "[TRADER][OK] "
-            f"label={opp.label} shares={opp.shares:.4f} stake={_fmt_usd(opp.stake_usd)} profit={_fmt_usd(opp.profit_usd)} "
-            f"actual_bundle={f'{bundle_sum:.4f}' if bundle_sum else 'n/a'} actual_profit={_fmt_usd(actual_profit)}"
+            f"label={opp.label} shares={opp.shares:.4f} stake={_fmt_usd(opp.stake_usd)} "
+            f"actual_bundle={f'{bundle_sum:.4f}' if bundle_sum else 'n/a'} actual_profit={_fmt_usd(actual_profit)} "
+            f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')} "
+            f"submit_gap_ms={row['timing'].get('submit_gap_ms', 'n/a')} "
+            f"hedge_drift_bps={_hedge_drift_bps or 'n/a'} "
+            f"residual_qty={_residual_qty:.6f}"
         )
         _append_jsonl(trades_file, row)
         _append_jsonl(success_trades_file, row)
