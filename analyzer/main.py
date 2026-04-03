@@ -30,6 +30,7 @@ class TickMeta(BaseModel):
     token_ids: dict[str, str | None] | None = None
     market_id: int | None = None
     title: str | None = None
+    poly_fee_rate: float | None = None  # dynamic taker fee rate from CLOB API
 
 
 class Tick(BaseModel):
@@ -147,169 +148,228 @@ def _check_arbitrage() -> None:
         q = _side_obj(t, side)
         return q.ask, float(q.ask_sz)
 
-    # Buy UP on A and DOWN on B => ask_up(A) + ask_down(B) < 1
-    # Only keep unique combinations; swapped legs would be identical.
-    combos: list[tuple[str, Tick, Literal["up", "down"], Tick, Literal["up", "down"]]] = [
-        ("UP@poly + DOWN@pred", poly, "up", pred, "down"),
-        ("DOWN@poly + UP@pred", poly, "down", pred, "up"),
+    def _levels_bids(t: Tick, side: Literal["up", "down"]) -> list[tuple[float, float]]:
+        """Bid levels sorted highest-first (best bid at index 0)."""
+        q = _side_obj(t, side)
+        levels = q.bids or []
+        out: list[tuple[float, float]] = []
+        for lvl in levels[: max(0, max_book_levels)]:
+            try:
+                p = float(lvl[0])
+                sz = float(lvl[1])
+            except Exception:
+                continue
+            if p <= 0.0 or p >= 1.0 or sz <= 0.0:
+                continue
+            out.append((p, sz))
+        if out:
+            return sorted(out, key=lambda x: -x[0])
+        if q.bid is None or q.bid_sz <= 0:
+            return []
+        return [(float(q.bid), float(q.bid_sz))]
+
+    # ════════════════════════════════════════════════════════════════════
+    # BID+ASK: Predict maker-bid + Polymarket taker-ask < 1.0
+    # Размещаем пассивный LIMIT BID на Predict; хеджируем на Poly после фила.
+    # ════════════════════════════════════════════════════════════════════
+    predict_fee_bps = float(CFG.predict_fee_bps)
+    # Dynamic fee rate: prefer tick meta (from CLOB API), fallback to config
+    _poly_meta_rate = None
+    if poly and poly.meta:
+        _poly_meta_rate = poly.meta.poly_fee_rate
+    poly_fee_rate = float(_poly_meta_rate) if _poly_meta_rate is not None and _poly_meta_rate > 0 else float(CFG.poly_fee_rate)
+    ba_safety_buffer_bps = float(CFG.ba_safety_buffer_bps)
+    ba_min_net_edge_bps = float(CFG.ba_min_net_edge_bps)
+    predict_max_bid_price = float(CFG.predict_max_bid_price)
+    poly_max_hedge_price = float(CFG.poly_max_hedge_price)
+    pred_reserve_usd = float(CFG.pred_reserve_usd)
+    poly_reserve_usd = float(CFG.poly_reserve_usd)
+    poly_bank_util_max = float(CFG.poly_bank_util_max)
+    poly_min_order_usd = float(CFG.poly_min_order_usd)
+    predict_min_order_usd = float(CFG.predict_min_order_usd)
+
+    ba_combos: list[tuple[str, Tick, Literal["up", "down"], Tick, Literal["up", "down"]]] = [
+        ("BA:UP@poly + DOWN@pred", poly, "up", pred, "down"),
+        ("BA:DOWN@poly + UP@pred", poly, "down", pred, "up"),
     ]
 
-    for label, t1, side1, t2, side2 in combos:
-        t1_slot = t1.meta.slot if t1.meta else None
-        t2_slot = t2.meta.slot if t2.meta else None
-        if t1_slot is None or t2_slot is None or t1_slot != t2_slot:
+    for ba_label, t_poly, side_poly, t_pred, side_pred in ba_combos:
+        ba_t1_slot = t_poly.meta.slot if t_poly.meta else None
+        ba_t2_slot = t_pred.meta.slot if t_pred.meta else None
+        if ba_t1_slot is None or ba_t2_slot is None or ba_t1_slot != ba_t2_slot:
             continue
 
-        slot_key = int(t1_slot)
-        key = (label, slot_key)
+        ba_slot_key = int(ba_t1_slot)
+        ba_key = (ba_label, ba_slot_key)
 
-        ask1, _sz1_top = _get_ask_and_sz(t1, side1)
-        ask2, _sz2_top = _get_ask_and_sz(t2, side2)
-
-        if ask1 is None or ask2 is None:
-            continue
-        if ask1 <= 0.0 or ask2 <= 0.0:
-            continue
-        if ask1 >= 1.0 or ask2 >= 1.0:
+        # BID+ASK цена бида ВЫЧИСЛЯЕТСЯ из цены Poly — не из существующей книги Predict.
+        # Мы размещаем LIMIT BID на Predict по нашей целевой цене; книга Predict не нужна.
+        ask_levels_poly = _levels_asks(t_poly, side_poly)
+        if not ask_levels_poly:
             continue
 
-        # Use VWAP-effective asks (depth-aware) for sizing and profitability.
-        levels1 = _levels_asks(t1, side1)
-        levels2 = _levels_asks(t2, side2)
-        depth1 = _depth_shares_from_asks(levels1)
-        depth2 = _depth_shares_from_asks(levels2)
-        if depth1 <= 0.0 or depth2 <= 0.0:
+        poly_ask_top = ask_levels_poly[0][0]
+        if poly_ask_top <= 0.0:
             continue
 
-        # First estimate with top-of-book ask as an initial sizing hint.
-        # We'll later re-evaluate costs with VWAP at the final q.
-        s_top = float(ask1) + float(ask2)
-        if s_top <= 0.0:
+        # Фильтр: Poly top-of-book слишком дорог
+        if poly_ask_top >= poly_max_hedge_price:
             continue
 
-        # Sizing model: buy the SAME number of shares Q on both legs.
-        q_limits = [
-            depth1,
-            depth2,
-        ]
+        pred_fee_frac = predict_fee_bps / 10000.0
+        safety_frac = ba_safety_buffer_bps / 10000.0
+        poly_slippage_frac = poly_buffer_bps / 10000.0
 
-        t1_bankroll = poly_bankroll_usd if t1.source == "polymarket" else pred_bankroll_usd
-        t2_bankroll = poly_bankroll_usd if t2.source == "polymarket" else pred_bankroll_usd
+        # Вычисляем максимальную прибыльную цену бида на Predict (по top-of-book poly)
+        _dyn_fee_top = poly_fee_rate * poly_ask_top * (1.0 - poly_ask_top)
+        _eff_poly_top = poly_ask_top * (1.0 + poly_slippage_frac) + _dyn_fee_top
+        pred_fee_mult = 1.0 + pred_fee_frac
+        max_bid = (1.0 - _eff_poly_top - safety_frac) / pred_fee_mult if pred_fee_mult > 0 else 0.0
 
-        q_limits.extend([
-            (t1_bankroll / float(ask1)) if t1_bankroll > 0 else 0.0,
-            (t2_bankroll / float(ask2)) if t2_bankroll > 0 else 0.0,
-            (trader_max_trade_usd / s_top) if trader_max_trade_usd > 0 else 0.0,
-        ])
-
-        q = min(q_limits)
-        if q <= 0.0:
+        if max_bid <= 0.0:
             continue
 
-        vwap1 = _vwap_for_shares(levels1, q)
-        vwap2 = _vwap_for_shares(levels2, q)
-        if vwap1 is None or vwap2 is None:
+        # Применяем лимит цены; итоговая target_bid — цена нашего лимитного ордера
+        target_bid = min(max_bid, predict_max_bid_price)
+        if target_bid <= 0.0:
             continue
 
-        bps1 = _buffer_bps_for_source(t1.source)
-        bps2 = _buffer_bps_for_source(t2.source)
-        eff1 = float(vwap1) * (1.0 + float(bps1) / 10000.0)
-        eff2 = float(vwap2) * (1.0 + float(bps2) / 10000.0)
-
-        s_eff = eff1 + eff2
-        edge_eff = 1.0 - s_eff
-        if edge_eff <= 0.0:
+        # Размещение идёт только если poly позволяет нормально хеджировать
+        depth_poly_ask = _depth_shares_from_asks(ask_levels_poly)
+        if depth_poly_ask <= 0.0:
             continue
 
-        pool1_usd = float(vwap1) * depth1
-        pool2_usd = float(vwap2) * depth2
-
-        cost1_usd = q * eff1
-        cost2_usd = q * eff2
-        total_cost_usd = q * s_eff
-        profit_usd = q * edge_eff
-
-        if total_cost_usd < min_stake_usd:
-            continue
-        if profit_usd < min_profit_usd:
+        q_ba = min(
+            depth_poly_ask,
+            (max(0.0, poly_bankroll_usd - poly_reserve_usd) / poly_ask_top) if poly_bankroll_usd > 0 else depth_poly_ask,
+            (max(0.0, pred_bankroll_usd - pred_reserve_usd) / target_bid) if pred_bankroll_usd > 0 else depth_poly_ask,
+            (trader_max_trade_usd / (target_bid + poly_ask_top)) if trader_max_trade_usd > 0 else depth_poly_ask,
+        )
+        if q_ba <= 0.0:
             continue
 
-        # Expected profit on total spend (stake) using bundle-arb model:
-        # ROI on cost = (1 - s) / s
-        roi = edge_eff / s_eff
-
-        prev_best = _best_profit_usd.get(key)
-        if prev_best is not None and profit_usd <= prev_best + 1e-6:
+        # VWAP на Poly для точного расчёта по фактическому размеру
+        vwap_poly_ask = _vwap_for_shares(ask_levels_poly, q_ba)
+        if vwap_poly_ask is None:
             continue
 
-        _best_profit_usd[key] = profit_usd
+        # Фильтр: VWAP poly слишком высок
+        if vwap_poly_ask >= poly_max_hedge_price:
+            continue
 
-        if s_eff < 1.0:
-            t1_token_id = None
-            if t1.meta and t1.meta.token_ids:
-                t1_token_id = t1.meta.token_ids.get(side1)
-            t2_token_id = None
-            if t2.meta and t2.meta.token_ids:
-                t2_token_id = t2.meta.token_ids.get(side2)
+        # Уточняем динамическую комиссию по VWAP
+        poly_dynamic_fee = poly_fee_rate * vwap_poly_ask * (1.0 - vwap_poly_ask)
+        eff_poly_ask = vwap_poly_ask * (1.0 + poly_slippage_frac) + poly_dynamic_fee
 
-            payload = {
-                "type": "arbitrage",
-                "label": label,
-                "sum": s_eff,
-                "edge": edge_eff,
-                "roi": roi,
-                "shares": q,
-                "stake_usd": total_cost_usd,
-                "payout_usd": q,
-                "profit_usd": profit_usd,
-                "min_stake_usd": min_stake_usd,
-                "min_profit_usd": min_profit_usd,
-                "analyzer_calc_at": datetime.utcnow().isoformat() + "Z",
-                "analyzer_tick_ts_max": max(t1.ts, t2.ts).isoformat(),
-                "legs": [
-                    {
-                        "source": t1.source,
-                        "side": side1,
-                        "ts": t1.ts.isoformat(),
-                        "ask": float(vwap1),
-                        "ask_sz": float(depth1),
-                        "vwap": float(vwap1),
-                        "buffer_bps": float(bps1),
-                        "ask_top": float(ask1),
-                        "pool_usd": pool1_usd,
-                        "shares": q,
-                        "stake_usd": cost1_usd,
-                        "token_id": t1_token_id,
-                        "market_id": t1.meta.market_id if t1.meta else None,
-                        "title": t1.meta.title if t1.meta else None,
-                    },
-                    {
-                        "source": t2.source,
-                        "side": side2,
-                        "ts": t2.ts.isoformat(),
-                        "ask": float(vwap2),
-                        "ask_sz": float(depth2),
-                        "vwap": float(vwap2),
-                        "buffer_bps": float(bps2),
-                        "ask_top": float(ask2),
-                        "pool_usd": pool2_usd,
-                        "shares": q,
-                        "stake_usd": cost2_usd,
-                        "token_id": t2_token_id,
-                        "market_id": t2.meta.market_id if t2.meta else None,
-                        "title": t2.meta.title if t2.meta else None,
-                    },
-                ],
-                "sent_at": datetime.utcnow().isoformat() + "Z",
-            }
-            print(
-                f"[ARBITRAGE] {label} sum={s_eff:.4f} edge={edge_eff:.4f} roi={roi:.4f} "
-                f"shares={q:.2f} cost=${total_cost_usd:.2f} payout=${q:.2f} profit=${profit_usd:.2f} "
-                f"| leg1 {t1.source}:{side1}@{t1.ts.isoformat()} vwap={float(vwap1):.4f} top={float(ask1):.4f} depth={depth1:.1f} stake=${cost1_usd:.2f} "
-                f"| leg2 {t2.source}:{side2}@{t2.ts.isoformat()} vwap={float(vwap2):.4f} top={float(ask2):.4f} depth={depth2:.1f} stake=${cost2_usd:.2f}"
-            )
+        # Наш бид на Predict = target_bid (worst-case edge: платим полную target_bid)
+        vwap_pred_bid = target_bid
+        eff_pred_bid = vwap_pred_bid * pred_fee_mult
 
-            _post_opportunity(payload)
+        ba_s_eff = eff_pred_bid + eff_poly_ask + safety_frac
+        ba_edge = 1.0 - ba_s_eff
+        ba_net_edge_bps = ba_edge * 10000.0
+
+        if ba_net_edge_bps <= ba_min_net_edge_bps:
+            continue
+
+        ba_cost_pred = q_ba * eff_pred_bid
+        ba_cost_poly = q_ba * eff_poly_ask
+        ba_total_cost = ba_cost_pred + ba_cost_poly
+        ba_profit = q_ba * ba_edge
+        ba_roi = ba_edge / ba_s_eff
+
+        if ba_total_cost < min_stake_usd:
+            continue
+        if ba_profit < min_profit_usd:
+            continue
+
+        # Фильтр: poly стоимость превышает лимит использования банкролла
+        if poly_bankroll_usd > 0 and ba_cost_poly > poly_bank_util_max * poly_bankroll_usd:
+            continue
+
+        # Фильтр: минимальные размеры ордеров (poly = немедленный hedge, pred = limit bid)
+        if ba_cost_poly < poly_min_order_usd:
+            continue
+        if ba_cost_pred < predict_min_order_usd:
+            continue
+
+        prev_ba = _best_profit_usd.get(ba_key)
+        if prev_ba is not None and ba_profit <= prev_ba + 1e-6:
+            continue
+        _best_profit_usd[ba_key] = ba_profit
+
+        ba_poly_token_id = None
+        if t_poly.meta and t_poly.meta.token_ids:
+            ba_poly_token_id = t_poly.meta.token_ids.get(side_poly)
+        ba_pred_token_id = None
+        if t_pred.meta and t_pred.meta.token_ids:
+            ba_pred_token_id = t_pred.meta.token_ids.get(side_pred)
+
+        ba_payload = {
+            "type": "bid_ask_arbitrage",
+            "label": ba_label,
+            "sum": ba_s_eff,
+            "edge": ba_edge,
+            "net_edge_bps": round(ba_net_edge_bps, 2),
+            "roi": ba_roi,
+            "shares": q_ba,
+            "stake_usd": ba_total_cost,
+            "payout_usd": q_ba,
+            "profit_usd": ba_profit,
+            "min_stake_usd": min_stake_usd,
+            "min_profit_usd": min_profit_usd,
+            "poly_dynamic_fee": round(poly_dynamic_fee, 6),
+            "poly_fee_rate": poly_fee_rate,
+            "predict_fee_bps": predict_fee_bps,
+            "safety_buffer_bps": ba_safety_buffer_bps,
+            "predict_max_bid_price": predict_max_bid_price,
+            "analyzer_calc_at": datetime.utcnow().isoformat() + "Z",
+            "analyzer_tick_ts_max": max(t_poly.ts, t_pred.ts).isoformat(),
+            "legs": [
+                {
+                    "source": t_poly.source,
+                    "side": side_poly,
+                    "ts": t_poly.ts.isoformat(),
+                    "ask": float(vwap_poly_ask),
+                    "ask_sz": float(depth_poly_ask),
+                    "vwap": float(vwap_poly_ask),
+                    "buffer_bps": float(poly_buffer_bps),
+                    "ask_top": float(poly_ask_top),
+                    "pool_usd": float(vwap_poly_ask) * depth_poly_ask,
+                    "shares": q_ba,
+                    "stake_usd": ba_cost_poly,
+                    "token_id": ba_poly_token_id,
+                    "market_id": t_poly.meta.market_id if t_poly.meta else None,
+                    "title": t_poly.meta.title if t_poly.meta else None,
+                },
+                {
+                    "source": t_pred.source,
+                    "side": side_pred,
+                    "ts": t_pred.ts.isoformat(),
+                    "ask": float(target_bid),      # = наша целевая цена лимитного бида
+                    "ask_sz": float(q_ba),
+                    "vwap": float(vwap_pred_bid),
+                    "buffer_bps": 0.0,
+                    "ask_top": float(target_bid),
+                    "pool_usd": float(vwap_pred_bid) * q_ba,
+                    "shares": q_ba,
+                    "stake_usd": ba_cost_pred,
+                    "token_id": ba_pred_token_id,
+                    "market_id": t_pred.meta.market_id if t_pred.meta else None,
+                    "title": t_pred.meta.title if t_pred.meta else None,
+                },
+            ],
+            "sent_at": datetime.utcnow().isoformat() + "Z",
+        }
+        print(
+            f"[BID+ASK] {ba_label} sum={ba_s_eff:.4f} edge={ba_edge:.4f} net_edge_bps={ba_net_edge_bps:.1f} "
+            f"roi={ba_roi:.4f} shares={q_ba:.2f} cost=${ba_total_cost:.2f} profit=${ba_profit:.2f} "
+            f"| poly({side_poly}) ask_vwap={vwap_poly_ask:.4f} eff={eff_poly_ask:.4f} top={poly_ask_top:.4f} "
+            f"depth={depth_poly_ask:.1f} fee={poly_dynamic_fee:.4f} "
+            f"| pred({side_pred}) target_bid={target_bid:.4f} max_bid={max_bid:.4f} eff={eff_pred_bid:.4f} "
+            f"| safety={ba_safety_buffer_bps:.0f}bps"
+        )
+        _post_opportunity(ba_payload)
 
 
 @app.post("/ingest")

@@ -1,8 +1,8 @@
 """
-predict.fun BTC/USD Up or Down - 15min Order Book Monitor
+predict.fun BTC/USD Up or Down - 1h Order Book Monitor
 ==========================================================
 Каждую секунду получает лучший BID (покупка) и ASK (продажа)
-для токенов UP (Yes) и DOWN (No) текущего 15-минутного рынка.
+для токенов UP (Yes) и DOWN (No) текущего часового рынка.
 
 Требования:
   pip install requests python-dotenv
@@ -18,6 +18,7 @@ API ключ:
   DOWN = complement: bid_down = 1 - ask_up[0], ask_down = 1 - bid_up[0]
 """
 
+import calendar
 import io
 import os
 import sys
@@ -58,7 +59,7 @@ except ImportError:
 
 API_BASE = "https://api.predict.fun/v1"
 ET_ZONE  = ZoneInfo("America/New_York")
-SLOT_MIN = 15  # минут в окне
+SLOT_MIN = 60  # минут в окне
 
 # ── Цвета ANSI ─────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -103,36 +104,33 @@ def complement(price: float, decimal_precision: int = 2) -> float:
 # ──────────────────────────────────────────────────────────────
 
 def current_et_slot() -> datetime:
-    """Возвращает начало текущего 15-минутного слота в ET."""
+    """Возвращает начало текущего часового слота в ET."""
     now_et = datetime.now(tz=ET_ZONE)
-    slot_min = (now_et.minute // SLOT_MIN) * SLOT_MIN
-    return now_et.replace(minute=slot_min, second=0, microsecond=0)
+    return now_et.replace(minute=0, second=0, microsecond=0)
+
+
+_MONTH_NAMES = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
 
 
 def slot_to_slug(slot_et: datetime) -> str:
     """
     Формирует slug рынка из временного слота ET.
-    Пример: btc-usd-up-down-2026-03-31-11-30-15-minutes
+    Пример: bitcoin-up-or-down-april-3-2026-2pm-et
     """
-    return (
-        f"btc-usd-up-down-"
-        f"{slot_et.year:04d}-{slot_et.month:02d}-{slot_et.day:02d}-"
-        f"{slot_et.hour:02d}-{slot_et.minute:02d}-15-minutes"
-    )
+    month = slot_et.strftime("%B").lower()   # "april"
+    day   = slot_et.day                       # 3 (без нуля)
+    year  = slot_et.year
+    hour12 = slot_et.hour % 12 or 12
+    ampm   = "am" if slot_et.hour < 12 else "pm"
+    return f"bitcoin-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
 
 
 def slot_to_title(slot_et: datetime) -> str:
-    """Строит поисковый запрос по слоту."""
-    end_et = slot_et + timedelta(minutes=SLOT_MIN)
-    hour_12  = slot_et.hour % 12 or 12
-    ampm     = "AM" if slot_et.hour < 12 else "PM"
-    end_h12  = end_et.hour % 12 or 12
-    end_ampm = "AM" if end_et.hour < 12 else "PM"
-    month = slot_et.strftime("%B")  # "March"
-    return (
-        f"BTC/USD Up or Down - {month} {slot_et.day}, "
-        f"{hour_12}:{slot_et.minute:02d}-{end_h12}:{end_et.minute:02d}{end_ampm} ET"
-    )
+    """Строит ожидаемый заголовок рынка."""
+    month  = slot_et.strftime("%B")      # "April"
+    hour12 = slot_et.hour % 12 or 12
+    ampm   = "AM" if slot_et.hour < 12 else "PM"
+    return f"Bitcoin Up or Down - {month} {slot_et.day}, {hour12}{ampm} ET"
 
 
 def slot_end_utc(slot_et: datetime) -> datetime:
@@ -147,7 +145,7 @@ def slot_end_utc(slot_et: datetime) -> datetime:
 
 def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str, int, datetime] | tuple[None, None, None, None]:
     """
-    Ищет ближайший активный или предстоящий BTC/USD 15-мин рынок.
+    Ищет активный или предстоящий Bitcoin 1-час Up/Down рынок.
     Возвращает (market_id, title, decimal_precision, ends_utc).
     """
     now_utc = datetime.now(tz=timezone.utc)
@@ -180,7 +178,7 @@ def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str
     try:
         resp = session.get(
             f"{API_BASE}/search",
-            params={"query": "BTC/USD Up or Down 15 minutes", "limit": "20"},
+            params={"query": "Bitcoin Up or Down 1 hour", "limit": "20"},
             timeout=10,
         )
         resp.raise_for_status()
@@ -197,7 +195,8 @@ def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str
         if c.get("marketVariant") != "CRYPTO_UP_DOWN":
             continue
         title = c.get("title", "")
-        if "BTC/USD" not in title:
+        title_up = title.upper()
+        if "BTC" not in title_up and "BITCOIN" not in title_up:
             continue
         starts_str = c.get("startsAt")
         ends_str   = c.get("endsAt")
@@ -215,27 +214,51 @@ def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str
 
     # Из top-level markets восстанавливаем время через categorySlug
     for m in data.get("markets", []):
-        if m.get("marketVariant") != "CRYPTO_UP_DOWN" or "BTC/USD" not in m.get("title", ""):
+        m_title = m.get("title", "")
+        m_title_up = m_title.upper()
+        if m.get("marketVariant") != "CRYPTO_UP_DOWN":
+            continue
+        if "BTC" not in m_title_up and "BITCOIN" not in m_title_up:
             continue
         cs = m.get("categorySlug", "")
-        parts = cs.split("-")
-        try:
-            yr, mo, dy, hh, mm = int(parts[4]), int(parts[5]), int(parts[6]), int(parts[7]), int(parts[8])
-            start_et = datetime(yr, mo, dy, hh, mm, tzinfo=ET_ZONE)
-            end_et   = start_et + timedelta(minutes=SLOT_MIN)
-            starts   = start_et.astimezone(timezone.utc)
-            ends     = end_et.astimezone(timezone.utc)
-            mid = m.get("id")
-            dp  = m.get("decimalPrecision", 2)
-            title = m.get("title", "")
-            if starts <= now_utc <= ends:
-                if not any(x[1] == mid for x in active):
-                    active.append((starts, mid, title, dp, ends))
-            elif starts > now_utc:
-                if not any(x[1] == mid for x in upcoming):
-                    upcoming.append((starts, mid, title, dp, ends))
-        except (IndexError, ValueError):
-            pass
+        start_et: datetime | None = None
+        # New format: bitcoin-up-or-down-april-3-2026-2pm-et
+        if cs.startswith("bitcoin-up-or-down-"):
+            try:
+                rest = cs[len("bitcoin-up-or-down-"):].split("-")
+                # rest = ["april", "3", "2026", "2pm", "et"]
+                mo_num = _MONTH_NAMES.get(rest[0])
+                dy_num = int(rest[1])
+                yr_num = int(rest[2])
+                t_str  = rest[3]  # "2pm" / "10am"
+                is_pm  = t_str.endswith("pm")
+                hh12   = int(t_str[:-2])
+                hh24   = (hh12 % 12) + (12 if is_pm else 0)
+                if mo_num:
+                    start_et = datetime(yr_num, mo_num, dy_num, hh24, 0, tzinfo=ET_ZONE)
+            except (IndexError, ValueError, TypeError):
+                pass
+        else:
+            # Old format: btc-usd-up-down-YYYY-MM-DD-HH-MM-*
+            try:
+                parts = cs.split("-")
+                yr2, mo2, dy2, hh2, mm2 = int(parts[4]), int(parts[5]), int(parts[6]), int(parts[7]), int(parts[8])
+                start_et = datetime(yr2, mo2, dy2, hh2, mm2, tzinfo=ET_ZONE)
+            except (IndexError, ValueError):
+                pass
+        if start_et is None:
+            continue
+        end_et = start_et + timedelta(minutes=SLOT_MIN)
+        starts = start_et.astimezone(timezone.utc)
+        ends   = end_et.astimezone(timezone.utc)
+        mid    = m.get("id")
+        dp     = m.get("decimalPrecision", 2)
+        if starts <= now_utc <= ends:
+            if not any(x[1] == mid for x in active):
+                active.append((starts, mid, m_title, dp, ends))
+        elif starts > now_utc:
+            if not any(x[1] == mid for x in upcoming):
+                upcoming.append((starts, mid, m_title, dp, ends))
 
     if active:
         active.sort()
@@ -252,7 +275,7 @@ def find_market(session: requests.Session, _slot_et: datetime) -> tuple[int, str
         print(f"  {YELLOW}Ближайший рынок: {title} (старт {local_start}, через {wait_s:.0f}с){RESET}")
         return mid, title, dp, ends
 
-    print(f"  {YELLOW}[WARN] Рынок BTC/USD 15-мин не найден{RESET}")
+    print(f"  {YELLOW}[WARN] Рынок BTC/USD 1-час не найден{RESET}")
     return None, None, None, None
 
 

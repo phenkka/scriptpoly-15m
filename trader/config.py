@@ -42,6 +42,8 @@ class TraderConfig:
         self.predict_slippage_bps = _env_int("PREDICT_SLIPPAGE_BPS", 0)
         self.predict_fill_timeout_sec = _env_float("PREDICT_FILL_TIMEOUT_SEC", 6.0)
         self.predict_fill_poll_interval_sec = _env_float("PREDICT_FILL_POLL_INTERVAL_SEC", 0.2)
+        self.predict_limit_fill_timeout_sec = _env_float("PREDICT_LIMIT_FILL_TIMEOUT_SEC", 30.0)
+        self.predict_limit_poll_interval_sec = _env_float("PREDICT_LIMIT_POLL_INTERVAL_SEC", 0.5)
         self.predict_market_cooldown_sec = _env_float("PREDICT_MARKET_COOLDOWN_SEC", 900.0)
 
         self.predict_proxy_url = os.environ.get("PREDICT_PROXY_URL", "").strip() or None

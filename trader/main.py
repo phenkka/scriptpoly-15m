@@ -159,6 +159,11 @@ class Opportunity(BaseModel):
     sent_at: str
     analyzer_calc_at: str | None = None
     analyzer_tick_ts_max: str | None = None
+    poly_dynamic_fee: float | None = None
+    poly_fee_rate: float | None = None
+    predict_fee_bps: float | None = None
+    safety_buffer_bps: float | None = None
+    predict_max_bid_price: float | None = None
 
 
 app = FastAPI()
@@ -334,6 +339,62 @@ def _polymarket_book(token_id: str) -> dict[str, Any]:
     if not isinstance(j, dict):
         raise RuntimeError("polymarket_book_bad_response")
     return j
+
+
+_poly_fee_rate_cache: dict[str, float] = {}
+_POLY_FEE_RATE_FALLBACK = 0.072  # Crypto category default
+
+
+def _fetch_poly_fee_rate(token_id: str) -> float:
+    """Fetch taker fee rate from Polymarket CLOB API. Caches per token_id."""
+    cached = _poly_fee_rate_cache.get(token_id)
+    if cached is not None:
+        return cached
+    try:
+        r = requests.get("https://clob.polymarket.com/fee-rate", params={"token_id": token_id}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        rate_bps = float(data.get("fee_rate_bps", data.get("feeRateBps", 0)) or 0)
+        rate = rate_bps / 10_000 if rate_bps > 1 else rate_bps
+        if rate <= 0:
+            rate = _POLY_FEE_RATE_FALLBACK
+        _poly_fee_rate_cache[token_id] = rate
+        return rate
+    except Exception:
+        _poly_fee_rate_cache[token_id] = _POLY_FEE_RATE_FALLBACK
+        return _POLY_FEE_RATE_FALLBACK
+
+
+def _vwap_from_poly_book(book: dict[str, Any], shares: float) -> float | None:
+    """Calculate VWAP from live Polymarket asks book for a given number of shares.
+    Returns None if insufficient liquidity."""
+    asks_raw = book.get("asks") or []
+    if not asks_raw or shares <= 0:
+        return None
+    # Sort asks by price ascending
+    levels: list[tuple[float, float]] = []
+    for a in asks_raw:
+        try:
+            p = float(a.get("price", 0))
+            sz = float(a.get("size", 0))
+            if p > 0 and sz > 0:
+                levels.append((p, sz))
+        except (ValueError, TypeError):
+            continue
+    levels.sort(key=lambda x: x[0])
+    remaining = shares
+    cost = 0.0
+    got = 0.0
+    for p, sz in levels:
+        if remaining <= 0:
+            break
+        take = min(remaining, sz)
+        cost += take * p
+        got += take
+        remaining -= take
+    if got <= 0:
+        return None
+    return cost / got
 
 
 def _predict_token_id_for_side(market: dict[str, Any], side: str) -> str:
@@ -552,7 +613,7 @@ def _append_jsonl(path_s: str, row: dict[str, Any]) -> None:
 def _preflight(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: OpportunityLeg) -> list[str]:
     errs: list[str] = []
 
-    if opp.type != "arbitrage":
+    if opp.type not in {"arbitrage", "bid_ask_arbitrage"}:
         errs.append(f"unsupported_type:{opp.type}")
 
     if poly_leg.token_id is None or not str(poly_leg.token_id).strip():
@@ -580,7 +641,7 @@ def _preflight(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: Opportunity
 
 def _preflight_test(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: OpportunityLeg) -> list[str]:
     errs: list[str] = []
-    if opp.type != "arbitrage":
+    if opp.type not in {"arbitrage", "bid_ask_arbitrage"}:
         errs.append(f"unsupported_type:{opp.type}")
     if poly_leg.token_id is None or not str(poly_leg.token_id).strip():
         errs.append("polymarket_missing_token_id")
@@ -699,128 +760,465 @@ def _predict_get_jwt(
     return r2.json()["data"]["token"]
 
 
-def _place_predict_limit_buy(leg: OpportunityLeg) -> dict[str, Any]:
-    api_key = os.environ.get("PREDICT_API_KEY", "").strip()
-    private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
-    if not api_key:
-        raise RuntimeError("missing_env:PREDICT_API_KEY")
-    if not private_key:
-        raise RuntimeError("missing_env:PREDICT_PRIVATE_KEY")
+def _place_predict_limit_buy(
+    leg: OpportunityLeg,
+    *,
+    poly_hedge_ask: float = 0.0,
+    predict_fee_bps: float = 0.0,
+    poly_fee_rate: float = 0.072,
+    safety_buffer_bps: float = 0.0,
+) -> dict[str, Any]:
+    """Post a LIMIT BID on Predict with queue-aware pricing + cancel/replace + partial fill tracking.
+
+    Args:
+        poly_hedge_ask: poly VWAP ask used for net-edge guard.
+        predict_fee_bps: predict fee bps for net-edge calc.
+        poly_fee_rate: Polymarket taker fee rate (fee = rate * p * (1-p)).
+        safety_buffer_bps: safety buffer bps for net-edge calc.
+
+    Returns a dict with:
+      - response.filled: True if any shares were filled
+      - response.partial_fills: list of {ts, delta_shares, cumulative_shares}
+      - response.quote_meta: {quote_age_ms, replace_count, cancel_reason, first_fill_ts, ...}
+      - standard fields: chain_id, market, token_id, request, response
+    """
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
 
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "x-api-key": api_key})
-
-    if CFG.predict_proxy_url:
-        session.proxies.update({"http": CFG.predict_proxy_url, "https": CFG.predict_proxy_url})
-
+    session, builder = _predict_client.get()
+    market = _predict_client.get_market(int(leg.market_id))
     chain_id = _get_predict_chain_id()
-    predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
-    builder = OrderBuilder.make(chain_id, private_key, OrderBuilderOptions(predict_account=predict_account) if predict_account else None)
-
-    jwt_token = _predict_get_jwt(session, private_key, predict_account=predict_account, builder=builder)
-    session.headers.update({"Authorization": f"Bearer {jwt_token}"})
-
-    market = _predict_market(session, int(leg.market_id))
     fee_rate_bps = int(market.get("feeRateBps") or 0)
     is_neg_risk = bool(market.get("isNegRisk"))
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
 
-    price_per_share_wei = _wei_from_float(float(leg.ask))
-    quantity_wei = _wei_from_float(float(leg.shares))
-    amounts = builder.get_limit_order_amounts(
-        LimitHelperInput(
-            side=Side.BUY,
-            price_per_share_wei=price_per_share_wei,
-            quantity_wei=quantity_wei,
+    fill_timeout_sec = float(os.environ.get("PREDICT_LIMIT_FILL_TIMEOUT_SEC", "30.0") or "30.0")
+    poll_interval_sec = float(os.environ.get("PREDICT_LIMIT_POLL_INTERVAL_SEC", "0.5") or "0.5")
+    quote_ttl_sec = float(os.environ.get("PREDICT_QUOTE_TTL_SEC", "10.0") or "10.0")
+    max_replaces = int(os.environ.get("PREDICT_QUOTE_MAX_REPLACE", "3") or "3")
+
+    def _build_and_post(bid_price: float) -> dict[str, Any]:
+        """Build, sign, and POST a LIMIT BUY order at bid_price. Returns API response."""
+        price_per_share_wei = _wei_from_float(bid_price)
+        quantity_wei = _wei_from_float(float(leg.shares))
+        amounts = builder.get_limit_order_amounts(
+            LimitHelperInput(
+                side=Side.BUY,
+                price_per_share_wei=price_per_share_wei,
+                quantity_wei=quantity_wei,
+            )
         )
-    )
-
-    order = builder.build_order(
-        "LIMIT",
-        BuildOrderInput(
-            side=Side.BUY,
-            token_id=str(token_id),
-            maker_amount=str(amounts.maker_amount),
-            taker_amount=str(amounts.taker_amount),
-            fee_rate_bps=fee_rate_bps,
-        ),
-    )
-
-    typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
-    signed_order = builder.sign_typed_data_order(typed_data)
-
-    signed_dump = _dump_obj(signed_order)
-    if not isinstance(signed_dump, dict):
-        raise RuntimeError("predict_signed_order_bad")
-
-    order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
-    signature = signed_dump.get("signature")
-    if not order_obj or not signature:
-        order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+        order = builder.build_order(
+            "LIMIT",
+            BuildOrderInput(
+                side=Side.BUY,
+                token_id=str(token_id),
+                maker_amount=str(amounts.maker_amount),
+                taker_amount=str(amounts.taker_amount),
+                fee_rate_bps=fee_rate_bps,
+            ),
+        )
+        typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
+        signed_order = builder.sign_typed_data_order(typed_data)
+        signed_dump = _dump_obj(signed_order)
+        if not isinstance(signed_dump, dict):
+            raise RuntimeError("predict_signed_order_bad")
+        order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
         signature = signed_dump.get("signature")
-    if not signature:
-        raise RuntimeError("predict_missing_signature")
-    if not str(signature).startswith("0x"):
-        signature = "0x" + str(signature)
-    if "signature" not in order_obj:
-        order_obj["signature"] = signature
+        if not order_obj or not signature:
+            order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+            signature = signed_dump.get("signature")
+        if not signature:
+            raise RuntimeError("predict_missing_signature")
+        if not str(signature).startswith("0x"):
+            signature = "0x" + str(signature)
+        if "signature" not in order_obj:
+            order_obj["signature"] = signature
+        order_api = _predict_order_to_api(order_obj)
 
-    order_api = _predict_order_to_api(order_obj)
-
-    payload = {
-        "data": {
-            "pricePerShare": str(int(round(float(leg.ask) * 10**18))),
-            "strategy": "LIMIT",
-            "slippageBps": "0",
-            "order": order_api,
+        payload = {
+            "data": {
+                "pricePerShare": str(int(round(bid_price * 10**18))),
+                "strategy": "LIMIT",
+                "slippageBps": "0",
+                "order": order_api,
+            }
         }
-    }
+        r = session.post(
+            "https://api.predict.fun/v1/orders",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=float(CFG.timeout_sec),
+        )
+        if not r.ok:
+            if r.status_code == 401:
+                _predict_client.invalidate_jwt()
+            raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
+        out = r.json()
+        if not out.get("success"):
+            raise RuntimeError(f"predict_create_order_failed resp={out}")
+        return out, payload
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
+    def _get_filled_wei(get_resp: dict[str, Any] | None) -> int:
+        """Extract amountFilled (wei) from GET order response."""
+        if get_resp is None:
+            return 0
+        data = get_resp.get("data") if isinstance(get_resp, dict) else None
+        if not isinstance(data, dict):
+            return 0
+        try:
+            return max(0, int(str(data.get("amountFilled") or "0")))
+        except (ValueError, TypeError):
+            return 0
 
-    r = session.post(
-        "https://api.predict.fun/v1/orders",
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=float(CFG.timeout_sec),
-    )
-    if not r.ok:
-        raise RuntimeError(f"predict_order_http_{r.status_code}: {r.text[:500]}")
-    out = r.json()
-    if not out.get("success"):
-        raise RuntimeError(f"predict_create_order_failed resp={out}")
+    def _get_status(get_resp: dict[str, Any] | None) -> str:
+        if get_resp is None:
+            return ""
+        data = get_resp.get("data") if isinstance(get_resp, dict) else None
+        if not isinstance(data, dict):
+            return ""
+        return str(data.get("status") or "").upper()
 
+    def _check_predict_best_bid() -> tuple[float | None, float]:
+        """Fetch predict orderbook and return (best_bid_price, best_bid_size) for our side.
+        Returns (None, 0.0) on error or empty book."""
+        try:
+            ob = _predict_orderbook(session, int(leg.market_id))
+            # Orderbook shape: {outcomes: [{bids: [[price, qty], ...], asks: ...}, ...]}            
+            outcomes = ob.get("outcomes") or []
+            our_token = str(token_id)
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                if str(outcome.get("onChainId") or "") == our_token or str(outcome.get("tokenId") or "") == our_token:
+                    bids = outcome.get("bids") or []
+                    if bids:
+                        best = max(bids, key=lambda b: float(b[0]))
+                        return float(best[0]), float(best[1])
+            # Fallback: flat structure
+            bids_flat = ob.get("bids") or []
+            if bids_flat:
+                best = max(bids_flat, key=lambda b: float(b[0]))
+                return float(best[0]), float(best[1])
+        except Exception:
+            pass
+        return None, 0.0
+
+    # ── Queue-aware bid pricing ──
+    tick_size = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+    queue_threshold_usd = float(os.environ.get("PREDICT_QUEUE_THRESHOLD_USD", "20.0") or "20.0")
+    hard_max_queue_usd = float(os.environ.get("PREDICT_HARD_MAX_QUEUE_USD", "100.0") or "100.0")
+
+    # max_bid: highest bid price where net_edge > 0 after all fees
+    # poly fee = feeRate * p * (1-p); using analyzer's poly_hedge_ask as p
+    _fee_mult = 1.0 + predict_fee_bps / 10_000
+    _poly_dynamic_fee = poly_fee_rate * poly_hedge_ask * (1.0 - poly_hedge_ask)
+    max_bid_by_edge = (1.0 - poly_hedge_ask - _poly_dynamic_fee - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
+    _predict_max_bid_price = float(os.environ.get("PREDICT_MAX_BID_PRICE", "0.49") or "0.49")
+    max_bid = min(max_bid_by_edge, _predict_max_bid_price)
+
+    def _queue_price(best_bid: float, best_bid_sz: float) -> tuple[float | None, dict[str, Any]]:
+        """Determine bid price considering queue ahead.
+        Returns (bid_price, meta). bid_price=None means skip.
+
+        Priority:
+        1. If max_bid > best_bid → can step above existing queue → do it (no queue ahead of us).
+        2. If can't step up (max_bid == best_bid) → check queue size:
+           - small queue (≤ threshold) → join
+           - large queue (> hard_max) → skip
+           - between → join anyway (moderate queue)
+        """
+        q_meta: dict[str, Any] = {
+            "best_bid": round(best_bid, 6),
+            "best_bid_sz": round(best_bid_sz, 2),
+            "max_bid": round(max_bid, 6),
+            "queue_ahead_usd": round(best_bid * best_bid_sz, 2),
+            "tick_size": tick_size,
+        }
+        if best_bid > max_bid:
+            q_meta["decision"] = "skip_best_bid_exceeds_max"
+            return None, q_meta
+        # Try to step one tick above best_bid → gets us ahead of current queue
+        step_bid = round(best_bid + tick_size, 6)
+        if step_bid <= max_bid:
+            q_meta["decision"] = "step_up"
+            q_meta["ticks_improved"] = 1
+            return step_bid, q_meta
+        # Can't step up (max_bid == best_bid or max_bid < best_bid + tick)
+        queue_usd = best_bid * best_bid_sz
+        if queue_usd > hard_max_queue_usd:
+            q_meta["decision"] = "skip_hard_max_queue"
+            return None, q_meta
+        q_meta["decision"] = "join"
+        return best_bid, q_meta
+
+    # Fetch live orderbook for queue-aware initial pricing
+    analyzer_bid = float(leg.ask)  # analyzer's recommended bid = pred_bid_top
+    live_best_bid, live_best_bid_sz = _check_predict_best_bid()
+    queue_pricing_meta: dict[str, Any] = {"analyzer_bid": analyzer_bid}
+
+    if live_best_bid is not None and live_best_bid > 0:
+        chosen_price, q_meta = _queue_price(live_best_bid, live_best_bid_sz)
+        queue_pricing_meta.update(q_meta)
+        if chosen_price is None:
+            # Can't profitably quote → return skip
+            queue_pricing_meta["action"] = "skip"
+            print(
+                f"[PREDICT_LIMIT] queue_skip market_id={leg.market_id} "
+                f"best_bid={live_best_bid:.4f} sz={live_best_bid_sz:.1f} "
+                f"queue=${live_best_bid * live_best_bid_sz:.1f} max_bid={max_bid:.4f} "
+                f"reason={q_meta.get('decision')}"
+            )
+            return {
+                "chain_id": str(chain_id),
+                "market": {
+                    "id": market.get("id"),
+                    "title": market.get("title"),
+                    "feeRateBps": fee_rate_bps,
+                },
+                "token_id": token_id,
+                "request": None,
+                "response": {
+                    "filled": False,
+                    "orderId": None,
+                    "orderHash": None,
+                    "partial_fills": [],
+                    "total_filled_wei": 0,
+                    "total_filled_shares": 0.0,
+                    "quote_meta": {
+                        "cancel_reason": f"queue_skip:{q_meta.get('decision')}",
+                        "queue_pricing": queue_pricing_meta,
+                    },
+                },
+            }
+        # Enforce minimum order value: price * shares >= PREDICT_MIN_ORDER_USD
+        _pred_min_order_val = float(os.environ.get("PREDICT_MIN_ORDER_USD", "0.9") or "0.9")
+        _shares_for_value = float(leg.shares) if float(leg.shares) > 0 else 1.0
+        _min_price_for_value = _pred_min_order_val / _shares_for_value
+        if chosen_price < _min_price_for_value:
+            # Round up to nearest tick
+            import math as _math
+            _ticks = _math.ceil(_min_price_for_value / tick_size)
+            chosen_price = round(_ticks * tick_size, 6)
+            q_meta["adjusted_for_min_value"] = True
+            q_meta["min_price_for_value"] = round(chosen_price, 6)
+            if chosen_price > max_bid:
+                q_meta["decision"] = "skip_min_value_exceeds_max_bid"
+                queue_pricing_meta.update(q_meta)
+                queue_pricing_meta["action"] = "skip"
+                print(
+                    f"[PREDICT_LIMIT] queue_skip market_id={leg.market_id} "
+                    f"min_price_for_value={chosen_price:.4f} > max_bid={max_bid:.4f} "
+                    f"reason=skip_min_value_exceeds_max_bid"
+                )
+                return {
+                    "chain_id": str(chain_id),
+                    "market": {"id": market.get("id"), "title": market.get("title"), "feeRateBps": fee_rate_bps},
+                    "token_id": token_id,
+                    "request": None,
+                    "response": {
+                        "filled": False,
+                        "orderId": None,
+                        "orderHash": None,
+                        "partial_fills": [],
+                        "total_filled_wei": 0,
+                        "total_filled_shares": 0.0,
+                        "quote_meta": {
+                            "cancel_reason": "queue_skip:skip_min_value_exceeds_max_bid",
+                            "queue_pricing": queue_pricing_meta,
+                        },
+                    },
+                }
+        current_bid_price = chosen_price
+        queue_pricing_meta["action"] = "quote"
+        print(
+            f"[PREDICT_LIMIT] queue_price market_id={leg.market_id} "
+            f"best_bid={live_best_bid:.4f} sz={live_best_bid_sz:.1f} "
+            f"queue=${live_best_bid * live_best_bid_sz:.1f} "
+            f"decision={q_meta.get('decision')} → bid={current_bid_price:.4f} max_bid={max_bid:.4f}"
+        )
+    else:
+        # No live orderbook → use analyzer's recommended price
+        current_bid_price = analyzer_bid
+        queue_pricing_meta["decision"] = "fallback_no_live_book"
+        queue_pricing_meta["action"] = "quote"
+
+    out, payload = _build_and_post(current_bid_price)
     create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
     order_id = str(create_data.get("orderId") or "").strip() or None
     order_hash = str(create_data.get("orderHash") or "").strip() or None
 
-    fill_timeout_sec = float(CFG.predict_fill_timeout_sec)
-    poll_interval_sec = float(CFG.predict_fill_poll_interval_sec)
-    t_deadline = time.time() + max(0.0, fill_timeout_sec)
+    quote_post_ts = time.time()
+    first_fill_ts: float | None = None
+    partial_fills: list[dict[str, Any]] = []
+    prev_filled_wei: int = 0
+    replace_count: int = 0
+    cancel_reason: str | None = None
     last_get: dict[str, Any] | None = None
+    all_creates: list[dict[str, Any]] = [out]
+
+    t_deadline = time.time() + max(0.0, fill_timeout_sec)
     filled = False
+
     if order_hash:
         while time.time() < t_deadline:
-            last_get = _predict_get_order_by_hash(session, order_hash)
+            # ── Poll fill status ──
+            try:
+                last_get = _predict_get_order_by_hash(session, order_hash)
+            except Exception:
+                time.sleep(poll_interval_sec)
+                continue
+
+            status = _get_status(last_get)
+            current_filled_wei = _get_filled_wei(last_get)
+
+            # Track partial fill deltas
+            if current_filled_wei > prev_filled_wei:
+                delta_wei = current_filled_wei - prev_filled_wei
+                now_ts = time.time()
+                if first_fill_ts is None:
+                    first_fill_ts = now_ts
+                partial_fills.append({
+                    "ts": now_ts,
+                    "delta_wei": delta_wei,
+                    "cumulative_wei": current_filled_wei,
+                    "delta_shares": delta_wei / 10**18,
+                    "cumulative_shares": current_filled_wei / 10**18,
+                })
+                prev_filled_wei = current_filled_wei
+                print(
+                    f"[PREDICT_LIMIT] partial_fill hash={order_hash} "
+                    f"delta={delta_wei / 10**18:.4f} cumulative={current_filled_wei / 10**18:.4f}"
+                )
+
+            # Fully filled?
             if _predict_resp_is_filled(last_get):
                 filled = True
                 break
+
+            # Terminal status with no fill
+            if status in {"CANCELLED", "EXPIRED", "REJECTED"} and current_filled_wei <= 0:
+                cancel_reason = f"terminal_status:{status}"
+                break
+
+            # ── Outbid check: queue-aware replace when actually outbid ──
+            quote_age_sec = time.time() - quote_post_ts
+            if quote_age_sec >= quote_ttl_sec and replace_count < max_replaces and current_filled_wei <= 0:
+                live_bb, live_bb_sz = _check_predict_best_bid()
+
+                if live_bb is not None and live_bb > current_bid_price + 1e-6:
+                    # We've been outbid → apply queue-aware pricing
+                    new_price, rq_meta = _queue_price(live_bb, live_bb_sz)
+                    queue_pricing_meta[f"replace_{replace_count}"] = rq_meta
+
+                    if new_price is None:
+                        cancel_reason = f"replace_queue_skip:{rq_meta.get('decision')}"
+                        print(
+                            f"[PREDICT_LIMIT] replace_skip hash={order_hash} "
+                            f"best_bid={live_bb:.4f} sz={live_bb_sz:.1f} "
+                            f"queue=${live_bb * live_bb_sz:.1f} max_bid={max_bid:.4f} "
+                            f"reason={rq_meta.get('decision')}"
+                        )
+                        try:
+                            if order_id:
+                                _predict_remove_orders(session, [order_id])
+                        except Exception:
+                            pass
+                        break
+
+                    # Net-edge guard on the chosen price
+                    pred_eff = new_price * (1.0 + predict_fee_bps / 10_000)
+                    poly_eff = poly_hedge_ask + _poly_dynamic_fee
+                    net_edge = 1.0 - pred_eff - poly_eff - safety_buffer_bps / 10_000
+                    if net_edge <= 0:
+                        cancel_reason = "replace_no_edge"
+                        print(
+                            f"[PREDICT_LIMIT] no_edge_for_replace hash={order_hash} "
+                            f"new_bid={new_price:.4f} net_edge={net_edge:.4f}"
+                        )
+                        try:
+                            if order_id:
+                                _predict_remove_orders(session, [order_id])
+                        except Exception:
+                            pass
+                        break
+
+                    print(
+                        f"[PREDICT_LIMIT] outbid hash={order_hash} "
+                        f"our={current_bid_price:.4f} top={live_bb:.4f} sz={live_bb_sz:.1f} "
+                        f"queue=${live_bb * live_bb_sz:.1f} "
+                        f"decision={rq_meta.get('decision')} → new_bid={new_price:.4f} net_edge={net_edge:.4f}"
+                    )
+
+                    # Cancel old order
+                    try:
+                        if order_id:
+                            _predict_remove_orders(session, [order_id])
+                    except Exception as _ce:
+                        print(f"[PREDICT_LIMIT] cancel_failed hash={order_hash} err={_ce}")
+
+                    # Post replacement order at queue-aware price
+                    try:
+                        current_bid_price = new_price
+                        out_new, payload = _build_and_post(current_bid_price)
+                        create_data_new = out_new.get("data") if isinstance(out_new.get("data"), dict) else {}
+                        order_id = str(create_data_new.get("orderId") or "").strip() or None
+                        order_hash = str(create_data_new.get("orderHash") or "").strip() or None
+                        quote_post_ts = time.time()
+                        replace_count += 1
+                        all_creates.append(out_new)
+                        prev_filled_wei = 0  # new order, reset
+                        print(
+                            f"[PREDICT_LIMIT] replaced #{replace_count} "
+                            f"new_hash={order_hash} price={current_bid_price:.4f}"
+                        )
+                    except Exception as _re:
+                        cancel_reason = f"replace_failed:{_re}"
+                        break
+                    continue  # skip sleep, immediately poll new order
+
             time.sleep(max(0.05, poll_interval_sec))
 
+    # ── Final fill check (partial fills count as filled) ──
+    total_filled_wei = prev_filled_wei
+    if not filled and total_filled_wei > 0:
+        filled = True  # partial fill → still hedge what we got
+
+    # ── Cleanup: cancel unfilled remainder ──
     remove_resp: dict[str, Any] | None = None
-    if not filled and order_id:
-        remove_resp = _predict_remove_orders(session, [order_id])
+    if order_id:
+        try:
+            # Always try to cancel — if fully filled, API will just ignore it
+            remove_resp = _predict_remove_orders(session, [order_id])
+        except Exception as _re:
+            remove_resp = {"success": False, "error": str(_re)}
+
+    quote_total_age_ms = (time.time() - (quote_post_ts - (quote_ttl_sec * replace_count if replace_count else 0))) * 1000.0
 
     response_obj: dict[str, Any] = {
-        "create": out,
+        "create": all_creates[0] if all_creates else None,
+        "all_creates": all_creates,
         "get": last_get,
         "remove": remove_resp,
         "filled": filled,
         "orderId": order_id,
         "orderHash": order_hash,
+        "partial_fills": partial_fills,
+        "total_filled_wei": total_filled_wei,
+        "total_filled_shares": total_filled_wei / 10**18 if total_filled_wei > 0 else 0.0,
+        "quote_meta": {
+            "quote_age_ms": round((time.time() - quote_post_ts) * 1000.0, 1),
+            "quote_total_age_ms": round(quote_total_age_ms, 1),
+            "replace_count": replace_count,
+            "cancel_reason": cancel_reason,
+            "first_fill_ts": first_fill_ts,
+            "time_to_first_fill_ms": round((first_fill_ts - quote_post_ts) * 1000.0, 1) if first_fill_ts else None,
+            "final_bid_price": current_bid_price,
+            "initial_bid_price": float(leg.ask),
+            "partial_fill_count": len(partial_fills),
+            "queue_pricing": queue_pricing_meta,
+        },
     }
     return {
         "chain_id": str(chain_id),
@@ -853,14 +1251,17 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
 
     # Строим Book с одним ask-уровнем из тика коллектора.
     # Формат: [[price_float, size_float]] — именно такой возвращает predict API.
+    # Применяем slippage к цене в book: подписанный ордер будет стоить ask*(1+bps/10000),
+    # что позволяет исполниться даже если реальный ask немного выше стейла.
+    slippage_bps = int(os.environ.get("PREDICT_SLIPPAGE_BPS", "0") or "0")
+    slipped_ask = min(float(leg.ask) * (1.0 + slippage_bps / 10000.0), 0.99)
     book_obj = Book(
         market_id=int(leg.market_id),
         update_timestamp_ms=0,
         bids=[],
-        asks=[[float(leg.ask), float(leg.ask_sz)]],
+        asks=[[slipped_ask, float(leg.ask_sz)]],
     )
 
-    slippage_bps = int(os.environ.get("PREDICT_SLIPPAGE_BPS", "0") or "0")
     value_wei = _wei_from_float(float(leg.stake_usd))
 
     amounts = builder.get_market_order_amounts(
@@ -974,6 +1375,18 @@ def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None
                     break
                 if _attempt < _FOK_MAX_RETRIES - 1:
                     time.sleep(_FOK_RETRY_PAUSE)
+            # Если после всех retry финальный статус CANCELLED/REJECTED и ничего не заполнено —
+            # create.success был оптимистичным, реального исполнения нет.
+            if filled and last_get is not None:
+                _final_data = (last_get or {}).get("data") or {}
+                _final_st = str(_final_data.get("status") or "").upper()
+                _final_af = 0
+                try:
+                    _final_af = int(str(_final_data.get("amountFilled") or "0"))
+                except (ValueError, TypeError):
+                    pass
+                if _final_st in {"CANCELLED", "EXPIRED", "REJECTED"} and _final_af <= 0:
+                    filled = False
         else:
             # Ордер ещё не подтверждён — ждём polling (лимит-ордера и т.д.)
             t_deadline = time.time() + max(0.0, fill_timeout_sec)
@@ -1330,51 +1743,71 @@ def opportunity(opp: Opportunity) -> dict:
                 _predict_market_in_flight.add(_market_id_int)
 
         # ────────────────────────────────────────────────────
-        # LIVE POLY PRICE CHECK — перед тем как коммитить
-        # predict-капитал, убеждаемся что цена poly ещё OK.
-        # Если poly сдвинулась и сумма >= порога — пропускаем.
+        # LIVE POLY NET-EDGE CHECK — перед тем как коммитить
+        # predict-капитал, проверяем что live net-edge > 0.
         # ────────────────────────────────────────────────────
-        poly_max_live_sum = float(os.environ.get("POLY_MAX_LIVE_SUM", "1.0"))
+        _pre_fee_rate = float(opp.poly_fee_rate or 0.072)
+        _pre_pred_fee_bps = float(opp.predict_fee_bps or 0)
+        _pre_safety_bps = float(opp.safety_buffer_bps or 0)
         try:
             live_book = _polymarket_book(str(poly_leg.token_id))
-            live_asks_raw = live_book.get("asks") or []
-            live_poly_ask: float | None = None
-            if live_asks_raw:
-                # asks: list of {"price": str, "size": str} — берём минимальную цену
-                live_poly_ask = min(float(x["price"]) for x in live_asks_raw if float(x.get("price", 0)) > 0)
-            if live_poly_ask is not None:
-                live_sum = live_poly_ask + float(pred_leg.ask)
+            _live_vwap_pre = _vwap_from_poly_book(live_book, float(opp.shares))
+            if _live_vwap_pre is not None:
+                _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
+                _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
+                _poly_eff_pre = _live_vwap_pre + _live_fee_pre
+                _live_net_edge_pre = 1.0 - _pred_eff_pre - _poly_eff_pre - _pre_safety_bps / 10_000
                 row["live_poly_precheck"] = {
                     "stale_poly_ask": float(poly_leg.ask),
-                    "live_poly_ask": live_poly_ask,
+                    "live_poly_vwap": round(_live_vwap_pre, 6),
+                    "live_poly_fee": round(_live_fee_pre, 6),
                     "pred_ask": float(pred_leg.ask),
-                    "live_sum": round(live_sum, 6),
-                    "threshold": poly_max_live_sum,
+                    "live_net_edge": round(_live_net_edge_pre, 6),
+                    "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
                 }
                 print(
                     "[TRADER] poly_live_precheck "
-                    f"stale={poly_leg.ask} live={live_poly_ask:.4f} "
-                    f"pred={pred_leg.ask} sum={live_sum:.4f} threshold={poly_max_live_sum}"
+                    f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
+                    f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
+                    f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
                 )
-                if live_sum >= poly_max_live_sum:
+                if _live_net_edge_pre <= 0:
                     row["skipped"] = True
                     row["skip_reason"] = {
-                        "code": "poly_price_moved",
+                        "code": "poly_live_no_edge",
                         "stale_poly_ask": float(poly_leg.ask),
-                        "live_poly_ask": live_poly_ask,
-                        "live_sum": round(live_sum, 6),
-                        "threshold": poly_max_live_sum,
+                        "live_poly_vwap": round(_live_vwap_pre, 6),
+                        "live_net_edge": round(_live_net_edge_pre, 6),
                     }
                     row["summary"]["status"] = "skipped"
-                    row["summary"]["reason_code"] = "poly_price_moved"
+                    row["summary"]["reason_code"] = "poly_live_no_edge"
                     row["summary"]["reason"] = row["skip_reason"]
                     print(
                         "[TRADER][SKIP] "
-                        f"label={opp.label} reason=poly_price_moved "
-                        f"stale={poly_leg.ask} live={live_poly_ask:.4f} sum={live_sum:.4f}"
+                        f"label={opp.label} reason=poly_live_no_edge "
+                        f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
                     )
                     _append_jsonl(trades_file, row)
-                    return {"status": "skipped", "reason": "poly_price_moved"}
+                    return {"status": "skipped", "reason": "poly_live_no_edge"}
+                # Hard cap: poly VWAP exceeds POLY_MAX_HEDGE_PRICE
+                _pre_poly_max_hedge = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
+                if _live_vwap_pre >= _pre_poly_max_hedge:
+                    row["skipped"] = True
+                    row["skip_reason"] = {
+                        "code": "poly_live_hedge_price_cap",
+                        "live_poly_vwap": round(_live_vwap_pre, 6),
+                        "poly_max_hedge_price": _pre_poly_max_hedge,
+                    }
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
+                    row["summary"]["reason"] = row["skip_reason"]
+                    print(
+                        "[TRADER][SKIP] "
+                        f"label={opp.label} reason=poly_live_hedge_price_cap "
+                        f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
+                    )
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
         except Exception as _e_poly_check:
             print(f"[TRADER] poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
@@ -1395,6 +1828,290 @@ def opportunity(opp: Opportunity) -> dict:
             _book_freshness["pred_book_age_at_submit_ms"] = (_submit_wall - pred_dt.replace(tzinfo=None).timestamp()) * 1000.0
         row["book_freshness"] = _book_freshness
 
+        # ════════════════════════════════════════════════════════════════
+        # BID+ASK: Predict LIMIT BID (maker) → Poly FOK hedge (sequential).
+        # Predict ставит пассивный лимит-бид; после фила хеджируем на Poly.
+        # Cancel/replace при устаревании; partial fills хеджируются по delta.
+        # ════════════════════════════════════════════════════════════════
+        if opp.type == "bid_ask_arbitrage":
+            _pred_timing_ba: dict[str, Any] = {}
+            _poly_timing_ba: dict[str, Any] = {}
+
+            # Step 1: LIMIT BID on Predict (blocking with cancel/replace + partial fill tracking)
+            predict_result_ba: dict[str, Any] | None = None
+            pred_exec_error_ba: Exception | None = None
+            _pred_timing_ba["submit_ts"] = time.time()
+            try:
+                predict_result_ba = _place_predict_limit_buy(
+                    pred_leg,
+                    poly_hedge_ask=float(poly_leg.ask),
+                    predict_fee_bps=float(opp.predict_fee_bps or 0),
+                    poly_fee_rate=float(opp.poly_fee_rate or 0.072),
+                    safety_buffer_bps=float(opp.safety_buffer_bps or 0),
+                )
+                _pred_timing_ba["ack_ts"] = time.time()
+            except Exception as _e_ba_pred:
+                pred_exec_error_ba = _e_ba_pred
+                _pred_timing_ba["fail_ts"] = time.time()
+            _pred_timing_ba["end"] = time.time()
+
+            _ba_pred_resp = (predict_result_ba.get("response") or {}) if predict_result_ba else {}
+            pred_filled_ba = bool(_ba_pred_resp.get("filled", False))
+            pred_hash_ba = _ba_pred_resp.get("orderHash")
+            _ba_quote_meta = _ba_pred_resp.get("quote_meta") or {}
+            _ba_partial_fills = _ba_pred_resp.get("partial_fills") or []
+            _ba_total_filled_shares = float(_ba_pred_resp.get("total_filled_shares") or 0.0)
+
+            row["predict"] = predict_result_ba or {}
+            row["timing"]["predict_start"] = _pred_timing_ba.get("submit_ts")
+            row["timing"]["predict_end"] = _pred_timing_ba.get("end")
+            row["timing"]["predict_ack_ts"] = _pred_timing_ba.get("ack_ts")
+            if _pred_timing_ba.get("submit_ts") and _pred_timing_ba.get("end"):
+                row["timing"]["predict_ms"] = (_pred_timing_ba["end"] - _pred_timing_ba["submit_ts"]) * 1000.0
+            # Rich timing from quote_meta
+            row["timing"]["predict_quote_age_ms"] = _ba_quote_meta.get("quote_age_ms")
+            row["timing"]["predict_time_to_first_fill_ms"] = _ba_quote_meta.get("time_to_first_fill_ms")
+            row["timing"]["predict_replace_count"] = _ba_quote_meta.get("replace_count")
+            row["timing"]["predict_cancel_reason"] = _ba_quote_meta.get("cancel_reason")
+
+            if not pred_filled_ba:
+                _skip_code_ba = "predict_limit_error" if pred_exec_error_ba else "predict_limit_not_filled"
+                row["skipped"] = True
+                row["skip_reason"] = {
+                    "code": _skip_code_ba,
+                    "error": str(pred_exec_error_ba) if pred_exec_error_ba else "timeout_or_cancel",
+                    "order_hash": pred_hash_ba,
+                    "cancel_reason": _ba_quote_meta.get("cancel_reason"),
+                    "replace_count": _ba_quote_meta.get("replace_count"),
+                    "quote_age_ms": _ba_quote_meta.get("quote_age_ms"),
+                }
+                row["summary"]["status"] = "skipped"
+                row["summary"]["reason_code"] = _skip_code_ba
+                print(
+                    f"[TRADER][SKIP] label={opp.label} reason={_skip_code_ba} "
+                    f"hash={pred_hash_ba} cancel_reason={_ba_quote_meta.get('cancel_reason')} "
+                    f"replaces={_ba_quote_meta.get('replace_count')} "
+                    f"quote_age_ms={_ba_quote_meta.get('quote_age_ms')} err={pred_exec_error_ba}"
+                )
+                _append_jsonl(trades_file, row)
+                return {"status": "skipped", "reason": _skip_code_ba}
+
+            # Predict filled (full or partial) → record cooldown
+            if pred_leg.market_id is not None:
+                _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
+
+            # Determine hedge quantity: use actual filled shares from predict, not requested
+            _ba_hedge_qty = _ba_total_filled_shares if _ba_total_filled_shares > 0 else float(pred_leg.shares)
+
+            # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
+            # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
+            _ba_actual_pred_bid = float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask)
+            _ba_fee_rate = float(opp.poly_fee_rate or 0.072)
+            _ba_pred_fee_bps = float(opp.predict_fee_bps or 0)
+            _ba_safety_bps = float(opp.safety_buffer_bps or 0)
+            _live_net_edge_ba: float | None = None
+            _live_vwap_ba: float | None = None
+            _live_poly_fee_ba: float | None = None
+
+            try:
+                _live_book_ba = _polymarket_book(str(poly_leg.token_id))
+                _live_vwap_ba = _vwap_from_poly_book(_live_book_ba, _ba_hedge_qty)
+            except Exception as _e_ba_live:
+                print(f"[TRADER] bid_ask_hedge_live_check failed (non-fatal): {_e_ba_live}")
+
+            if _live_vwap_ba is not None:
+                _live_poly_fee_ba = _ba_fee_rate * _live_vwap_ba * (1.0 - _live_vwap_ba)
+                _pred_eff_ba = _ba_actual_pred_bid * (1.0 + _ba_pred_fee_bps / 10_000)
+                _poly_eff_ba = _live_vwap_ba + _live_poly_fee_ba
+                _live_net_edge_ba = 1.0 - _pred_eff_ba - _poly_eff_ba - _ba_safety_bps / 10_000
+
+                row["live_hedge_recheck"] = {
+                    "pred_bid": _ba_actual_pred_bid,
+                    "live_poly_vwap": round(_live_vwap_ba, 6),
+                    "live_poly_fee": round(_live_poly_fee_ba, 6),
+                    "live_net_edge": round(_live_net_edge_ba, 6),
+                    "live_net_edge_bps": round(_live_net_edge_ba * 10_000, 1),
+                    "hedge_qty": round(_ba_hedge_qty, 4),
+                    "poly_fee_rate": _ba_fee_rate,
+                }
+                print(
+                    f"[TRADER] bid_ask_hedge_live_recheck pred_bid={_ba_actual_pred_bid:.4f} "
+                    f"live_vwap={_live_vwap_ba:.4f} live_fee={_live_poly_fee_ba:.4f} "
+                    f"net_edge={_live_net_edge_ba:.4f} ({_live_net_edge_ba * 10_000:.1f}bps)"
+                )
+                if _live_net_edge_ba <= 0:
+                    _ba_inc_pb = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "type": "bid_ask_hedge_no_edge",
+                        "label": opp.label,
+                        "book_freshness": _book_freshness,
+                        "live_poly_vwap": round(_live_vwap_ba, 6),
+                        "live_poly_fee": round(_live_poly_fee_ba, 6),
+                        "live_net_edge": round(_live_net_edge_ba, 6),
+                        "pred_bid": _ba_actual_pred_bid,
+                        "pred_filled_qty": float(_ba_hedge_qty),
+                        "quote_meta": _ba_quote_meta,
+                    }
+                    _append_jsonl(incidents_file, _ba_inc_pb)
+                    row["ok"] = False
+                    row["summary"]["status"] = "incident"
+                    row["summary"]["reason_code"] = "bid_ask_hedge_no_edge"
+                    print(
+                        f"[TRADER][INCIDENT] BID_ASK_HEDGE_NO_EDGE label={opp.label} "
+                        f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f}"
+                    )
+                    _append_jsonl(trades_file, row)
+                    return {"status": "incident", "reason": "bid_ask_hedge_no_edge"}
+
+            # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
+            _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
+            if _live_vwap_ba is not None and _live_vwap_ba >= _poly_max_hedge_price:
+                _ba_inc_hp = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "type": "bid_ask_hedge_price_cap",
+                    "label": opp.label,
+                    "live_poly_vwap": round(_live_vwap_ba, 6),
+                    "poly_max_hedge_price": _poly_max_hedge_price,
+                    "pred_bid": _ba_actual_pred_bid,
+                    "pred_filled_qty": float(_ba_hedge_qty),
+                    "quote_meta": _ba_quote_meta,
+                }
+                _append_jsonl(incidents_file, _ba_inc_hp)
+                row["ok"] = False
+                row["summary"]["status"] = "incident"
+                row["summary"]["reason_code"] = "bid_ask_hedge_price_cap"
+                print(
+                    f"[TRADER][INCIDENT] BID_ASK_HEDGE_PRICE_CAP label={opp.label} "
+                    f"live_vwap={_live_vwap_ba:.4f} cap={_poly_max_hedge_price:.4f}"
+                )
+                _append_jsonl(trades_file, row)
+                return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
+
+            # Step 3: FOK hedge on Polymarket — hedge actual filled quantity
+            _ba_hedge_leg = OpportunityLeg(
+                **{**poly_leg.model_dump(), "shares": _ba_hedge_qty, "stake_usd": _ba_hedge_qty * float(poly_leg.ask)}
+            )
+            polymarket_result_ba: dict[str, Any] | None = None
+            poly_exec_error_ba: Exception | None = None
+            _poly_timing_ba["submit_ts"] = time.time()
+            try:
+                polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg)
+                _poly_timing_ba["ack_ts"] = time.time()
+            except Exception as _e_ba_poly:
+                poly_exec_error_ba = _e_ba_poly
+                _poly_timing_ba["fail_ts"] = time.time()
+            _poly_timing_ba["end"] = time.time()
+
+            row["polymarket"] = polymarket_result_ba or {}
+            row["timing"]["poly_start"] = _poly_timing_ba.get("submit_ts")
+            row["timing"]["poly_end"] = _poly_timing_ba.get("end")
+            row["timing"]["poly_ack_ts"] = _poly_timing_ba.get("ack_ts")
+            row["timing"]["t_end"] = time.time()
+            row["timing"]["total_ms"] = (row["timing"]["t_end"] - t0) * 1000.0
+            if _poly_timing_ba.get("submit_ts") and _poly_timing_ba.get("end"):
+                row["timing"]["poly_ms"] = (_poly_timing_ba["end"] - _poly_timing_ba["submit_ts"]) * 1000.0
+
+            # predict_fill_to_poly_submit_ms: gap from first predict fill detection to poly submit
+            _ba_first_fill_ts = _ba_quote_meta.get("first_fill_ts")
+            if _ba_first_fill_ts and _poly_timing_ba.get("submit_ts"):
+                row["timing"]["predict_fill_to_poly_submit_ms"] = (
+                    _poly_timing_ba["submit_ts"] - _ba_first_fill_ts
+                ) * 1000.0
+            # poly_submit_to_fill_ms
+            if _poly_timing_ba.get("submit_ts") and _poly_timing_ba.get("ack_ts"):
+                row["timing"]["poly_submit_to_fill_ms"] = (
+                    _poly_timing_ba["ack_ts"] - _poly_timing_ba["submit_ts"]
+                ) * 1000.0
+            # unhedged_ms = gap from predict fill ACK to poly ACK (total exposure time)
+            if _ba_first_fill_ts and _poly_timing_ba.get("ack_ts"):
+                row["timing"]["unhedged_ms"] = (
+                    _poly_timing_ba["ack_ts"] - _ba_first_fill_ts
+                ) * 1000.0
+            elif _pred_timing_ba.get("ack_ts") and _poly_timing_ba.get("submit_ts"):
+                row["timing"]["unhedged_ms"] = (
+                    _poly_timing_ba["submit_ts"] - _pred_timing_ba["ack_ts"]
+                ) * 1000.0
+
+            _ba_poly_resp = (polymarket_result_ba.get("response") or {}) if polymarket_result_ba else {}
+            poly_filled_ba = _ba_poly_resp.get("success") is True
+            _ba_poly_qty: float = 0.0
+            try:
+                _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
+            except (ValueError, TypeError):
+                pass
+            _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty)
+
+            row["fill_analysis"] = {
+                "unhedged_ms": row["timing"].get("unhedged_ms"),
+                "predict_fill_to_poly_submit_ms": row["timing"].get("predict_fill_to_poly_submit_ms"),
+                "poly_submit_to_fill_ms": row["timing"].get("poly_submit_to_fill_ms"),
+                "first_fill_venue": "predict",
+                "first_fill_qty": round(_ba_hedge_qty, 6),
+                "residual_unhedged_qty": round(_ba_residual, 6),
+                "pred_filled_qty": round(_ba_hedge_qty, 6),
+                "poly_filled_qty": round(_ba_poly_qty, 6),
+                "requested_qty": round(float(opp.shares), 6),
+                "partial_fill_count": len(_ba_partial_fills),
+                "replace_count": _ba_quote_meta.get("replace_count"),
+                "predict_time_to_first_fill_ms": _ba_quote_meta.get("time_to_first_fill_ms"),
+            }
+            row["parallel_result"] = {
+                "pred_filled": True,
+                "poly_filled": poly_filled_ba,
+                "pred_error": None,
+                "poly_error": str(poly_exec_error_ba) if poly_exec_error_ba else None,
+            }
+            print(
+                f"[TRADER] bid_ask_poly_done success={poly_filled_ba} "
+                f"status={_ba_poly_resp.get('status')} making={_ba_poly_resp.get('makingAmount')} "
+                f"taking={_ba_poly_resp.get('takingAmount')} "
+                f"pred_filled={_ba_hedge_qty:.4f} residual={_ba_residual:.4f}"
+            )
+
+            if poly_filled_ba:
+                row["ok"] = True
+                row["summary"]["status"] = "ok"
+                row["summary"]["reason_code"] = "ok"
+                print(
+                    f"[TRADER][OK] BID+ASK label={opp.label} shares={opp.shares:.4f} "
+                    f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')} "
+                    f"pred_qty={_ba_hedge_qty:.4f} poly_qty={_ba_poly_qty:.4f} "
+                    f"ttff_ms={_ba_quote_meta.get('time_to_first_fill_ms', 'n/a')} "
+                    f"replaces={_ba_quote_meta.get('replace_count')}"
+                )
+                _append_jsonl(trades_file, row)
+                _append_jsonl(success_trades_file, row)
+                return {"status": "ok"}
+            else:
+                # Predict filled, poly failed → unhedged predict incident
+                _ba_inc2 = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "type": "bid_ask_unhedged_predict",
+                    "label": opp.label,
+                    "fill_analysis": row["fill_analysis"],
+                    "book_freshness": _book_freshness,
+                    "unhedged_leg": "predict",
+                    "unhedged_side": pred_leg.side,
+                    "unhedged_qty": float(_ba_hedge_qty),
+                    "unhedged_stake_usd": float(pred_leg.stake_usd),
+                    "poly_error": str(poly_exec_error_ba) if poly_exec_error_ba else None,
+                    "quote_meta": _ba_quote_meta,
+                }
+                _append_jsonl(incidents_file, _ba_inc2)
+                row["ok"] = False
+                row["summary"]["status"] = "incident"
+                row["summary"]["reason_code"] = "bid_ask_unhedged_predict"
+                print(
+                    f"[TRADER][INCIDENT] BID_ASK_UNHEDGED_PREDICT label={opp.label} "
+                    f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
+                    f"residual={_ba_residual:.6f}"
+                )
+                _append_jsonl(trades_file, row)
+                return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
+
+        # ════════════════════════════════════════════════════════════════
+        # ASK+ASK: параллельная отправка обеих ног (оригинальная логика)
+        # ════════════════════════════════════════════════════════════════
         _pred_timing: dict[str, Any] = {}
         _poly_timing: dict[str, Any] = {}
 
@@ -1540,13 +2257,27 @@ def opportunity(opp: Opportunity) -> dict:
             }
 
             pred_filled = _predict_resp_is_filled(resp_obj)
+            # Дополнительная защита: если amountFilled=0 и статус CANCELLED — сброс
+            if pred_filled:
+                try:
+                    _lg = resp_obj.get("get") or {}
+                    _ld = (_lg.get("data") or {}) if isinstance(_lg, dict) else {}
+                    _lst = str(_ld.get("status") or "").upper()
+                    _laf = int(str(_ld.get("amountFilled") or "0"))
+                    if _lst in {"CANCELLED", "EXPIRED", "REJECTED"} and _laf <= 0:
+                        pred_filled = False
+                except Exception:
+                    pass
+            if not pred_filled:
+                _pred_filled_qty = 0.0
+                filled_shares_dbg = None
             print(
                 "[TRADER] predict_done "
                 f"order_hash={pred_hash} status={status} "
                 f"amountFilled_usdt_wei={amount_filled_usdt_wei} "
                 f"filled_shares={filled_shares_dbg} filled={pred_filled}"
             )
-            if filled_shares_dbg is not None and filled_shares_dbg > 1e-9 and pred_leg.market_id is not None:
+            if pred_filled and filled_shares_dbg is not None and filled_shares_dbg > 1e-9 and pred_leg.market_id is not None:
                 _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
         else:
             print(f"[TRADER] predict_error err={pred_exec_error}")

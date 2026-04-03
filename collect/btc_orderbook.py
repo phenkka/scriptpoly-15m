@@ -1,8 +1,8 @@
 """
-Polymarket BTC Up/Down 15-min — монитор стакана ордеров.
+Polymarket BTC Up/Down 1-hour — монитор стакана ордеров.
 
 Каждую секунду получает лучшие BID и ASK для токенов UP и DOWN
-из текущего 15-минутного окна. Автоматически переключается на
+из текущего часового окна. Автоматически переключается на
 следующее окно, когда предыдущее закрывается.
 
 Цены — вероятности от 0.00 до 1.00:
@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -26,10 +27,49 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
-SLOT_SEC  = 900  # 15 минут в секундах
+SLOT_SEC  = 3600  # 1 час в секундах
+_ET_ZONE  = ZoneInfo("America/New_York")
 
 SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
+
+# ── Dynamic fee rate cache (per token_id) ──
+_fee_rate_cache: dict[str, float] = {}
+_FEE_RATE_FALLBACK = 0.072  # Crypto category default per Polymarket docs
+
+
+def _fetch_poly_fee_rate(token_id: str) -> float:
+    """Fetch taker fee rate from Polymarket CLOB API. Caches per token_id."""
+    cached = _fee_rate_cache.get(token_id)
+    if cached is not None:
+        return cached
+    try:
+        resp = SESSION.get(f"{CLOB_API}/fee-rate", params={"token_id": token_id}, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        # API returns feeRateBps (int) or fee_rate_bps — convert to decimal rate
+        rate_bps = float(data.get("fee_rate_bps", data.get("feeRateBps", 0)) or 0)
+        rate = rate_bps / 10_000 if rate_bps > 1 else rate_bps  # handle both bps and decimal
+        if rate <= 0:
+            rate = _FEE_RATE_FALLBACK
+        _fee_rate_cache[token_id] = rate
+        print(f"  [FEE] token=...{token_id[-12:]} rate={rate:.4f} (bps={rate_bps})")
+        return rate
+    except Exception as e:
+        print(f"  [FEE] fetch failed token=...{token_id[-12:]}: {e}, using fallback={_FEE_RATE_FALLBACK}")
+        _fee_rate_cache[token_id] = _FEE_RATE_FALLBACK
+        return _FEE_RATE_FALLBACK
+
+
+def _slot_ts_to_poly_slug(slot_ts: int) -> str:
+    """bitcoin-up-or-down-april-3-2026-2pm-et"""
+    dt_et  = datetime.fromtimestamp(slot_ts, tz=timezone.utc).astimezone(_ET_ZONE)
+    month  = dt_et.strftime("%B").lower()
+    day    = dt_et.day
+    year   = dt_et.year
+    hour12 = dt_et.hour % 12 or 12
+    ampm   = "am" if dt_et.hour < 12 else "pm"
+    return f"bitcoin-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
 
 
 def post_tick(
@@ -40,6 +80,7 @@ def post_tick(
     *,
     slot: int | None = None,
     token_ids: dict[str, str | None] | None = None,
+    poly_fee_rate: float | None = None,
 ) -> None:
     url = os.environ.get("ANALYZER_URL", "").strip()
     if not url:
@@ -56,6 +97,7 @@ def post_tick(
             "question": question,
             "slot": slot,
             "token_ids": token_ids,
+            "poly_fee_rate": poly_fee_rate,
         },
     }
 
@@ -75,7 +117,7 @@ def fetch_market_tokens(slot_ts: int) -> tuple[str, dict[str, str]] | tuple[None
     По временному слоту ищет рынок через Gamma API.
     Возвращает (question, {outcome: token_id, ...}) или (None, None).
     """
-    slug = f"btc-updown-15m-{slot_ts}"
+    slug = _slot_ts_to_poly_slug(slot_ts)
     try:
         resp = SESSION.get(
             f"{GAMMA_API}/events",
@@ -296,6 +338,8 @@ def run_loop() -> None:
         # Push aggregated tick once per second (best-effort)
         # Пропускаем тик если token_ids ещё не готовы (переход рынка)
         if up_token_id is not None and down_token_id is not None:
+            # Fetch fee rate once per token (cached)
+            _fee_rate = _fetch_poly_fee_rate(up_token_id)
             post_tick(
                 ts_str,
                 question,
@@ -303,6 +347,7 @@ def run_loop() -> None:
                 down_payload,
                 slot=active_slot,
                 token_ids={"up": up_token_id, "down": down_token_id},
+                poly_fee_rate=_fee_rate,
             )
 
         # Пустая строка-разделитель между тиками, если токенов > 1
