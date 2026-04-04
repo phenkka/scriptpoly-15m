@@ -48,8 +48,8 @@ class AnalyzerConfig:
         self.ba_min_net_edge_bps = _env_float("BA_MIN_NET_EDGE_BPS", 0.0)
 
         # BID+ASK hard price caps
-        self.predict_max_bid_price = _env_float("PREDICT_MAX_BID_PRICE", 0.49)
-        self.poly_max_hedge_price = _env_float("POLY_MAX_HEDGE_PRICE", 0.58)
+        self.predict_max_bid_price = _env_float("PREDICT_MAX_BID_PRICE", 0.99)
+        self.poly_max_hedge_price = _env_float("POLY_MAX_HEDGE_PRICE", 0.99)
 
         # Reserves: keep this much USD aside per bankroll
         self.pred_reserve_usd = _env_float("PRED_RESERVE_USD", 0.50)

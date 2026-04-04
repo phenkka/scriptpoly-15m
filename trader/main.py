@@ -764,6 +764,7 @@ def _place_predict_limit_buy(
     leg: OpportunityLeg,
     *,
     poly_hedge_ask: float = 0.0,
+    poly_token_id: str | None = None,
     predict_fee_bps: float = 0.0,
     poly_fee_rate: float = 0.072,
     safety_buffer_bps: float = 0.0,
@@ -880,12 +881,11 @@ def _place_predict_limit_buy(
             return ""
         return str(data.get("status") or "").upper()
 
-    def _check_predict_best_bid() -> tuple[float | None, float]:
-        """Fetch predict orderbook and return (best_bid_price, best_bid_size) for our side.
-        Returns (None, 0.0) on error or empty book."""
+    def _check_predict_book() -> tuple[float | None, float, float | None]:
+        """Fetch predict orderbook and return (best_bid_price, best_bid_size, best_ask_price) for our side.
+        Returns (None, 0.0, None) on error or empty book."""
         try:
             ob = _predict_orderbook(session, int(leg.market_id))
-            # Orderbook shape: {outcomes: [{bids: [[price, qty], ...], asks: ...}, ...]}            
             outcomes = ob.get("outcomes") or []
             our_token = str(token_id)
             for outcome in outcomes:
@@ -893,17 +893,32 @@ def _place_predict_limit_buy(
                     continue
                 if str(outcome.get("onChainId") or "") == our_token or str(outcome.get("tokenId") or "") == our_token:
                     bids = outcome.get("bids") or []
-                    if bids:
-                        best = max(bids, key=lambda b: float(b[0]))
-                        return float(best[0]), float(best[1])
+                    asks = outcome.get("asks") or []
+                    best_bid = max(bids, key=lambda b: float(b[0])) if bids else None
+                    best_ask = min(asks, key=lambda a: float(a[0])) if asks else None
+                    return (
+                        float(best_bid[0]) if best_bid else None,
+                        float(best_bid[1]) if best_bid else 0.0,
+                        float(best_ask[0]) if best_ask else None,
+                    )
             # Fallback: flat structure
             bids_flat = ob.get("bids") or []
-            if bids_flat:
-                best = max(bids_flat, key=lambda b: float(b[0]))
-                return float(best[0]), float(best[1])
+            asks_flat = ob.get("asks") or []
+            best_bid = max(bids_flat, key=lambda b: float(b[0])) if bids_flat else None
+            best_ask = min(asks_flat, key=lambda a: float(a[0])) if asks_flat else None
+            return (
+                float(best_bid[0]) if best_bid else None,
+                float(best_bid[1]) if best_bid else 0.0,
+                float(best_ask[0]) if best_ask else None,
+            )
         except Exception:
             pass
-        return None, 0.0
+        return None, 0.0, None
+
+    # Backward-compat shim used in outbid-check loop
+    def _check_predict_best_bid() -> tuple[float | None, float]:
+        bb, sz, _ = _check_predict_book()
+        return bb, sz
 
     # ── Queue-aware bid pricing ──
     tick_size = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
@@ -915,19 +930,16 @@ def _place_predict_limit_buy(
     _fee_mult = 1.0 + predict_fee_bps / 10_000
     _poly_dynamic_fee = poly_fee_rate * poly_hedge_ask * (1.0 - poly_hedge_ask)
     max_bid_by_edge = (1.0 - poly_hedge_ask - _poly_dynamic_fee - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
-    _predict_max_bid_price = float(os.environ.get("PREDICT_MAX_BID_PRICE", "0.49") or "0.49")
+    _predict_max_bid_price = float(os.environ.get("PREDICT_MAX_BID_PRICE", "0.99") or "0.99")
     max_bid = min(max_bid_by_edge, _predict_max_bid_price)
 
     def _queue_price(best_bid: float, best_bid_sz: float) -> tuple[float | None, dict[str, Any]]:
         """Determine bid price considering queue ahead.
         Returns (bid_price, meta). bid_price=None means skip.
 
-        Priority:
-        1. If max_bid > best_bid → can step above existing queue → do it (no queue ahead of us).
-        2. If can't step up (max_bid == best_bid) → check queue size:
-           - small queue (≤ threshold) → join
-           - large queue (> hard_max) → skip
-           - between → join anyway (moderate queue)
+        Strategy: bid aggressively at min(analyzer_bid, max_bid) — our maximum profitable price.
+        This maximises fill probability because we go to the top of the book in one shot.
+        Only if max_bid == best_bid (no room to improve) do we fall back to queue-size check.
         """
         q_meta: dict[str, Any] = {
             "best_bid": round(best_bid, 6),
@@ -939,13 +951,21 @@ def _place_predict_limit_buy(
         if best_bid > max_bid:
             q_meta["decision"] = "skip_best_bid_exceeds_max"
             return None, q_meta
-        # Try to step one tick above best_bid → gets us ahead of current queue
-        step_bid = round(best_bid + tick_size, 6)
-        if step_bid <= max_bid:
-            q_meta["decision"] = "step_up"
-            q_meta["ticks_improved"] = 1
-            return step_bid, q_meta
-        # Can't step up (max_bid == best_bid or max_bid < best_bid + tick)
+        # Bid at our max profitable price (analyzer target capped at max_bid).
+        # This puts us at the top of the book and above the current ask spread.
+        target_bid = round(min(analyzer_bid, max_bid), 6)
+        # Ensure we're at least 1 tick above best_bid (strictly in front of queue).
+        min_competitive = round(best_bid + tick_size, 6)
+        if target_bid < min_competitive:
+            target_bid = min_competitive
+        if target_bid > max_bid:
+            target_bid = round(max_bid, 6)
+        if target_bid > best_bid:
+            ticks = round((target_bid - best_bid) / tick_size)
+            q_meta["decision"] = "bid_at_target"
+            q_meta["ticks_improved"] = ticks
+            return target_bid, q_meta
+        # target_bid == best_bid (max_bid == best_bid, no room to step above)
         queue_usd = best_bid * best_bid_sz
         if queue_usd > hard_max_queue_usd:
             q_meta["decision"] = "skip_hard_max_queue"
@@ -955,8 +975,37 @@ def _place_predict_limit_buy(
 
     # Fetch live orderbook for queue-aware initial pricing
     analyzer_bid = float(leg.ask)  # analyzer's recommended bid = pred_bid_top
-    live_best_bid, live_best_bid_sz = _check_predict_best_bid()
+    live_best_bid, live_best_bid_sz, live_best_ask = _check_predict_book()
     queue_pricing_meta: dict[str, Any] = {"analyzer_bid": analyzer_bid}
+
+    # ── Ask-side check: if Predict ask > max_bid, there's no active arb in this direction.
+    # Skip immediately so the in_flight lock is released and the mirror direction can try.
+    if live_best_ask is not None and live_best_ask > max_bid + 1e-6:
+        queue_pricing_meta["action"] = "skip"
+        queue_pricing_meta["decision"] = "skip_ask_exceeds_max_bid"
+        print(
+            f"[PREDICT_LIMIT] queue_skip market_id={leg.market_id} "
+            f"best_ask={live_best_ask:.4f} max_bid={max_bid:.4f} "
+            f"reason=skip_ask_exceeds_max_bid"
+        )
+        return {
+            "chain_id": str(chain_id),
+            "market": {"id": market.get("id"), "title": market.get("title"), "feeRateBps": fee_rate_bps},
+            "token_id": token_id,
+            "request": None,
+            "response": {
+                "filled": False,
+                "orderId": None,
+                "orderHash": None,
+                "partial_fills": [],
+                "total_filled_wei": 0,
+                "total_filled_shares": 0.0,
+                "quote_meta": {
+                    "cancel_reason": "queue_skip:skip_ask_exceeds_max_bid",
+                    "queue_pricing": queue_pricing_meta,
+                },
+            },
+        }
 
     if live_best_bid is not None and live_best_bid > 0:
         chosen_price, q_meta = _queue_price(live_best_bid, live_best_bid_sz)
@@ -1108,6 +1157,22 @@ def _place_predict_limit_buy(
                 live_bb, live_bb_sz = _check_predict_best_bid()
 
                 if live_bb is not None and live_bb > current_bid_price + 1e-6:
+                    # Refresh max_bid from current live Poly price before deciding
+                    if poly_token_id:
+                        try:
+                            _poly_book_live = _polymarket_book(poly_token_id)
+                            _live_poly_ask = _vwap_from_poly_book(_poly_book_live, float(leg.shares))
+                            if _live_poly_ask and 0 < _live_poly_ask < 1:
+                                _live_dyn_fee = poly_fee_rate * _live_poly_ask * (1.0 - _live_poly_ask)
+                                _live_max_by_edge = (1.0 - _live_poly_ask - _live_dyn_fee - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
+                                max_bid = min(_live_max_by_edge, _predict_max_bid_price)
+                                print(
+                                    f"[PREDICT_LIMIT] max_bid_refresh poly_ask={_live_poly_ask:.4f} "
+                                    f"max_bid_by_edge={_live_max_by_edge:.4f} max_bid={max_bid:.4f}"
+                                )
+                        except Exception:
+                            pass  # keep existing max_bid on error
+
                     # We've been outbid → apply queue-aware pricing
                     new_price, rq_meta = _queue_price(live_bb, live_bb_sz)
                     queue_pricing_meta[f"replace_{replace_count}"] = rq_meta
@@ -1845,6 +1910,7 @@ def opportunity(opp: Opportunity) -> dict:
                 predict_result_ba = _place_predict_limit_buy(
                     pred_leg,
                     poly_hedge_ask=float(poly_leg.ask),
+                    poly_token_id=poly_leg.token_id,
                     predict_fee_bps=float(opp.predict_fee_bps or 0),
                     poly_fee_rate=float(opp.poly_fee_rate or 0.072),
                     safety_buffer_bps=float(opp.safety_buffer_bps or 0),
