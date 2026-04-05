@@ -1917,6 +1917,29 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                     _append_jsonl(trades_file, row)
                     return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
+                # Guard: ensure full fill hedge cost >= poly min order ($1).
+                # Partial fills (≥1 share but < full qty) may produce a hedge amount below
+                # Poly's $1 min. We check at full qty; partial fills are handled post-fill.
+                _poly_min_pre = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+                _hedge_cost_full = float(opp.shares) * _live_vwap_pre
+                if _hedge_cost_full < _poly_min_pre:
+                    row["skipped"] = True
+                    row["skip_reason"] = {
+                        "code": "poly_min_order_usd",
+                        "live_poly_vwap": round(_live_vwap_pre, 6),
+                        "hedge_cost_usd": round(_hedge_cost_full, 4),
+                        "poly_min_order_usd": _poly_min_pre,
+                    }
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "poly_min_order_usd"
+                    row["summary"]["reason"] = row["skip_reason"]
+                    print(
+                        "[TRADER][SKIP] "
+                        f"label={opp.label} reason=poly_min_order_usd "
+                        f"hedge_cost=${_hedge_cost_full:.2f} min=${_poly_min_pre}"
+                    )
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "poly_min_order_usd"}
         except Exception as _e_poly_check:
             print(f"[TRADER]{_t} poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
