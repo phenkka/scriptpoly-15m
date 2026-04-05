@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import itertools
 import json
 import os
 import time
@@ -167,6 +168,8 @@ class Opportunity(BaseModel):
 
 
 app = FastAPI()
+
+_TRACE_COUNTER = itertools.count(1)
 
 
 @app.on_event("startup")
@@ -768,6 +771,7 @@ def _place_predict_limit_buy(
     predict_fee_bps: float = 0.0,
     poly_fee_rate: float = 0.072,
     safety_buffer_bps: float = 0.0,
+    trace_id: int | None = None,
 ) -> dict[str, Any]:
     """Post a LIMIT BID on Predict with queue-aware pricing + cancel/replace + partial fill tracking.
 
@@ -783,6 +787,8 @@ def _place_predict_limit_buy(
       - response.quote_meta: {quote_age_ms, replace_count, cancel_reason, first_fill_ts, ...}
       - standard fields: chain_id, market, token_id, request, response
     """
+    _trace = f"[{trace_id}]" if trace_id is not None else ""
+
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
 
@@ -984,8 +990,22 @@ def _place_predict_limit_buy(
         if chosen_price is None:
             # Can't profitably quote → return skip
             queue_pricing_meta["action"] = "skip"
+            if q_meta.get("decision") == "skip_best_bid_exceeds_max":
+                try:
+                    print(
+                        f"[PREDICT_LIMIT]{_trace} max_bid_breakdown market_id={leg.market_id} "
+                        f"poly_ask={poly_hedge_ask:.4f} poly_fee_rate={poly_fee_rate:.5f} "
+                        f"poly_dyn_fee={_poly_dynamic_fee:.5f} "
+                        f"safety_buffer_bps={float(safety_buffer_bps):.1f} "
+                        f"predict_fee_bps={float(predict_fee_bps):.1f} "
+                        f"max_bid_by_edge={max_bid_by_edge:.6f} "
+                        f"max_bid_cap={_predict_max_bid_price:.4f} "
+                        f"max_bid={max_bid:.6f} fee_mult={_fee_mult:.5f}"
+                    )
+                except Exception:
+                    pass
             print(
-                f"[PREDICT_LIMIT] queue_skip market_id={leg.market_id} "
+                f"[PREDICT_LIMIT]{_trace} queue_skip market_id={leg.market_id} "
                 f"best_bid={live_best_bid:.4f} sz={live_best_bid_sz:.1f} "
                 f"queue=${live_best_bid * live_best_bid_sz:.1f} max_bid={max_bid:.4f} "
                 f"reason={q_meta.get('decision')}"
@@ -1006,10 +1026,7 @@ def _place_predict_limit_buy(
                     "partial_fills": [],
                     "total_filled_wei": 0,
                     "total_filled_shares": 0.0,
-                    "quote_meta": {
-                        "cancel_reason": f"queue_skip:{q_meta.get('decision')}",
-                        "queue_pricing": queue_pricing_meta,
-                    },
+                    "quote_meta": {"cancel_reason": f"queue_skip:{q_meta.get('decision')}", "queue_pricing": queue_pricing_meta},
                 },
             }
         # Enforce minimum order value: price * shares >= PREDICT_MIN_ORDER_USD
@@ -1053,7 +1070,7 @@ def _place_predict_limit_buy(
         current_bid_price = chosen_price
         queue_pricing_meta["action"] = "quote"
         print(
-            f"[PREDICT_LIMIT] queue_price market_id={leg.market_id} "
+            f"[PREDICT_LIMIT]{_trace} queue_price market_id={leg.market_id} "
             f"best_bid={live_best_bid:.4f} sz={live_best_bid_sz:.1f} "
             f"queue=${live_best_bid * live_best_bid_sz:.1f} "
             f"decision={q_meta.get('decision')} → bid={current_bid_price:.4f} max_bid={max_bid:.4f}"
@@ -1077,6 +1094,7 @@ def _place_predict_limit_buy(
     cancel_reason: str | None = None
     last_get: dict[str, Any] | None = None
     all_creates: list[dict[str, Any]] = [out]
+    need_final_get_check: bool = False
 
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     filled = False
@@ -1108,7 +1126,7 @@ def _place_predict_limit_buy(
                 })
                 prev_filled_wei = current_filled_wei
                 print(
-                    f"[PREDICT_LIMIT] partial_fill hash={order_hash} "
+                    f"[PREDICT_LIMIT]{_trace} partial_fill hash={order_hash} "
                     f"delta={delta_wei / 10**18:.4f} cumulative={current_filled_wei / 10**18:.4f}"
                 )
 
@@ -1120,6 +1138,7 @@ def _place_predict_limit_buy(
             # Terminal status with no fill
             if status in {"CANCELLED", "EXPIRED", "REJECTED"} and current_filled_wei <= 0:
                 cancel_reason = f"terminal_status:{status}"
+                need_final_get_check = True
                 break
 
             # ── Live Poly hedge-viability check: cancel if hedge became unprofitable ──
@@ -1135,7 +1154,7 @@ def _place_predict_limit_buy(
                         if _edge_live <= 0:
                             cancel_reason = f"poly_hedge_no_edge:{_edge_live:.4f}"
                             print(
-                                f"[PREDICT_LIMIT] cancel_poly_no_edge hash={order_hash} "
+                                f"[PREDICT_LIMIT]{_trace} cancel_poly_no_edge hash={order_hash} "
                                 f"poly_ask={_pa_live:.4f} pred_bid={current_bid_price:.4f} "
                                 f"edge={_edge_live:.4f}"
                             )
@@ -1144,6 +1163,7 @@ def _place_predict_limit_buy(
                                     _predict_remove_orders(session, [order_id])
                             except Exception:
                                 pass
+                            need_final_get_check = True
                             break
                         # Also refresh max_bid so outbid check below uses latest
                         _live_dyn_fee2 = poly_fee_rate * _pa_live * (1.0 - _pa_live)
@@ -1167,7 +1187,7 @@ def _place_predict_limit_buy(
                     if new_price is None:
                         cancel_reason = f"replace_queue_skip:{rq_meta.get('decision')}"
                         print(
-                            f"[PREDICT_LIMIT] replace_skip hash={order_hash} "
+                            f"[PREDICT_LIMIT]{_trace} replace_skip hash={order_hash} "
                             f"best_bid={live_bb:.4f} sz={live_bb_sz:.1f} "
                             f"queue=${live_bb * live_bb_sz:.1f} max_bid={max_bid:.4f} "
                             f"reason={rq_meta.get('decision')}"
@@ -1177,6 +1197,7 @@ def _place_predict_limit_buy(
                                 _predict_remove_orders(session, [order_id])
                         except Exception:
                             pass
+                        need_final_get_check = True
                         break
 
                     # Net-edge guard on the chosen price
@@ -1186,7 +1207,7 @@ def _place_predict_limit_buy(
                     if net_edge <= 0:
                         cancel_reason = "replace_no_edge"
                         print(
-                            f"[PREDICT_LIMIT] no_edge_for_replace hash={order_hash} "
+                            f"[PREDICT_LIMIT]{_trace} no_edge_for_replace hash={order_hash} "
                             f"new_bid={new_price:.4f} net_edge={net_edge:.4f}"
                         )
                         try:
@@ -1194,10 +1215,11 @@ def _place_predict_limit_buy(
                                 _predict_remove_orders(session, [order_id])
                         except Exception:
                             pass
+                        need_final_get_check = True
                         break
 
                     print(
-                        f"[PREDICT_LIMIT] outbid hash={order_hash} "
+                        f"[PREDICT_LIMIT]{_trace} outbid hash={order_hash} "
                         f"our={current_bid_price:.4f} top={live_bb:.4f} sz={live_bb_sz:.1f} "
                         f"queue=${live_bb * live_bb_sz:.1f} "
                         f"decision={rq_meta.get('decision')} → new_bid={new_price:.4f} net_edge={net_edge:.4f}"
@@ -1208,7 +1230,7 @@ def _place_predict_limit_buy(
                         if order_id:
                             _predict_remove_orders(session, [order_id])
                     except Exception as _ce:
-                        print(f"[PREDICT_LIMIT] cancel_failed hash={order_hash} err={_ce}")
+                        print(f"[PREDICT_LIMIT]{_trace} cancel_failed hash={order_hash} err={_ce}")
 
                     # Post replacement order at queue-aware price
                     try:
@@ -1222,7 +1244,7 @@ def _place_predict_limit_buy(
                         all_creates.append(out_new)
                         prev_filled_wei = 0  # new order, reset
                         print(
-                            f"[PREDICT_LIMIT] replaced #{replace_count} "
+                            f"[PREDICT_LIMIT]{_trace} replaced #{replace_count} "
                             f"new_hash={order_hash} price={current_bid_price:.4f}"
                         )
                     except Exception as _re:
@@ -1231,6 +1253,38 @@ def _place_predict_limit_buy(
                     continue  # skip sleep, immediately poll new order
 
             time.sleep(max(0.05, poll_interval_sec))
+
+    if order_hash and need_final_get_check and not filled:
+        _FINAL_GET_RETRIES = 3
+        _FINAL_GET_SLEEP_SEC = 0.25
+        for _attempt in range(_FINAL_GET_RETRIES):
+            try:
+                last_get = _predict_get_order_by_hash(session, order_hash)
+                _final_filled_wei = _get_filled_wei(last_get)
+                if _final_filled_wei > prev_filled_wei:
+                    delta_wei = _final_filled_wei - prev_filled_wei
+                    now_ts = time.time()
+                    if first_fill_ts is None:
+                        first_fill_ts = now_ts
+                    partial_fills.append({
+                        "ts": now_ts,
+                        "delta_wei": delta_wei,
+                        "cumulative_wei": _final_filled_wei,
+                        "delta_shares": delta_wei / 10**18,
+                        "cumulative_shares": _final_filled_wei / 10**18,
+                    })
+                    prev_filled_wei = _final_filled_wei
+                    print(
+                        f"[PREDICT_LIMIT]{_trace} final_fill_check hash={order_hash} "
+                        f"cumulative={_final_filled_wei / 10**18:.4f}"
+                    )
+                if _predict_resp_is_filled(last_get) or prev_filled_wei > 0:
+                    filled = True
+                    break
+            except Exception:
+                pass
+            if _attempt < _FINAL_GET_RETRIES - 1:
+                time.sleep(_FINAL_GET_SLEEP_SEC)
 
     # ── Final fill check (partial fills count as filled) ──
     total_filled_wei = prev_filled_wei
@@ -1553,6 +1607,9 @@ def test_predict(opp: Opportunity) -> dict:
 def opportunity(opp: Opportunity) -> dict:
     opp = _cap_opportunity(opp)
 
+    trace_id = next(_TRACE_COUNTER)
+    _t = f"[{trace_id}]"
+
     t0 = time.time()
 
     dry_run = bool(CFG.dry_run)
@@ -1562,14 +1619,14 @@ def opportunity(opp: Opportunity) -> dict:
 
     # Minimal audit log for operator.
     print(
-        "[TRADER] recv "
+        f"[TRADER]{_t} recv "
         f"label={opp.label} shares={opp.shares:.2f} "
         f"cost=${opp.stake_usd:.2f} payout=${opp.payout_usd:.2f} profit=${opp.profit_usd:.2f} "
         f"sent_at={opp.sent_at} recv_at={datetime.utcnow().isoformat()}Z"
     )
     for i, leg in enumerate(opp.legs, start=1):
         print(
-            f"[TRADER] leg{i} source={leg.source} side={leg.side} ask={leg.ask} "
+            f"[TRADER]{_t} leg{i} source={leg.source} side={leg.side} ask={leg.ask} "
             f"shares={leg.shares:.2f} stake_usd=${leg.stake_usd:.2f} "
             f"ask_sz={leg.ask_sz} pool_usd={leg.pool_usd:.2f} "
             f"market_id={leg.market_id} token_id={leg.token_id} ts={leg.ts}"
@@ -1673,7 +1730,7 @@ def opportunity(opp: Opportunity) -> dict:
                 "poly_min_order_usd": float(poly_min),
             }
             print(
-                "[TRADER][SKIP] "
+                f"[TRADER]{_t}[SKIP] "
                 f"label={opp.label} reason=poly_min_order_usd "
                 f"poly_stake={_fmt_usd(poly_leg.stake_usd)} poly_min={_fmt_usd(poly_min)} "
                 f"pred_stake={_fmt_usd(pred_leg.stake_usd)} shares={opp.shares:.4f}"
@@ -1696,7 +1753,7 @@ def opportunity(opp: Opportunity) -> dict:
                 "predict_min_order_usd": float(pred_min),
             }
             print(
-                "[TRADER][SKIP] "
+                f"[TRADER]{_t}[SKIP] "
                 f"label={opp.label} reason=predict_min_order_usd "
                 f"pred_stake={_fmt_usd(pred_leg.stake_usd)} pred_min={_fmt_usd(pred_min)} "
                 f"poly_stake={_fmt_usd(poly_leg.stake_usd)} shares={opp.shares:.4f}"
@@ -1770,7 +1827,7 @@ def opportunity(opp: Opportunity) -> dict:
                 row["summary"]["reason_code"] = "predict_market_cooldown"
                 row["summary"]["reason"] = row["skip_reason"]
                 print(
-                    "[TRADER][SKIP] "
+                    f"[TRADER]{_t}[SKIP] "
                     f"label={opp.label} reason=predict_market_cooldown market_id={int(pred_leg.market_id)} "
                     f"remaining_sec={remaining:.1f}"
                 )
@@ -1782,7 +1839,7 @@ def opportunity(opp: Opportunity) -> dict:
             with _predict_market_in_flight_lock:
                 if _market_id_int in _predict_market_in_flight:
                     print(
-                        "[TRADER][SKIP] "
+                        f"[TRADER]{_t}[SKIP] "
                         f"label={opp.label} reason=predict_market_in_flight market_id={_market_id_int}"
                     )
                     row["skipped"] = True
@@ -1818,7 +1875,7 @@ def opportunity(opp: Opportunity) -> dict:
                     "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
                 }
                 print(
-                    "[TRADER] poly_live_precheck "
+                    f"[TRADER]{_t} poly_live_precheck "
                     f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
                     f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
                     f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
@@ -1835,7 +1892,7 @@ def opportunity(opp: Opportunity) -> dict:
                     row["summary"]["reason_code"] = "poly_live_no_edge"
                     row["summary"]["reason"] = row["skip_reason"]
                     print(
-                        "[TRADER][SKIP] "
+                        f"[TRADER]{_t}[SKIP] "
                         f"label={opp.label} reason=poly_live_no_edge "
                         f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
                     )
@@ -1854,14 +1911,14 @@ def opportunity(opp: Opportunity) -> dict:
                     row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
                     row["summary"]["reason"] = row["skip_reason"]
                     print(
-                        "[TRADER][SKIP] "
+                        f"[TRADER]{_t}[SKIP] "
                         f"label={opp.label} reason=poly_live_hedge_price_cap "
                         f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
                     )
                     _append_jsonl(trades_file, row)
                     return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
         except Exception as _e_poly_check:
-            print(f"[TRADER] poly_live_precheck_failed (non-fatal): {_e_poly_check}")
+            print(f"[TRADER]{_t} poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
         # ════════════════════════════════════════════════════════════════
         # ПАРАЛЛЕЛЬНАЯ отправка обеих ног через ThreadPoolExecutor.
@@ -1901,6 +1958,7 @@ def opportunity(opp: Opportunity) -> dict:
                     predict_fee_bps=float(opp.predict_fee_bps or 0),
                     poly_fee_rate=float(opp.poly_fee_rate or 0.072),
                     safety_buffer_bps=float(opp.safety_buffer_bps or 0),
+                    trace_id=trace_id,
                 )
                 _pred_timing_ba["ack_ts"] = time.time()
             except Exception as _e_ba_pred:
@@ -1941,7 +1999,7 @@ def opportunity(opp: Opportunity) -> dict:
                 row["summary"]["status"] = "skipped"
                 row["summary"]["reason_code"] = _skip_code_ba
                 print(
-                    f"[TRADER][SKIP] label={opp.label} reason={_skip_code_ba} "
+                    f"[TRADER]{_t}[SKIP] label={opp.label} reason={_skip_code_ba} "
                     f"hash={pred_hash_ba} cancel_reason={_ba_quote_meta.get('cancel_reason')} "
                     f"replaces={_ba_quote_meta.get('replace_count')} "
                     f"quote_age_ms={_ba_quote_meta.get('quote_age_ms')} err={pred_exec_error_ba}"
@@ -2435,7 +2493,7 @@ def opportunity(opp: Opportunity) -> dict:
             row["summary"]["status"] = "skipped"
             row["summary"]["reason_code"] = skip_code
             row["summary"]["reason"] = row["skip_reason"]
-            print(f"[TRADER][SKIP] label={opp.label} reason={skip_code}")
+            print(f"[TRADER]{_t}[SKIP] label={opp.label} reason={skip_code}")
             _append_jsonl(trades_file, row)
             return {"status": "skipped", "reason": skip_code}
         elif pred_filled and not poly_filled:
