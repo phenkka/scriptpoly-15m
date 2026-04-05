@@ -45,7 +45,7 @@ app = FastAPI()
 
 _state_lock = Lock()
 _last: dict[str, Tick] = {}
-_best_profit_usd: dict[tuple[str, int], float] = {}
+_last_target_bid: dict[tuple[str, int], float] = {}
 
 
 def _post_opportunity(payload: dict) -> None:
@@ -85,6 +85,7 @@ def _check_arbitrage() -> None:
     poly = _last.get("polymarket")
     pred = _last.get("predict")
     if not poly or not pred:
+        print(f"[ANALYZER] skip no_data poly={'yes' if poly else 'no'} pred={'yes' if pred else 'no'}")
         return
 
     trader_max_trade_usd = float(CFG.trader_max_trade_usd)
@@ -197,6 +198,7 @@ def _check_arbitrage() -> None:
         ba_t1_slot = t_poly.meta.slot if t_poly.meta else None
         ba_t2_slot = t_pred.meta.slot if t_pred.meta else None
         if ba_t1_slot is None or ba_t2_slot is None or ba_t1_slot != ba_t2_slot:
+            print(f"[ANALYZER] skip slot_mismatch label={ba_label} poly_slot={ba_t1_slot} pred_slot={ba_t2_slot}")
             continue
 
         ba_slot_key = int(ba_t1_slot)
@@ -269,7 +271,10 @@ def _check_arbitrage() -> None:
         ba_edge = 1.0 - ba_s_eff
         ba_net_edge_bps = ba_edge * 10000.0
 
-        if ba_net_edge_bps <= ba_min_net_edge_bps:
+        # net_edge уже гарантирован safety_frac внутри max_bid.
+        # Дополнительная проверка нужна только если ba_min_net_edge_bps > 0.
+        if ba_min_net_edge_bps > 0 and ba_net_edge_bps < ba_min_net_edge_bps:
+            print(f"[ANALYZER] skip low_edge label={ba_label} net_edge_bps={ba_net_edge_bps:.1f} min={ba_min_net_edge_bps} poly_ask={poly_ask_top:.4f} target_bid={target_bid:.4f}")
             continue
 
         ba_cost_pred = q_ba * eff_pred_bid
@@ -293,10 +298,11 @@ def _check_arbitrage() -> None:
         if ba_cost_pred < predict_min_order_usd:
             continue
 
-        prev_ba = _best_profit_usd.get(ba_key)
-        if prev_ba is not None and ba_profit <= prev_ba + 1e-6:
+        prev_target = _last_target_bid.get(ba_key)
+        if prev_target is not None and target_bid < prev_target + 0.01 - 1e-9:
+            print(f"[ANALYZER] skip no_improvement label={ba_label} target_bid={target_bid:.4f} prev={prev_target:.4f}")
             continue
-        _best_profit_usd[ba_key] = ba_profit
+        _last_target_bid[ba_key] = target_bid
 
         ba_poly_token_id = None
         if t_poly.meta and t_poly.meta.token_ids:

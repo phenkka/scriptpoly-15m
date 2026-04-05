@@ -801,6 +801,10 @@ def _place_predict_limit_buy(
 
     def _build_and_post(bid_price: float) -> dict[str, Any]:
         """Build, sign, and POST a LIMIT BUY order at bid_price. Returns API response."""
+        # Snap to tick grid: arbitrary sub-cent prices cause makerAmount/takerAmount ratio
+        # to diverge from pricePerShare (integer truncation), resulting in API 400 amounts_mismatch.
+        _tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+        bid_price = round(int(bid_price / _tick) * _tick, 6)
         price_per_share_wei = _wei_from_float(bid_price)
         quantity_wei = _wei_from_float(float(leg.shares))
         amounts = builder.get_limit_order_amounts(
@@ -883,34 +887,30 @@ def _place_predict_limit_buy(
 
     def _check_predict_book() -> tuple[float | None, float, float | None]:
         """Fetch predict orderbook and return (best_bid_price, best_bid_size, best_ask_price) for our side.
+        Uses flat bids/asks (UP-primary book) and computes complement for DOWN side.
         Returns (None, 0.0, None) on error or empty book."""
         try:
             ob = _predict_orderbook(session, int(leg.market_id))
-            outcomes = ob.get("outcomes") or []
-            our_token = str(token_id)
-            for outcome in outcomes:
-                if not isinstance(outcome, dict):
-                    continue
-                if str(outcome.get("onChainId") or "") == our_token or str(outcome.get("tokenId") or "") == our_token:
-                    bids = outcome.get("bids") or []
-                    asks = outcome.get("asks") or []
-                    best_bid = max(bids, key=lambda b: float(b[0])) if bids else None
-                    best_ask = min(asks, key=lambda a: float(a[0])) if asks else None
-                    return (
-                        float(best_bid[0]) if best_bid else None,
-                        float(best_bid[1]) if best_bid else 0.0,
-                        float(best_ask[0]) if best_ask else None,
-                    )
-            # Fallback: flat structure
+            # The flat bids[]/asks[] are for UP token (same convention as collector).
+            # outcomes[] use a different/inverted naming — don't use them.
             bids_flat = ob.get("bids") or []
             asks_flat = ob.get("asks") or []
-            best_bid = max(bids_flat, key=lambda b: float(b[0])) if bids_flat else None
-            best_ask = min(asks_flat, key=lambda a: float(a[0])) if asks_flat else None
-            return (
-                float(best_bid[0]) if best_bid else None,
-                float(best_bid[1]) if best_bid else 0.0,
-                float(best_ask[0]) if best_ask else None,
-            )
+            if leg.side == "up":
+                best_bid = max(bids_flat, key=lambda b: float(b[0])) if bids_flat else None
+                best_ask = min(asks_flat, key=lambda a: float(a[0])) if asks_flat else None
+                return (
+                    float(best_bid[0]) if best_bid else None,
+                    float(best_bid[1]) if best_bid else 0.0,
+                    float(best_ask[0]) if best_ask else None,
+                )
+            else:
+                # DOWN bids = complement of lowest UP ask; DOWN asks = complement of highest UP bid
+                best_up_ask = min(asks_flat, key=lambda a: float(a[0])) if asks_flat else None
+                best_up_bid = max(bids_flat, key=lambda b: float(b[0])) if bids_flat else None
+                dn_bid = round(1.0 - float(best_up_ask[0]), 6) if best_up_ask else None
+                dn_bid_sz = float(best_up_ask[1]) if best_up_ask else 0.0
+                dn_ask = round(1.0 - float(best_up_bid[0]), 6) if best_up_bid else None
+                return (dn_bid, dn_bid_sz, dn_ask)
         except Exception:
             pass
         return None, 0.0, None
@@ -977,35 +977,6 @@ def _place_predict_limit_buy(
     analyzer_bid = float(leg.ask)  # analyzer's recommended bid = pred_bid_top
     live_best_bid, live_best_bid_sz, live_best_ask = _check_predict_book()
     queue_pricing_meta: dict[str, Any] = {"analyzer_bid": analyzer_bid}
-
-    # ── Ask-side check: if Predict ask > max_bid, there's no active arb in this direction.
-    # Skip immediately so the in_flight lock is released and the mirror direction can try.
-    if live_best_ask is not None and live_best_ask > max_bid + 1e-6:
-        queue_pricing_meta["action"] = "skip"
-        queue_pricing_meta["decision"] = "skip_ask_exceeds_max_bid"
-        print(
-            f"[PREDICT_LIMIT] queue_skip market_id={leg.market_id} "
-            f"best_ask={live_best_ask:.4f} max_bid={max_bid:.4f} "
-            f"reason=skip_ask_exceeds_max_bid"
-        )
-        return {
-            "chain_id": str(chain_id),
-            "market": {"id": market.get("id"), "title": market.get("title"), "feeRateBps": fee_rate_bps},
-            "token_id": token_id,
-            "request": None,
-            "response": {
-                "filled": False,
-                "orderId": None,
-                "orderHash": None,
-                "partial_fills": [],
-                "total_filled_wei": 0,
-                "total_filled_shares": 0.0,
-                "quote_meta": {
-                    "cancel_reason": "queue_skip:skip_ask_exceeds_max_bid",
-                    "queue_pricing": queue_pricing_meta,
-                },
-            },
-        }
 
     if live_best_bid is not None and live_best_bid > 0:
         chosen_price, q_meta = _queue_price(live_best_bid, live_best_bid_sz)
