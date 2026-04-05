@@ -954,9 +954,18 @@ def _place_predict_limit_buy(
             "queue_ahead_usd": round(best_bid * best_bid_sz, 2),
             "tick_size": tick_size,
         }
+        _passive_ticks_miss = int(os.environ.get("PREDICT_PASSIVE_BID_MAX_TICKS_MISS", "5") or "5")
+        _ticks_behind = round((best_bid - max_bid) / tick_size) if best_bid > max_bid else 0
         if best_bid > max_bid:
-            q_meta["decision"] = "skip_best_bid_exceeds_max"
-            return None, q_meta
+            if _ticks_behind > _passive_ticks_miss:
+                q_meta["decision"] = "skip_best_bid_exceeds_max"
+                return None, q_meta
+            # Within passive threshold: place at max_bid and wait.
+            # cancel_poly_no_edge will kill it if Poly moves against us;
+            # replace logic will bump it up if Poly gets cheaper.
+            q_meta["decision"] = "bid_passive"
+            q_meta["ticks_behind"] = _ticks_behind
+            return round(max_bid, 6), q_meta
         # Bid at our max profitable price (analyzer target capped at max_bid).
         # This puts us at the top of the book and above the current ask spread.
         target_bid = round(min(analyzer_bid, max_bid), 6)
@@ -1076,10 +1085,15 @@ def _place_predict_limit_buy(
             f"decision={q_meta.get('decision')} → bid={current_bid_price:.4f} max_bid={max_bid:.4f}"
         )
     else:
-        # No live orderbook → use analyzer's recommended price
-        current_bid_price = analyzer_bid
-        queue_pricing_meta["decision"] = "fallback_no_live_book"
+        # No live bids → bid at max_bid derived from Poly ask (not Predict ask price).
+        # We become the best bid; first seller fills us at our profitable price.
+        current_bid_price = round(max_bid, 6)
+        queue_pricing_meta["decision"] = "bid_no_queue"
         queue_pricing_meta["action"] = "quote"
+        print(
+            f"[PREDICT_LIMIT]{_trace} bid_no_queue market_id={leg.market_id} "
+            f"max_bid={max_bid:.4f} (no live bids on Predict)"
+        )
 
     out, payload = _build_and_post(current_bid_price)
     create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
@@ -2087,15 +2101,11 @@ def opportunity(opp: Opportunity) -> dict:
                         "quote_meta": _ba_quote_meta,
                     }
                     _append_jsonl(incidents_file, _ba_inc_pb)
-                    row["ok"] = False
-                    row["summary"]["status"] = "incident"
-                    row["summary"]["reason_code"] = "bid_ask_hedge_no_edge"
                     print(
                         f"[TRADER][INCIDENT] BID_ASK_HEDGE_NO_EDGE label={opp.label} "
-                        f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f}"
+                        f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f} "
+                        f"— forcing hedge to close unhedged predict position"
                     )
-                    _append_jsonl(trades_file, row)
-                    return {"status": "incident", "reason": "bid_ask_hedge_no_edge"}
 
             # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
             _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
@@ -2122,6 +2132,29 @@ def opportunity(opp: Opportunity) -> dict:
                 return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
 
             # Step 3: FOK hedge on Polymarket — hedge actual filled quantity
+            # Guard: partial fill may be below Poly's $1 min order.
+            _ba_hedge_cost_usd = _ba_hedge_qty * (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+            _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+            if _ba_hedge_cost_usd < _poly_min_hedge:
+                _ba_inc_min = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "type": "bid_ask_hedge_below_min",
+                    "label": opp.label,
+                    "pred_filled_qty": float(_ba_hedge_qty),
+                    "hedge_cost_usd": round(_ba_hedge_cost_usd, 4),
+                    "poly_min_order_usd": _poly_min_hedge,
+                }
+                _append_jsonl(incidents_file, _ba_inc_min)
+                row["ok"] = False
+                row["summary"]["status"] = "incident"
+                row["summary"]["reason_code"] = "bid_ask_hedge_below_min"
+                print(
+                    f"[TRADER][INCIDENT] BID_ASK_HEDGE_BELOW_MIN label={opp.label} "
+                    f"pred_filled={_ba_hedge_qty:.4f} hedge_cost=${_ba_hedge_cost_usd:.2f} min=${_poly_min_hedge}"
+                )
+                _append_jsonl(trades_file, row)
+                return {"status": "incident", "reason": "bid_ask_hedge_below_min"}
+
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_hedge_qty, "stake_usd": _ba_hedge_qty * float(poly_leg.ask)}
             )
