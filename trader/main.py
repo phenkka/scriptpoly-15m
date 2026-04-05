@@ -1269,8 +1269,16 @@ def _place_predict_limit_buy(
             time.sleep(max(0.05, poll_interval_sec))
 
     if order_hash and need_final_get_check and not filled:
-        _FINAL_GET_RETRIES = 3
-        _FINAL_GET_SLEEP_SEC = 0.25
+        # poly_hedge_no_edge cancels: on-chain fill can arrive up to ~30s after
+        # API cancel (BSC block confirmation lag). Poll longer to catch ghost fills.
+        _is_hedge_cancel = (cancel_reason or "").startswith("poly_hedge_no_edge")
+        _FINAL_GET_RETRIES = 60 if _is_hedge_cancel else 3
+        _FINAL_GET_SLEEP_SEC = 1.0 if _is_hedge_cancel else 0.25
+        if _is_hedge_cancel:
+            print(
+                f"[PREDICT_LIMIT]{_trace} ghost_fill_watch hash={order_hash} "
+                f"cancel_reason={cancel_reason} polling up to {_FINAL_GET_RETRIES}s"
+            )
         for _attempt in range(_FINAL_GET_RETRIES):
             try:
                 last_get = _predict_get_order_by_hash(session, order_hash)
