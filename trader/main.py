@@ -844,7 +844,7 @@ def _place_predict_limit_buy(
 
         payload = {
             "data": {
-                "pricePerShare": str(int(round(bid_price * 10**18))),
+                "pricePerShare": str(amounts.price_per_share),
                 "strategy": "LIMIT",
                 "slippageBps": "0",
                 "order": order_api,
@@ -1122,27 +1122,43 @@ def _place_predict_limit_buy(
                 cancel_reason = f"terminal_status:{status}"
                 break
 
+            # ── Live Poly hedge-viability check: cancel if hedge became unprofitable ──
+            if poly_token_id and current_filled_wei <= 0:
+                try:
+                    _pb_live = _polymarket_book(poly_token_id)
+                    _pa_live = _vwap_from_poly_book(_pb_live, float(leg.shares))
+                    if _pa_live and 0 < _pa_live < 1:
+                        _pdf_live = poly_fee_rate * _pa_live * (1.0 - _pa_live)
+                        _pred_eff_live = current_bid_price * (1.0 + predict_fee_bps / 10_000)
+                        _poly_eff_live = _pa_live + _pdf_live
+                        _edge_live = 1.0 - _pred_eff_live - _poly_eff_live - safety_buffer_bps / 10_000
+                        if _edge_live <= 0:
+                            cancel_reason = f"poly_hedge_no_edge:{_edge_live:.4f}"
+                            print(
+                                f"[PREDICT_LIMIT] cancel_poly_no_edge hash={order_hash} "
+                                f"poly_ask={_pa_live:.4f} pred_bid={current_bid_price:.4f} "
+                                f"edge={_edge_live:.4f}"
+                            )
+                            try:
+                                if order_id:
+                                    _predict_remove_orders(session, [order_id])
+                            except Exception:
+                                pass
+                            break
+                        # Also refresh max_bid so outbid check below uses latest
+                        _live_dyn_fee2 = poly_fee_rate * _pa_live * (1.0 - _pa_live)
+                        _live_max2 = (1.0 - _pa_live - _live_dyn_fee2 - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
+                        max_bid = min(_live_max2, _predict_max_bid_price)
+                except Exception:
+                    pass  # non-fatal: keep order open on API error
+
             # ── Outbid check: queue-aware replace when actually outbid ──
             quote_age_sec = time.time() - quote_post_ts
             if quote_age_sec >= quote_ttl_sec and replace_count < max_replaces and current_filled_wei <= 0:
                 live_bb, live_bb_sz = _check_predict_best_bid()
 
                 if live_bb is not None and live_bb > current_bid_price + 1e-6:
-                    # Refresh max_bid from current live Poly price before deciding
-                    if poly_token_id:
-                        try:
-                            _poly_book_live = _polymarket_book(poly_token_id)
-                            _live_poly_ask = _vwap_from_poly_book(_poly_book_live, float(leg.shares))
-                            if _live_poly_ask and 0 < _live_poly_ask < 1:
-                                _live_dyn_fee = poly_fee_rate * _live_poly_ask * (1.0 - _live_poly_ask)
-                                _live_max_by_edge = (1.0 - _live_poly_ask - _live_dyn_fee - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
-                                max_bid = min(_live_max_by_edge, _predict_max_bid_price)
-                                print(
-                                    f"[PREDICT_LIMIT] max_bid_refresh poly_ask={_live_poly_ask:.4f} "
-                                    f"max_bid_by_edge={_live_max_by_edge:.4f} max_bid={max_bid:.4f}"
-                                )
-                        except Exception:
-                            pass  # keep existing max_bid on error
+                    # max_bid already refreshed by hedge-viability check above; skip redundant fetch
 
                     # We've been outbid → apply queue-aware pricing
                     new_price, rq_meta = _queue_price(live_bb, live_bb_sz)

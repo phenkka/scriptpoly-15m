@@ -299,8 +299,7 @@ def _check_arbitrage() -> None:
             continue
 
         prev_target = _last_target_bid.get(ba_key)
-        if prev_target is not None and target_bid < prev_target + 0.01 - 1e-9:
-            print(f"[ANALYZER] skip no_improvement label={ba_label} target_bid={target_bid:.4f} prev={prev_target:.4f}")
+        if prev_target is not None and abs(target_bid - prev_target) < 0.01 - 1e-9:
             continue
         _last_target_bid[ba_key] = target_bid
 
