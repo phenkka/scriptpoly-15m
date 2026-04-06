@@ -2163,8 +2163,9 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_below_min"}
 
+            _ba_hedge_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_hedge_leg = OpportunityLeg(
-                **{**poly_leg.model_dump(), "shares": _ba_hedge_qty, "stake_usd": _ba_hedge_qty * float(poly_leg.ask)}
+                **{**poly_leg.model_dump(), "shares": _ba_hedge_qty, "stake_usd": _ba_hedge_qty * _ba_hedge_price}
             )
             polymarket_result_ba: dict[str, Any] | None = None
             poly_exec_error_ba: Exception | None = None
