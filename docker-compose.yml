@@ -44,6 +44,30 @@ services:
     volumes:
       - ./data:/data
 
+  balancer:
+    build:
+      context: .
+      dockerfile: balancer/Dockerfile
+    container_name: balancer
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY}
+      POLY_FUNDER: ${POLY_FUNDER:-}
+      PREDICT_PRIVATE_KEY: ${PREDICT_PRIVATE_KEY}
+      BALANCER_POLY_WALLET: ${BALANCER_POLY_WALLET:-0x187042aEF3a09C534E76612440ED086e58c9ACaD}
+      BALANCER_PREDICT_WALLET: ${BALANCER_PREDICT_WALLET:-0x1b7FD55c2D2c243CE917eb998f12CDEB9E686Fc9}
+      BALANCER_THRESHOLD_USD: ${BALANCER_THRESHOLD_USD:-10}
+      BALANCER_TARGET_USD: ${BALANCER_TARGET_USD:-25}
+      BALANCER_ENABLE_TRANSFERS: ${BALANCER_ENABLE_TRANSFERS:-false}
+      BALANCER_INTERVAL_SEC: ${BALANCER_INTERVAL_SEC:-30}
+      BALANCER_COOLDOWN_SEC: ${BALANCER_COOLDOWN_SEC:-300}
+      BSC_RPC_URL: ${BSC_RPC_URL:-https://bsc-dataseed.binance.org}
+      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-https://polygon-rpc.com}
+      BSC_USDT_ADDRESS: ${BSC_USDT_ADDRESS:-0x55d398326f99059fF775485246999027B3197955}
+      POLYGON_USDCE_ADDRESS: ${POLYGON_USDCE_ADDRESS:-0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174}
+
   collect_polymarket:
     build:
       context: .
