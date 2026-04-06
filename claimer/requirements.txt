@@ -1,0 +1,4 @@
+requests==2.32.3
+web3==6.20.2
+eth-account==0.13.4
+predict-sdk

@@ -92,3 +92,26 @@ services:
       ANALYZER_URL: http://analyzer:8000/ingest
       PREDICT_API_KEY: ${PREDICT_API_KEY}
     command: ["python", "-m", "collect.predict_orderbook"]
+
+  claimer:
+    build:
+      context: .
+      dockerfile: claimer/Dockerfile
+    container_name: claimer
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY}
+      POLY_FUNDER: ${POLY_FUNDER:-}
+      PREDICT_PRIVATE_KEY: ${PREDICT_PRIVATE_KEY}
+      PREDICT_ACCOUNT: ${PREDICT_ACCOUNT:-}
+      PREDICT_API_KEY: ${PREDICT_API_KEY}
+      BALANCER_POLY_WALLET: ${BALANCER_POLY_WALLET:-0x187042aEF3a09C534E76612440ED086e58c9ACaD}
+      BSC_RPC_URL: ${BSC_RPC_URL:-https://bsc-dataseed.binance.org}
+      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-https://polygon-rpc.com}
+      TRADER_TRADES_FILE: ${TRADER_TRADES_FILE:-/data/trades.jsonl}
+      CLAIMER_INTERVAL_SEC: ${CLAIMER_INTERVAL_SEC:-3600}
+      CLAIMER_DRY_RUN: ${CLAIMER_DRY_RUN:-false}
+    volumes:
+      - ./data:/data
