@@ -778,10 +778,10 @@ def main() -> None:
                 continue
 
             # Equalization strategy:
-            #   trigger when |poly - predict| > threshold_usd
+            #   trigger: если у любого из кошельков баланс < threshold_usd → выравниваем
             #   send half the imbalance → both sides end up at total/2
-            need_bsc = imbalance > threshold_usd    # poly has more → move poly→bsc to top up predict
-            need_poly = imbalance < -threshold_usd  # predict has more → move bsc→poly to top up polymarket
+            need_bsc = pred_trigger_bal < threshold_usd and imbalance > 0   # predict мало, poly даёт
+            need_poly = poly_display < threshold_usd and imbalance < 0      # poly мало, predict даёт
 
             if need_bsc and not need_poly:
                 amt = imbalance / 2.0  # half the excess from poly side
