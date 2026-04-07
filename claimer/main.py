@@ -573,17 +573,19 @@ def main() -> None:
         os.environ.get("BALANCER_POLY_PRIVATE_KEY", "").strip()
         or os.environ.get("POLY_PRIVATE_KEY", "").strip()
     )
-    _poly_rpc_default = ",".join([
+    _poly_rpc_fallbacks = [
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
         "https://polygon-rpc.com",
         "https://1rpc.io/matic",
-    ])
-    poly_rpc_urls = _parse_rpc_list(
+    ]
+    _poly_user = (
         os.environ.get("POLYGON_RPC_URLS", "").strip()
         or os.environ.get("POLYGON_RPC_URL", "").strip()
-        or _poly_rpc_default
-    ) or ["https://polygon-rpc.com"]
+    )
+    poly_rpc_urls = _parse_rpc_list(_poly_user) + [
+        u for u in _poly_rpc_fallbacks if u not in _parse_rpc_list(_poly_user)
+    ] or _poly_rpc_fallbacks
 
     # Predict.fun (BSC, Kernel wallet)
     predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip()
@@ -591,17 +593,19 @@ def main() -> None:
         os.environ.get("PREDICT_PRIVATE_KEY", "").strip()
     )
     predict_api_key = os.environ.get("PREDICT_API_KEY", "").strip()
-    _bsc_rpc_default = ",".join([
+    _bsc_rpc_fallbacks = [
         "https://bsc-dataseed.binance.org",
         "https://bsc-dataseed1.defibit.io",
         "https://bsc-dataseed1.ninicoin.io",
         "https://bsc.publicnode.com",
-    ])
-    bsc_rpc_urls = _parse_rpc_list(
+    ]
+    _bsc_user = (
         os.environ.get("BSC_RPC_URLS", "").strip()
         or os.environ.get("BSC_RPC_URL", "").strip()
-        or _bsc_rpc_default
-    ) or ["https://bsc-dataseed.binance.org"]
+    )
+    bsc_rpc_urls = _parse_rpc_list(_bsc_user) + [
+        u for u in _bsc_rpc_fallbacks if u not in _parse_rpc_list(_bsc_user)
+    ] or _bsc_rpc_fallbacks
 
     log.info(
         f"claimer_start dry_run={dry_run} safe={safe_address} "
