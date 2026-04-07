@@ -573,10 +573,16 @@ def main() -> None:
         os.environ.get("BALANCER_POLY_PRIVATE_KEY", "").strip()
         or os.environ.get("POLY_PRIVATE_KEY", "").strip()
     )
+    _poly_rpc_default = ",".join([
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com",
+        "https://polygon-rpc.com",
+        "https://1rpc.io/matic",
+    ])
     poly_rpc_urls = _parse_rpc_list(
         os.environ.get("POLYGON_RPC_URLS", "").strip()
         or os.environ.get("POLYGON_RPC_URL", "").strip()
-        or "https://polygon-rpc.com"
+        or _poly_rpc_default
     ) or ["https://polygon-rpc.com"]
 
     # Predict.fun (BSC, Kernel wallet)
@@ -585,10 +591,16 @@ def main() -> None:
         os.environ.get("PREDICT_PRIVATE_KEY", "").strip()
     )
     predict_api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+    _bsc_rpc_default = ",".join([
+        "https://bsc-dataseed.binance.org",
+        "https://bsc-dataseed1.defibit.io",
+        "https://bsc-dataseed1.ninicoin.io",
+        "https://bsc.publicnode.com",
+    ])
     bsc_rpc_urls = _parse_rpc_list(
         os.environ.get("BSC_RPC_URLS", "").strip()
         or os.environ.get("BSC_RPC_URL", "").strip()
-        or "https://bsc-dataseed.binance.org"
+        or _bsc_rpc_default
     ) or ["https://bsc-dataseed.binance.org"]
 
     log.info(

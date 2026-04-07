@@ -1,3 +1,3 @@
 requests==2.32.3
 web3==6.20.2
-predict-sdk
+predict-sdk==0.0.16
