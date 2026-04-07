@@ -968,13 +968,9 @@ def _place_predict_limit_buy(
             q_meta["decision"] = "bid_passive"
             q_meta["ticks_behind"] = _ticks_behind
             return round(max_bid, 6), q_meta
-        # Bid at our max profitable price (analyzer target capped at max_bid).
-        # This puts us at the top of the book and above the current ask spread.
-        target_bid = round(min(analyzer_bid, max_bid), 6)
-        # Ensure we're at least 1 tick above best_bid (strictly in front of queue).
-        min_competitive = round(best_bid + tick_size, 6)
-        if target_bid < min_competitive:
-            target_bid = min_competitive
+        # Bid minimally: just 1 tick above best_bid.
+        # If outbid, the replace loop will climb 1 tick at a time up to max_bid.
+        target_bid = round(best_bid + tick_size, 6)
         if target_bid > max_bid:
             target_bid = round(max_bid, 6)
         if target_bid > best_bid:
