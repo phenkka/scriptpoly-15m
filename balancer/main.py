@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -556,6 +558,77 @@ def _sleep(sec: float) -> None:
     time.sleep(sec)
 
 
+def _hourly_trade_stats(since_ts: float) -> str:
+    """Build hourly trade stats message from trades.jsonl. Returns '' if no data."""
+    import json
+    from pathlib import Path
+    from datetime import datetime
+
+    trades_file = os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")
+
+    def _read_jsonl(path: str) -> list[dict]:
+        p = Path(path)
+        if not p.exists():
+            return []
+        rows = []
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+        return rows
+
+    def _epoch(ts: str) -> float:
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    trades = [t for t in _read_jsonl(trades_file) if _epoch(t.get("ts", "")) >= since_ts]
+    if not trades:
+        return ""
+
+    total = len(trades)
+    ok_count = sum(1 for t in trades if t.get("ok"))
+    incident_count = sum(1 for t in trades if not t.get("ok") and not t.get("skipped"))
+    skipped = [t for t in trades if t.get("skipped")]
+
+    # Count by reason_code; for predict_limit_not_filled also break down by cancel_reason
+    reason_counts: dict[str, int] = {}
+    cancel_sub: dict[str, int] = {}
+    for t in skipped:
+        sr = t.get("skip_reason") or {}
+        code = sr.get("code") or (t.get("summary") or {}).get("reason_code") or "unknown"
+        reason_counts[code] = reason_counts.get(code, 0) + 1
+        if code == "predict_limit_not_filled":
+            cr_raw = sr.get("cancel_reason") or "unknown"
+            # strip trailing float noise: "poly_hedge_no_edge:-0.0183" → "poly_hedge_no_edge"
+            cr = cr_raw
+            cancel_sub[cr] = cancel_sub.get(cr, 0) + 1
+
+    lines = [
+        "📈 <b>HOURLY TRADE STATS</b>",
+        "",
+        f"Total calls:    <b>{total}</b>",
+        f"✅ Successful:  <b>{ok_count}</b>",
+        f"🔴 Incidents:   <b>{incident_count}</b>",
+        f"⏭ Skipped:     <b>{len(skipped)}</b>",
+    ]
+
+    if reason_counts:
+        lines.append("")
+        lines.append("<b>Skipped by reason:</b>")
+        for code, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {code}: <b>{cnt}</b>")
+            if code == "predict_limit_not_filled" and cancel_sub:
+                for cr, ccnt in sorted(cancel_sub.items(), key=lambda x: -x[1]):
+                    lines.append(f"      ↳ {cr}: {ccnt}")
+
+    return "\n".join(lines)
+
+
 def main() -> None:
     poly_wallet = os.environ.get("BALANCER_POLY_WALLET", "").strip() or "0x187042aEF3a09C534E76612440ED086e58c9ACaD"
     pred_wallet = os.environ.get("BALANCER_PREDICT_WALLET", "").strip() or "0x1b7FD55c2D2c243CE917eb998f12CDEB9E686Fc9"
@@ -668,6 +741,7 @@ def main() -> None:
     )
 
     last_action_ts: float = 0.0
+    _last_balance_notify_hour: int = -1
 
     while True:
         now = time.time()
@@ -781,6 +855,30 @@ def main() -> None:
                 + (f"→ will equalize to {equal_each:.2f}$ each" if abs(imbalance) > threshold_usd else "→ balanced")
             )
 
+            # Hourly balance notify at :02 (claimer runs at :01, so balance lands at :02)
+            _tm = time.localtime()
+            if _tm.tm_min == 2 and _tm.tm_hour != _last_balance_notify_hour:
+                _last_balance_notify_hour = _tm.tm_hour
+                _pending_line = ""
+                try:
+                    _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
+                    _pending_total = float(_pb.get("poly_usd", 0)) + float(_pb.get("pred_usd", 0))
+                    if _pending_total > 0:
+                        _pending_line = f"Pending: ${_pending_total:.2f}\n"
+                except Exception:
+                    pass
+                _notify(
+                    f"📊 <b>HOURLY BALANCE CHECK</b>\n"
+                    f"\n"
+                    f"Polymarket: ${poly_display:.2f}\n"
+                    f"Predict: ${pred_trigger_bal:.2f}\n"
+                    + _pending_line
+                    + f"<b>TOTAL: ${total_bal:.2f}</b>"
+                )
+                _stats_msg = _hourly_trade_stats(since_ts=time.time() - 3600)
+                if _stats_msg:
+                    _notify(_stats_msg)
+
             if (now - last_action_ts) < cooldown_sec:
                 _sleep(interval_sec)
                 continue
@@ -845,13 +943,21 @@ def main() -> None:
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
-                    _notify(f"⚠️ <b>Балансер: мост упал</b>\npoly→bsc ${amt:.2f}  status=FAILED")
+                    _notify(
+                        f"🔴 <b>TRANSFER FAILED</b>\n"
+                        f"\n"
+                        f"poly → predict  ${amt:.2f}\n"
+                        f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
                 _notify(
-                    f"🔄 <b>Балансер: poly→bsc</b>\n"
-                    f"Перевод ${amt:.2f}  статус={st}\n"
-                    f"poly={poly_display:.2f}$  predict={pred_trigger_bal:.2f}$"
-                )
+                    f"🔄 <b>TRANSFER: POLY → PREDICT</b>\n"
+                    f"\n"
+                    f"${amt:.2f} bridged  •  status: {st}\n"
+                    f"\n"
+                    f"Polymarket:   ${poly_display:.2f}\n"
+                    f"Predict.fun:  ${pred_trigger_bal:.2f}\n"
+                    f"\n"
+                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
 
                 # Forward USDT from EOA funder to PREDICT_ACCOUNT so it is available for trading
                 # Ждём дольше — мост может задержать зачисление на BSC на несколько секунд
@@ -957,13 +1063,21 @@ def main() -> None:
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
-                    _notify(f"⚠️ <b>Балансер: мост упал</b>\nbsc→poly ${amt:.2f}  status=FAILED")
+                    _notify(
+                        f"🔴 <b>TRANSFER FAILED</b>\n"
+                        f"\n"
+                        f"predict → poly  ${amt:.2f}\n"
+                        f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
                 _notify(
-                    f"🔄 <b>Балансер: bsc→poly</b>\n"
-                    f"Перевод ${amt:.2f}  статус={st}\n"
-                    f"poly={poly_display:.2f}$  predict={pred_trigger_bal:.2f}$"
-                )
+                    f"🔄 <b>TRANSFER: PREDICT → POLY</b>\n"
+                    f"\n"
+                    f"${amt:.2f} bridged  •  status: {st}\n"
+                    f"\n"
+                    f"Polymarket:   ${poly_display:.2f}\n"
+                    f"Predict.fun:  ${pred_trigger_bal:.2f}\n"
+                    f"\n"
+                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
 
                 last_action_ts = time.time()
 

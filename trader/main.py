@@ -15,7 +15,13 @@ from pydantic import BaseModel
 import httpx
 import requests
 
-from notify import notify
+import sys as _sys
+_sys.path.insert(0, "/app")
+try:
+    from notify import notify
+except ImportError:
+    def notify(text: str, **_: object) -> None:  # type: ignore[misc]
+        pass
 
 from predict_sdk import (
     BuildOrderInput,
@@ -194,6 +200,9 @@ _predict_market_last_buy_ts: dict[int, float] = {}
 # Набор market_id которые сейчас в процессе исполнения — блокирует параллельные трейды
 _predict_market_in_flight: set[int] = set()
 _predict_market_in_flight_lock = _threading.Lock()
+# State for grouping repeated HEDGE FILLED notifications in the same market
+# key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
+_ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
 
 
 def _fmt_usd(x: float | int | None) -> str:
@@ -2154,14 +2163,6 @@ def opportunity(opp: Opportunity) -> dict:
                         f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f} "
                         f"— forcing hedge to close unhedged predict position"
                     )
-                    notify(
-                        f"⚠️ <b>Инцидент: no_edge хедж</b>\n"
-                        f"<b>{opp.label}</b>\n"
-                        f"qty={_ba_hedge_qty:.2f} DOWN @ {_ba_actual_pred_bid:.4f}\n"
-                        f"poly UP @ {_live_vwap_ba:.4f}  net_edge={_live_net_edge_ba:.4f}\n"
-                        f"форс-хедж запускается..."
-                    )
-
             # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
             _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
             if _live_vwap_ba is not None and _live_vwap_ba >= _poly_max_hedge_price:
@@ -2313,14 +2314,43 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_pred_fee_paid = _ba_pred_fee_bps / 10_000 * _ba_pred_price * _ba_hedge_qty
                 _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
                 _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
-                notify(
-                    f"✅ <b>Трейд исполнен</b> [{_ba_order_type}]\n"
-                    f"<b>{opp.label}</b>\n"
-                    f"qty={_ba_hedge_qty:.2f}  stake=${opp.stake_usd:.2f}\n"
-                    f"pred DOWN @ {_ba_pred_price:.4f} | poly UP @ {_ba_poly_price:.4f}\n"
-                    f"pnl≈<b>${_ba_net_pnl:+.3f}</b>  (gross=${_ba_gross:+.3f} fee=${_ba_poly_fee_paid+_ba_pred_fee_paid:.3f})\n"
-                    f"⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s"
+
+                _tkey = str(poly_leg.token_id)
+                _prev = _ba_fill_state.get(_tkey)
+                _GROUP_TTL = 1800  # 30 min window to group fills for same market
+                _is_grouped = _prev is not None and (time.time() - _prev[3]) < _GROUP_TTL
+                _reply_to_id = _prev[0] if _is_grouped else None
+                _cum_pnl = (_prev[1] + _ba_net_pnl) if _is_grouped else _ba_net_pnl
+                _fill_n = (_prev[2] + 1) if _is_grouped else 1
+
+                _pnl_line = (
+                    f"<b>{_ba_net_pnl:+.2f}$ - TYANUCHKA IS CANCELED</b>\n"
+                    if (_ba_pred_price + _ba_poly_price) < 1.0
+                    else f"<b>{_ba_net_pnl:+.2f}$</b>\n"
                 )
+                _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
+                _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b> 🟢🟢🟢" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b> 🟢🟢🟢"
+
+                _msg_id = notify(
+                    f"{_title}\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Polymarket ({poly_leg.side.upper()} ASK)\n"
+                    f"price: {_ba_poly_price:.2f} - stake: ${_ba_poly_qty * _ba_poly_price:.2f} - shares: {_ba_poly_qty:.2f}\n"
+                    f"Predict ({pred_leg.side.upper()} BID)\n"
+                    f"price: {_ba_pred_price:.2f} - stake: ${_ba_hedge_qty * _ba_pred_price:.2f} - shares: {_ba_hedge_qty:.2f}\n"
+                    f"\n"
+                    + _pnl_line
+                    + _cum_line
+                    + f"\n"
+                    f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>",
+                    reply_to_message_id=_reply_to_id,
+                )
+                # Store state: use original msg_id for the whole group so all replies chain to first
+                _stored_id = (_prev[0] if _is_grouped else _msg_id) if _msg_id is not None else (_reply_to_id or 0)
+                if _stored_id:
+                    _ba_fill_state[_tkey] = (_stored_id, _cum_pnl, _fill_n, time.time())
                 return {"status": "ok"}
             else:
                 # Predict filled, poly failed → unhedged predict incident
@@ -2347,13 +2377,16 @@ def opportunity(opp: Opportunity) -> dict:
                     f"residual={_ba_residual:.6f}"
                 )
                 notify(
-                    f"🚨 <b>Инцидент: нехедж predict</b>\n"
+                    f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b> 🔴🔴🔴\n"
+                    f"\n"
                     f"<b>{opp.label}</b>\n"
-                    f"qty={_ba_hedge_qty:.2f} DOWN @ {_ba_actual_pred_bid:.4f}  stake=${float(pred_leg.stake_usd):.2f}\n"
-                    f"poly UP @ {_live_vwap_ba:.4f} — хедж <b>не прошёл</b>\n"
-                    f"ориент. убыток ≈ <b>${_ba_hedge_qty * (_live_vwap_ba - (1 - _ba_actual_pred_bid)):+.2f}</b>\n"
-                    f"err: {str(poly_exec_error_ba)[:80] if poly_exec_error_ba else 'unknown'}"
-                )
+                    f"\n"
+                    f"Predict ({pred_leg.side.upper()} BID)\n"
+                    f"price: {_ba_actual_pred_bid:.2f} - stake: ${_ba_hedge_qty * _ba_actual_pred_bid:.2f} - shares: {_ba_hedge_qty:.2f}\n"
+                    f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
+                    f"price: {_live_vwap_ba:.2f} (est.) - err: {str(poly_exec_error_ba)[:50] if poly_exec_error_ba else 'unknown'}\n"
+                    f"\n"
+                    f"<b>{_ba_hedge_qty * (_live_vwap_ba - (1.0 - _ba_actual_pred_bid)):+.2f}$ - TYANUCHKA</b>\n"                )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
 
@@ -2661,10 +2694,16 @@ def opportunity(opp: Opportunity) -> dict:
                 f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
             )
             notify(
-                f"⚠️ <b>Инцидент: unhedged predict</b>\n"
-                f"{opp.label}\n"
-                f"qty={_pred_filled_qty:.4f}  err={poly_exec_error}"
-            )
+                f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b> 🔴🔴🔴\n"
+                f"\n"
+                f"<b>{opp.label}</b>\n"
+                f"\n"
+                f"Predict ({pred_leg.side.upper()} ASK)\n"
+                f"stake: ${float(pred_leg.stake_usd):.2f} - shares: {_pred_filled_qty:.2f}\n"
+                f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
+                f"err: {str(poly_exec_error)[:60] if poly_exec_error else 'unknown'}\n"
+                f"\n"
+                f"<b>TYANUCHKA</b>\n"            )
             _append_jsonl(trades_file, row)
             return {"status": "incident", "reason": "unhedged_predict", "unhedged": "predict"}
         else:

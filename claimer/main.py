@@ -179,6 +179,7 @@ def _encode_abi_bytes(raw: str | bytes) -> bytes:
 
 
 _CLAIMS_FILE = Path(os.environ.get("CLAIMS_FILE", "/data/claims.jsonl"))
+_PENDING_BAL_FILE = Path(os.environ.get("PENDING_BAL_FILE", "/data/pending_bal.json"))
 
 
 def _append_claims(record: dict) -> None:
@@ -188,6 +189,15 @@ def _append_claims(record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         log.warning(f"claims_write_failed err={e}")
+
+
+def _write_pending_bal(poly_usd: float, pred_usd: float) -> None:
+    try:
+        _PENDING_BAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _PENDING_BAL_FILE.open("w", encoding="utf-8") as f:
+            json.dump({"ts": datetime.utcnow().isoformat() + "Z", "poly_usd": round(poly_usd, 2), "pred_usd": round(pred_usd, 2)}, f)
+    except Exception as e:
+        log.warning(f"pending_bal_write_failed err={e}")
 
 
 # ── Gnosis Safe execution ───────────────────────────────────────────────────
@@ -296,6 +306,7 @@ def _claim_polymarket(
     log.info(f"poly_positions total={len(positions)} winning={len(winning)}")
 
     ctf = w3.eth.contract(address=Web3.to_checksum_address(POLY_CTF_ADDRESS), abi=_CTF_ABI)
+    total_usd = sum(float(p.get("size", 0)) for p in winning)
     redeemed = 0
 
     for pos in winning:
@@ -368,17 +379,16 @@ def _claim_polymarket(
                 "size": size,
                 "tx_hash": txh,
             })
-            _notify(
-                f"💰 <b>Клейм Polymarket</b>\n"
-                f"condition={condition_id[:14]}...\n"
-                f"size={size:.2f}  tx={txh[:14]}..."
-            )
+            _notify(                f"💰 <b>КЛЕЙМ POLYMARKET</b>\n"
+                f"+{size:.2f}$\n"
+                f"\n"
+                f"<tg-spoiler>tx={txh}</tg-spoiler>\n"            )
             time.sleep(3)  # brief pause between consecutive txs
         except Exception as e:
             log.error(f"poly_redeem_failed condition={condition_id[:14]}... err={e}")
             traceback.print_exc()
 
-    return redeemed
+    return redeemed, total_usd
 
 
 # ── Predict.fun JWT auth + positions ────────────────────────────────────────
@@ -441,6 +451,7 @@ def _claim_predict(
     log.info(f"predict_positions total={len(positions)}")
 
     redeemed = 0
+    total_usd: float = 0.0
     for pos in positions:
         market = pos.get("market") or {}
         outcome = pos.get("outcome") or {}
@@ -493,6 +504,7 @@ def _claim_predict(
             continue
 
         shares = bal / 1e18
+        total_usd += shares
         log.info(
             f"predict_redeem market={market_id} title={market.get('title','')!r} "
             f"condition={condition_id[:14]}... index_set={index_set} "
@@ -529,11 +541,10 @@ def _claim_predict(
                     "tx_hash": txh,
                     "market_id": market_id,
                 })
-                _notify(
-                    f"💰 <b>Клейм predict.fun</b>\n"
-                    f"{market.get('title', '')}\n"
-                    f"~${shares:.2f}  tx={txh[:14]}..."
-                )
+                _notify(                    f"💰 <b>КЛЕЙМ PREDICT</b>\n"
+                    f"+{shares:.2f}$\n"
+                    f"\n"
+                    f"<tg-spoiler>tx={txh}</tg-spoiler>\n"                )
             else:
                 log.error(
                     f"predict_redeem_failed market={market_id} "
@@ -543,7 +554,7 @@ def _claim_predict(
             log.error(f"predict_redeem_error market={market_id} err={e}")
             traceback.print_exc()
 
-    return redeemed
+    return redeemed, total_usd
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────
@@ -629,13 +640,15 @@ def main() -> None:
 
         try:
             log.info(f"=== claimer_cycle_start ts={datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+            _poly_pending_usd: float = 0.0
+            _pred_pending_usd: float = 0.0
 
             # ── Polymarket ──────────────────────────────────────────────────
             if owner_pk and safe_address:
                 try:
                     w3_poly = _get_web3(poly_rpc_urls)
                     chain_id = int(w3_poly.eth.chain_id)
-                    n = _claim_polymarket(
+                    n, _poly_pending_usd = _claim_polymarket(
                         w3=w3_poly,
                         chain_id=chain_id,
                         safe_address=safe_address,
@@ -661,7 +674,7 @@ def main() -> None:
                         jwt_ts = time.time()
                         log.info("predict_jwt_refreshed")
 
-                    n = _claim_predict(
+                    n, _pred_pending_usd = _claim_predict(
                         session=session,
                         predict_account=predict_account,
                         predict_pk=predict_pk,
@@ -676,6 +689,7 @@ def main() -> None:
             else:
                 log.info("predict_skip no_account_or_pk_or_api_key")
 
+            _write_pending_bal(_poly_pending_usd, _pred_pending_usd)
             log.info("=== claimer_cycle_done ===")
         except Exception as e:
             log.error(f"claimer_main_loop_error err={e}")

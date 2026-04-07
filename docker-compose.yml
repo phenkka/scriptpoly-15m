@@ -39,6 +39,7 @@ services:
       PREDICT_API_KEY: ${PREDICT_API_KEY_2}
       PREDICT_PRIVATE_KEY: ${PREDICT_PRIVATE_KEY}
       PREDICT_ACCOUNT: ${PREDICT_ACCOUNT:-}
+      BOT_NOTIFY_URL: ${BOT_NOTIFY_URL:-http://bot:8080/notify}
     ports:
       - "9000:9000"
     volumes:
@@ -67,6 +68,7 @@ services:
       POLYGON_RPC_URL: ${POLYGON_RPC_URL:-https://polygon-rpc.com}
       BSC_USDT_ADDRESS: ${BSC_USDT_ADDRESS:-0x55d398326f99059fF775485246999027B3197955}
       POLYGON_USDCE_ADDRESS: ${POLYGON_USDCE_ADDRESS:-0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174}
+      BOT_NOTIFY_URL: ${BOT_NOTIFY_URL:-http://bot:8080/notify}
 
   collect_polymarket:
     build:
