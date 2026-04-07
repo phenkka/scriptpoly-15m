@@ -187,8 +187,14 @@ async def main() -> None:
     token   = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     port    = int(os.environ.get("BOT_PORT", "8080"))
+    proxy   = os.environ.get("PROXY_URL", "").strip() or None
 
-    bot = Bot(token=token)
+    from aiogram.client.session.aiohttp import AiohttpSession
+    if proxy:
+        session = AiohttpSession(proxy=proxy)
+    else:
+        session = AiohttpSession()
+    bot = Bot(token=token, session=session)
     dp  = Dispatcher()
     dp.include_router(router)
 

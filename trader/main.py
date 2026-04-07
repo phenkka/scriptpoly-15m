@@ -665,7 +665,13 @@ def _get_predict_chain_id() -> ChainId:
         raise RuntimeError(f"unknown_chain_id:{name}")
 
 
-def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
+def _place_polymarket_fok_market_buy(leg: OpportunityLeg, fak_fallback: bool = False) -> dict[str, Any]:
+    """Place a FOK market buy on Polymarket.
+
+    If fak_fallback=True and FOK fails with 'couldn't be fully filled',
+    retries immediately with FAK (Fill-And-Kill) which fills whatever is available.
+    Used for emergency hedge even at a loss.
+    """
     private_key = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
     funder = os.environ.get("POLY_FUNDER", "").strip()
     signature_type_s = os.environ.get("POLY_SIGNATURE_TYPE", "0").strip()
@@ -686,20 +692,23 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
         signature_type = 0
 
     host = "https://clob.polymarket.com"
-    try:
-        client = ClobClient(
+
+    def _build_client() -> ClobClient:
+        c = ClobClient(
             host=host,
             chain_id=137,
             key=private_key,
             signature_type=signature_type,
             funder=funder,
         )
-
         if poly_api_key and poly_secret and poly_passphrase:
-            client.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
+            c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
         else:
-            client.set_api_creds(client.create_or_derive_api_creds())
+            c.set_api_creds(c.create_or_derive_api_creds())
+        return c
 
+    try:
+        client = _build_client()
         mo = MarketOrderArgs(
             token_id=str(leg.token_id),
             amount=float(leg.stake_usd),
@@ -712,8 +721,41 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg) -> dict[str, Any]:
             "token_id": leg.token_id,
             "amount_usd": float(leg.stake_usd),
             "response": resp,
+            "order_type": "FOK",
         }
     except Exception as e:
+        fok_err_str = str(e)
+        is_fok_kill = "couldn't be fully filled" in fok_err_str or "FOK" in fok_err_str
+        if fak_fallback and is_fok_kill:
+            print(
+                f"[TRADER][POLY][FAK_FALLBACK] FOK killed, retrying with FAK "
+                f"token_id={leg.token_id} amount_usd={float(leg.stake_usd):.4f}"
+            )
+            try:
+                client2 = _build_client()
+                mo_fak = MarketOrderArgs(
+                    token_id=str(leg.token_id),
+                    amount=float(leg.stake_usd),
+                    side=BUY,
+                    order_type=OrderType.FAK,
+                )
+                signed_fak = client2.create_market_order(mo_fak)
+                resp_fak = client2.post_order(signed_fak, OrderType.FAK)
+                return {
+                    "token_id": leg.token_id,
+                    "amount_usd": float(leg.stake_usd),
+                    "response": resp_fak,
+                    "order_type": "FAK",
+                    "fok_error": fok_err_str,
+                }
+            except Exception as e2:
+                proxy_url = os.environ.get("PROXY_URL", "").strip()
+                print(
+                    "[TRADER][POLY][FAK_ERROR] "
+                    f"token_id={leg.token_id} amount_usd={float(leg.stake_usd):.6f} "
+                    f"proxy_set={bool(proxy_url)} err={e2}"
+                )
+                raise
         proxy_url = os.environ.get("PROXY_URL", "").strip()
         print(
             "[TRADER][POLY][ERROR] "
@@ -2112,6 +2154,13 @@ def opportunity(opp: Opportunity) -> dict:
                         f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f} "
                         f"— forcing hedge to close unhedged predict position"
                     )
+                    notify(
+                        f"⚠️ <b>Инцидент: no_edge хедж</b>\n"
+                        f"<b>{opp.label}</b>\n"
+                        f"qty={_ba_hedge_qty:.2f} DOWN @ {_ba_actual_pred_bid:.4f}\n"
+                        f"poly UP @ {_live_vwap_ba:.4f}  net_edge={_live_net_edge_ba:.4f}\n"
+                        f"форс-хедж запускается..."
+                    )
 
             # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
             _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
@@ -2169,7 +2218,7 @@ def opportunity(opp: Opportunity) -> dict:
             poly_exec_error_ba: Exception | None = None
             _poly_timing_ba["submit_ts"] = time.time()
             try:
-                polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg)
+                polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg, fak_fallback=True)
                 _poly_timing_ba["ack_ts"] = time.time()
             except Exception as _e_ba_poly:
                 poly_exec_error_ba = _e_ba_poly
@@ -2255,10 +2304,22 @@ def opportunity(opp: Opportunity) -> dict:
                 )
                 _append_jsonl(trades_file, row)
                 _append_jsonl(success_trades_file, row)
+                _ba_order_type = (polymarket_result_ba or {}).get("order_type", "FOK")
+                _ba_unhedged_sec = (row["timing"].get("unhedged_ms") or 0) / 1000
+                _ba_total_sec = (row["timing"].get("total_ms") or 0) / 1000
+                _ba_pred_price = _ba_actual_pred_bid
+                _ba_poly_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
+                _ba_poly_fee_paid = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price) * _ba_hedge_qty
+                _ba_pred_fee_paid = _ba_pred_fee_bps / 10_000 * _ba_pred_price * _ba_hedge_qty
+                _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
+                _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
                 notify(
-                    f"✅ <b>Трейд исполнен</b>\n"
-                    f"{opp.label}\n"
-                    f"stake=${opp.stake_usd:.2f}  profit=${opp.profit_usd:+.2f}"
+                    f"✅ <b>Трейд исполнен</b> [{_ba_order_type}]\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"qty={_ba_hedge_qty:.2f}  stake=${opp.stake_usd:.2f}\n"
+                    f"pred DOWN @ {_ba_pred_price:.4f} | poly UP @ {_ba_poly_price:.4f}\n"
+                    f"pnl≈<b>${_ba_net_pnl:+.3f}</b>  (gross=${_ba_gross:+.3f} fee=${_ba_poly_fee_paid+_ba_pred_fee_paid:.3f})\n"
+                    f"⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s"
                 )
                 return {"status": "ok"}
             else:
@@ -2284,6 +2345,14 @@ def opportunity(opp: Opportunity) -> dict:
                     f"[TRADER][INCIDENT] BID_ASK_UNHEDGED_PREDICT label={opp.label} "
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
                     f"residual={_ba_residual:.6f}"
+                )
+                notify(
+                    f"🚨 <b>Инцидент: нехедж predict</b>\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"qty={_ba_hedge_qty:.2f} DOWN @ {_ba_actual_pred_bid:.4f}  stake=${float(pred_leg.stake_usd):.2f}\n"
+                    f"poly UP @ {_live_vwap_ba:.4f} — хедж <b>не прошёл</b>\n"
+                    f"ориент. убыток ≈ <b>${_ba_hedge_qty * (_live_vwap_ba - (1 - _ba_actual_pred_bid)):+.2f}</b>\n"
+                    f"err: {str(poly_exec_error_ba)[:80] if poly_exec_error_ba else 'unknown'}"
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
