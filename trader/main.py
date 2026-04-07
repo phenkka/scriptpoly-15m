@@ -15,6 +15,8 @@ from pydantic import BaseModel
 import httpx
 import requests
 
+from notify import notify
+
 from predict_sdk import (
     BuildOrderInput,
     Book,
@@ -2257,6 +2259,11 @@ def opportunity(opp: Opportunity) -> dict:
                 )
                 _append_jsonl(trades_file, row)
                 _append_jsonl(success_trades_file, row)
+                notify(
+                    f"✅ <b>Трейд исполнен</b>\n"
+                    f"{opp.label}\n"
+                    f"stake=${opp.stake_usd:.2f}  profit=${opp.profit_usd:+.2f}"
+                )
                 return {"status": "ok"}
             else:
                 # Predict filled, poly failed → unhedged predict incident
@@ -2587,6 +2594,11 @@ def opportunity(opp: Opportunity) -> dict:
                 f"[TRADER][INCIDENT] UNHEDGED_PREDICT label={opp.label} "
                 f"pred_filled_qty={_pred_filled_qty:.6f} poly_error={poly_exec_error} "
                 f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
+            )
+            notify(
+                f"⚠️ <b>Инцидент: unhedged predict</b>\n"
+                f"{opp.label}\n"
+                f"qty={_pred_filled_qty:.4f}  err={poly_exec_error}"
             )
             _append_jsonl(trades_file, row)
             return {"status": "incident", "reason": "unhedged_predict", "unhedged": "predict"}

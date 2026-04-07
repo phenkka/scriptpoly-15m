@@ -16,13 +16,22 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import requests
 from eth_account import Account
+
+sys.path.insert(0, "/app")
+try:
+    from notify import notify as _notify
+except ImportError:
+    def _notify(text: str, **_: object) -> None:  # type: ignore[misc]
+        pass
 from eth_account.messages import encode_defunct
 from web3 import Web3
 
@@ -167,6 +176,18 @@ def _encode_abi_bytes(raw: str | bytes) -> bytes:
         return bytes(raw)
     raw = raw.strip()
     return bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+
+
+_CLAIMS_FILE = Path(os.environ.get("CLAIMS_FILE", "/data/claims.jsonl"))
+
+
+def _append_claims(record: dict) -> None:
+    try:
+        _CLAIMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _CLAIMS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning(f"claims_write_failed err={e}")
 
 
 # ── Gnosis Safe execution ───────────────────────────────────────────────────
@@ -339,6 +360,19 @@ def _claim_polymarket(
             log.info(f"poly_redeem_tx condition={condition_id[:14]}... tx={txh}")
             claimed.add(condition_id)
             redeemed += 1
+            _append_claims({
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "source": "polymarket",
+                "condition_id": condition_id,
+                "index_set": index_set,
+                "size": size,
+                "tx_hash": txh,
+            })
+            _notify(
+                f"💰 <b>Клейм Polymarket</b>\n"
+                f"condition={condition_id[:14]}...\n"
+                f"size={size:.2f}  tx={txh[:14]}..."
+            )
             time.sleep(3)  # brief pause between consecutive txs
         except Exception as e:
             log.error(f"poly_redeem_failed condition={condition_id[:14]}... err={e}")
@@ -485,6 +519,21 @@ def _claim_predict(
                 log.info(f"predict_redeem_ok market={market_id} tx={txh} shares={shares:.4f}")
                 claimed.add(claim_key)
                 redeemed += 1
+                _append_claims({
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "source": "predict",
+                    "title": market.get("title", ""),
+                    "condition_id": condition_id,
+                    "index_set": index_set,
+                    "amount_usd": round(shares, 4),
+                    "tx_hash": txh,
+                    "market_id": market_id,
+                })
+                _notify(
+                    f"💰 <b>Клейм predict.fun</b>\n"
+                    f"{market.get('title', '')}\n"
+                    f"~${shares:.2f}  tx={txh[:14]}..."
+                )
             else:
                 log.error(
                     f"predict_redeem_failed market={market_id} "

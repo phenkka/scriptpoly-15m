@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,13 @@ from typing import Any
 import requests
 from eth_account import Account
 from web3 import Web3
+
+sys.path.insert(0, "/app")
+try:
+    from notify import notify as _notify
+except ImportError:
+    def _notify(text: str, **_: object) -> None:  # type: ignore[misc]
+        pass
 
 
 _USDT_BSC = "0x55d398326f99059fF775485246999027B3197955"
@@ -837,7 +845,13 @@ def main() -> None:
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
+                    _notify(f"⚠️ <b>Балансер: мост упал</b>\npoly→bsc ${amt:.2f}  status=FAILED")
                     raise RuntimeError("bridge_failed")
+                _notify(
+                    f"🔄 <b>Балансер: poly→bsc</b>\n"
+                    f"Перевод ${amt:.2f}  статус={st}\n"
+                    f"poly={poly_display:.2f}$  predict={pred_trigger_bal:.2f}$"
+                )
 
                 # Forward USDT from EOA funder to PREDICT_ACCOUNT so it is available for trading
                 # Ждём дольше — мост может задержать зачисление на BSC на несколько секунд
@@ -943,7 +957,13 @@ def main() -> None:
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
+                    _notify(f"⚠️ <b>Балансер: мост упал</b>\nbsc→poly ${amt:.2f}  status=FAILED")
                     raise RuntimeError("bridge_failed")
+                _notify(
+                    f"🔄 <b>Балансер: bsc→poly</b>\n"
+                    f"Перевод ${amt:.2f}  статус={st}\n"
+                    f"poly={poly_display:.2f}$  predict={pred_trigger_bal:.2f}$"
+                )
 
                 last_action_ts = time.time()
 

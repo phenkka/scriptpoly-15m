@@ -11,6 +11,7 @@ COPY trader/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY trader /app/trader
+COPY notify.py /app/notify.py
 
 USER app
 

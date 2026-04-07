@@ -15,6 +15,7 @@ COPY balancer/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY balancer /app/balancer
+COPY notify.py /app/notify.py
 
 USER app
 

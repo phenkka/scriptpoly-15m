@@ -4,19 +4,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc build-essential \
+    && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
 RUN addgroup --system app && adduser --system --ingroup app app
 
 WORKDIR /app
 
-COPY claimer/requirements.txt /app/requirements.txt
+COPY bot/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY claimer /app/claimer
-COPY notify.py /app/notify.py
+COPY bot /app/bot
 
 USER app
 
-CMD ["python", "-m", "claimer.main"]
+CMD ["python", "-m", "bot.main"]
