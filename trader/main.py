@@ -1464,6 +1464,138 @@ def _place_predict_limit_buy(
     }
 
 
+def _place_predict_limit_sell(
+    leg: OpportunityLeg,
+    *,
+    sell_qty: float,
+    sell_price: float,
+    fill_timeout_sec: float = 30.0,
+    trace_id: int | None = None,
+) -> dict[str, Any]:
+    """Place a LIMIT SELL on Predict to unwind a partial position.
+
+    Returns {"filled": bool, "filled_qty": float, "sell_price": float, "order_hash": str|None}.
+    Always attempts to cancel remaining shares after timeout.
+    """
+    _trace = f"[{trace_id}]" if trace_id is not None else ""
+    if leg.market_id is None:
+        raise RuntimeError("predict_missing_market_id_for_sell")
+
+    session, builder = _predict_client.get()
+    market = _predict_client.get_market(int(leg.market_id))
+    chain_id = _get_predict_chain_id()
+    fee_rate_bps = int(market.get("feeRateBps") or 0)
+    is_neg_risk = bool(market.get("isNegRisk"))
+    is_yield_bearing = bool(market.get("isYieldBearing"))
+    token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
+
+    _tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+    sell_price = round(int(sell_price / _tick) * _tick, 6)
+    price_per_share_wei = _wei_from_float(sell_price)
+    quantity_wei = _wei_from_float(sell_qty)
+
+    amounts = builder.get_limit_order_amounts(
+        LimitHelperInput(
+            side=Side.SELL,
+            price_per_share_wei=price_per_share_wei,
+            quantity_wei=quantity_wei,
+        )
+    )
+    order = builder.build_order(
+        "LIMIT",
+        BuildOrderInput(
+            side=Side.SELL,
+            token_id=str(token_id),
+            maker_amount=str(amounts.maker_amount),
+            taker_amount=str(amounts.taker_amount),
+            fee_rate_bps=fee_rate_bps,
+        ),
+    )
+    typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
+    signed_order = builder.sign_typed_data_order(typed_data)
+    signed_dump = _dump_obj(signed_order)
+    if not isinstance(signed_dump, dict):
+        raise RuntimeError("predict_sell_signed_order_bad")
+    order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
+    signature = signed_dump.get("signature")
+    if not order_obj or not signature:
+        order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+        signature = signed_dump.get("signature")
+    if not str(signature).startswith("0x"):
+        signature = "0x" + str(signature)
+    if "signature" not in order_obj:
+        order_obj["signature"] = signature
+    order_api = _predict_order_to_api(order_obj)
+
+    payload = {
+        "data": {
+            "pricePerShare": str(amounts.price_per_share),
+            "strategy": "LIMIT",
+            "slippageBps": "0",
+            "order": order_api,
+        }
+    }
+    r = session.post(
+        "https://api.predict.fun/v1/orders",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=float(CFG.timeout_sec),
+    )
+    if not r.ok:
+        if r.status_code == 401:
+            _predict_client.invalidate_jwt()
+        raise RuntimeError(f"predict_sell_http_{r.status_code}: {r.text[:500]}")
+    out = r.json()
+    if not out.get("success"):
+        raise RuntimeError(f"predict_sell_order_failed resp={out}")
+
+    create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
+    order_id = str(create_data.get("orderId") or "").strip() or None
+    order_hash = str(create_data.get("orderHash") or "").strip() or None
+
+    print(
+        f"[TRADER]{_trace} predict_limit_sell placed hash={order_hash} "
+        f"qty={sell_qty:.4f} price={sell_price:.4f}"
+    )
+
+    # Poll for fill
+    filled = False
+    filled_wei = 0
+    last_get: dict[str, Any] | None = None
+    t_deadline = time.time() + fill_timeout_sec
+    while time.time() < t_deadline and order_hash:
+        try:
+            last_get = _predict_get_order_by_hash(session, order_hash)
+            _data = last_get.get("data") if isinstance(last_get, dict) else None
+            if isinstance(_data, dict):
+                try:
+                    filled_wei = max(0, int(str(_data.get("amountFilled") or "0")))
+                except Exception:
+                    pass
+            if _predict_resp_is_filled(last_get):
+                filled = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    # Cancel remainder
+    if order_id:
+        try:
+            _predict_remove_orders(session, [order_id])
+        except Exception:
+            pass
+
+    filled_qty = filled_wei / 10**18 if filled_wei > 0 else (sell_qty if filled else 0.0)
+    return {
+        "filled": filled,
+        "filled_qty": filled_qty,
+        "sell_price": sell_price,
+        "order_hash": order_hash,
+        "get": last_get,
+    }
+
+
 def _place_predict_market_buy(leg: OpportunityLeg, timing: dict[str, Any] | None = None) -> dict[str, Any]:
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id")
@@ -2261,35 +2393,80 @@ def opportunity(opp: Opportunity) -> dict:
             # Guard: partial fill may be below Poly's $1 min order.
             _ba_hedge_cost_usd = _ba_hedge_qty * (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+            # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
+            _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
             if _ba_hedge_cost_usd < _poly_min_hedge:
-                _ba_inc_min = {
-                    "ts": datetime.utcnow().isoformat() + "Z",
-                    "type": "bid_ask_hedge_below_min",
-                    "label": opp.label,
-                    "pred_filled_qty": float(_ba_hedge_qty),
-                    "hedge_cost_usd": round(_ba_hedge_cost_usd, 4),
-                    "poly_min_order_usd": _poly_min_hedge,
-                }
-                _append_jsonl(incidents_file, _ba_inc_min)
-                row["ok"] = False
-                row["summary"]["status"] = "incident"
-                row["summary"]["reason_code"] = "bid_ask_hedge_below_min"
-                print(
-                    f"[TRADER][INCIDENT] BID_ASK_HEDGE_BELOW_MIN label={opp.label} "
-                    f"pred_filled={_ba_hedge_qty:.4f} hedge_cost=${_ba_hedge_cost_usd:.2f} min=${_poly_min_hedge}"
-                )
-                notify(
-                    f"🟡 <b>INCIDENT: HEDGE BELOW MIN</b>\n"
-                    f"\n"
-                    f"<b>{opp.label}</b>\n"
-                    f"\n"
-                    f"Predict заполнил частично: <b>{_ba_hedge_qty:.2f} шарес</b>\n"
-                    f"Стоимость хеджа: <b>${_ba_hedge_cost_usd:.2f}</b> (мин Poly: ${_poly_min_hedge:.2f})\n"
-                    f"\n"
-                    f"⚠️ Позиция НЕ захеджирована — ручная проверка!"
-                )
-                _append_jsonl(trades_file, row)
-                return {"status": "incident", "reason": "bid_ask_hedge_below_min"}
+                if _ba_hedge_cost_usd >= _poly_over_hedge_threshold:
+                    # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
+                    _ba_hedge_qty_orig = _ba_hedge_qty
+                    _ba_hedge_qty = _poly_min_hedge / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+                    _ba_hedge_cost_usd = _poly_min_hedge
+                    print(
+                        f"[TRADER] BID_ASK_OVER_HEDGE label={opp.label} "
+                        f"pred_filled={_ba_hedge_qty_orig:.4f} → boosted={_ba_hedge_qty:.4f} "
+                        f"cost=${_ba_hedge_cost_usd:.2f}"
+                    )
+                    # fall through to Step 3 hedge below
+                else:
+                    # ── Unwind: sell back on Predict at current bid price ──
+                    _unwind_price = max(
+                        _poly_over_hedge_threshold / 10,  # floor sanity
+                        _ba_actual_pred_bid - float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
+                    )
+                    _unwind_result: dict[str, Any] = {}
+                    _unwind_err: str | None = None
+                    try:
+                        _unwind_result = _place_predict_limit_sell(
+                            pred_leg,
+                            sell_qty=_ba_hedge_qty,
+                            sell_price=_unwind_price,
+                            fill_timeout_sec=30.0,
+                            trace_id=trace_id,
+                        )
+                    except Exception as _uw_e:
+                        _unwind_err = str(_uw_e)
+                        print(f"[TRADER][UNWIND_ERROR] label={opp.label} err={_uw_e}")
+
+                    _uw_filled = _unwind_result.get("filled", False)
+                    _uw_qty = _unwind_result.get("filled_qty", 0.0)
+                    _uw_loss = (_ba_actual_pred_bid - _unwind_price) * _ba_hedge_qty  # approximate loss
+
+                    _ba_inc_min = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "type": "bid_ask_hedge_below_min_unwind",
+                        "label": opp.label,
+                        "pred_filled_qty": float(_ba_hedge_qty),
+                        "hedge_cost_usd": round(_ba_hedge_cost_usd, 4),
+                        "poly_min_order_usd": _poly_min_hedge,
+                        "unwind_price": _unwind_price,
+                        "unwind_filled": _uw_filled,
+                        "unwind_qty": _uw_qty,
+                        "unwind_error": _unwind_err,
+                    }
+                    _append_jsonl(incidents_file, _ba_inc_min)
+                    row["ok"] = False
+                    row["summary"]["status"] = "incident"
+                    row["summary"]["reason_code"] = "bid_ask_hedge_below_min_unwind"
+                    print(
+                        f"[TRADER][INCIDENT] BID_ASK_HEDGE_BELOW_MIN_UNWIND label={opp.label} "
+                        f"pred_filled={_ba_hedge_qty:.4f} cost=${_ba_hedge_cost_usd:.2f} "
+                        f"unwind_filled={_uw_filled} unwind_qty={_uw_qty:.4f}"
+                    )
+                    _uw_status = "✅ продано" if _uw_filled else "❌ не продано — ручная проверка!"
+                    notify(
+                        f"🟡 <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
+                        f"\n"
+                        f"<b>{opp.label}</b>\n"
+                        f"\n"
+                        f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> (${_ba_hedge_cost_usd:.2f})\n"
+                        f"Слишком мало для Poly (мин ${_poly_min_hedge:.2f})\n"
+                        f"\n"
+                        f"Продажа обратно на Predict по {_unwind_price:.2f}: {_uw_status}\n"
+                        + (f"Убыток: ~${_uw_loss:.3f}\n" if _uw_filled else "")
+                        + (f"Ошибка: {_unwind_err}\n" if _unwind_err else "")
+                    )
+                    _append_jsonl(trades_file, row)
+                    return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
 
             _ba_hedge_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_hedge_leg = OpportunityLeg(
