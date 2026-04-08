@@ -206,13 +206,48 @@ _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
 
 # In-memory hourly P&L log: list of (unix_ts, net_pnl) for the last hour
 _trade_pnl_log: list[tuple[float, float]] = []
+_pnl_checkpoint_ts: float = time.time()  # set at startup; tracks start of current window
 
 
 def _pnl_last_hour() -> tuple[float, int]:
-    """Return (sum_net_pnl, count) for all trades in the last 60 minutes."""
-    cutoff = time.time() - 3600
-    recent = [(ts, pnl) for ts, pnl in _trade_pnl_log if ts >= cutoff]
-    return sum(pnl for _, pnl in recent), len(recent)
+    """Return (sum_net_pnl, count) for trades since _pnl_checkpoint_ts, reading from file."""
+    cutoff = _pnl_checkpoint_ts
+    success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
+    p = Path(success_file)
+    if not p.exists():
+        return 0.0, 0
+    total, count = 0.0, 0
+    try:
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                if not row.get("ok"):
+                    continue
+                ts_str = row.get("ts", "")
+                if not ts_str:
+                    continue
+                ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
+                if ts < cutoff:
+                    continue
+                lr = row.get("live_hedge_recheck") or {}
+                hq = float(lr.get("hedge_qty") or 0)
+                pb = float(lr.get("pred_bid") or 0)
+                vwap = float(lr.get("live_poly_vwap") or 0)
+                lf = float(lr.get("live_poly_fee") or 0)
+                fee_bps = float(
+                    ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
+                )
+                gross = hq * (1.0 - pb - vwap)
+                total += gross - lf * hq - fee_bps / 10_000 * pb * hq
+                count += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return total, count
 
 
 def _fmt_usd(x: float | int | None) -> str:
@@ -2335,18 +2370,40 @@ def opportunity(opp: Opportunity) -> dict:
                     f"ttff_ms={_ba_quote_meta.get('time_to_first_fill_ms', 'n/a')} "
                     f"replaces={_ba_quote_meta.get('replace_count')}"
                 )
-                _append_jsonl(trades_file, row)
-                _append_jsonl(success_trades_file, row)
-                _ba_order_type = (polymarket_result_ba or {}).get("order_type", "FOK")
                 _ba_unhedged_sec = (row["timing"].get("unhedged_ms") or 0) / 1000
                 _ba_total_sec = (row["timing"].get("total_ms") or 0) / 1000
                 _ba_pred_price = _ba_actual_pred_bid
                 _ba_poly_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
+                # Override with actual fill price from Polymarket response (makingAmount/takingAmount)
+                # makingAmount = USDC spent, takingAmount = shares received → actual avg price
+                try:
+                    _ba_poly_making = float(_ba_poly_resp.get("makingAmount") or 0)
+                    _ba_poly_taking = float(_ba_poly_resp.get("takingAmount") or 0)
+                    if _ba_poly_making > 0 and _ba_poly_taking > 0:
+                        _ba_poly_price = _ba_poly_making / _ba_poly_taking
+                except Exception:
+                    pass
                 _ba_poly_fee_paid = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price) * _ba_hedge_qty
                 _ba_pred_fee_paid = _ba_pred_fee_bps / 10_000 * _ba_pred_price * _ba_hedge_qty
                 _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
                 _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
                 _trade_pnl_log.append((time.time(), _ba_net_pnl))
+                # Update live_hedge_recheck with actual executed prices so stored PnL is accurate
+                if "live_hedge_recheck" in row:
+                    row["live_hedge_recheck"]["live_poly_vwap"] = round(_ba_poly_price, 6)
+                    row["live_hedge_recheck"]["live_poly_fee"] = round(
+                        _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price), 6
+                    )
+                else:
+                    row["live_hedge_recheck"] = {
+                        "pred_bid": round(_ba_pred_price, 6),
+                        "live_poly_vwap": round(_ba_poly_price, 6),
+                        "live_poly_fee": round(_ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price), 6),
+                        "hedge_qty": round(_ba_hedge_qty, 4),
+                        "poly_fee_rate": _ba_fee_rate,
+                    }
+                _append_jsonl(trades_file, row)
+                _append_jsonl(success_trades_file, row)
 
                 _tkey = str(poly_leg.token_id)
                 _prev = _ba_fill_state.get(_tkey)

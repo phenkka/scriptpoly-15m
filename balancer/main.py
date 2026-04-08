@@ -778,6 +778,7 @@ def main() -> None:
 
     last_action_ts: float = 0.0
     _last_balance_notify_hour: int = -1
+    _last_pnl_checkpoint_ts: float = time.time() - 3600  # tracks start of current PnL window
 
     while True:
         now = time.time()
@@ -903,7 +904,8 @@ def main() -> None:
                         _pending_line = f"Pending claim: <b>${_pending_total:.2f}</b>\n"
                 except Exception:
                     pass
-                _h1_pnl, _h1_n = _hourly_pnl(since_ts=time.time() - 3600)
+                _h1_pnl, _h1_n = _hourly_pnl(since_ts=_last_pnl_checkpoint_ts)
+                _last_pnl_checkpoint_ts = time.time()  # advance window to now
                 _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
                 _pnl_line = f"{_pnl_emoji} PnL за час: <b>{_h1_pnl:+.2f}$</b> ({_h1_n} трейдов)\n"
                 _notify(
