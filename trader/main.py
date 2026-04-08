@@ -46,10 +46,17 @@ if _proxy_url:
     import py_clob_client.http_helpers.helpers as _clob_helpers
     _clob_helpers._http_client = httpx.Client(
         http2=True,
+        timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
         mounts={
-            "http://": httpx.HTTPTransport(proxy=_proxy_url),
-            "https://": httpx.HTTPTransport(proxy=_proxy_url),
+            "http://": httpx.HTTPTransport(proxy=_proxy_url, retries=1),
+            "https://": httpx.HTTPTransport(proxy=_proxy_url, retries=1),
         },
+    )
+else:
+    import py_clob_client.http_helpers.helpers as _clob_helpers
+    _clob_helpers._http_client = httpx.Client(
+        http2=True,
+        timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
     )
 
 
@@ -2285,12 +2292,33 @@ def opportunity(opp: Opportunity) -> dict:
             polymarket_result_ba: dict[str, Any] | None = None
             poly_exec_error_ba: Exception | None = None
             _poly_timing_ba["submit_ts"] = time.time()
-            try:
-                polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg, fak_fallback=True)
-                _poly_timing_ba["ack_ts"] = time.time()
-            except Exception as _e_ba_poly:
-                poly_exec_error_ba = _e_ba_poly
-                _poly_timing_ba["fail_ts"] = time.time()
+            # Retry poly hedge on network errors — predict is already filled so hedge is critical
+            _POLY_HEDGE_RETRIES = 3
+            for _poly_attempt in range(_POLY_HEDGE_RETRIES):
+                try:
+                    polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg, fak_fallback=True)
+                    _poly_timing_ba["ack_ts"] = time.time()
+                    poly_exec_error_ba = None
+                    break
+                except Exception as _e_ba_poly:
+                    poly_exec_error_ba = _e_ba_poly
+                    _err_s = str(_e_ba_poly)
+                    # Only retry on network/connection errors, not logical API rejections
+                    _is_network_err = (
+                        "Request exception" in _err_s
+                        or "ConnectionError" in _err_s
+                        or "Timeout" in _err_s
+                        or "status_code=None" in _err_s
+                    )
+                    if _is_network_err and _poly_attempt < _POLY_HEDGE_RETRIES - 1:
+                        print(
+                            f"[TRADER][POLY][RETRY] attempt={_poly_attempt + 1}/{_POLY_HEDGE_RETRIES} "
+                            f"err={_err_s[:80]}"
+                        )
+                        time.sleep(0.5)
+                        continue
+                    _poly_timing_ba["fail_ts"] = time.time()
+                    break
             _poly_timing_ba["end"] = time.time()
 
             row["polymarket"] = polymarket_result_ba or {}
