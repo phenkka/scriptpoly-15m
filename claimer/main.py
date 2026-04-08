@@ -186,6 +186,61 @@ def _encode_abi_bytes(raw: str | bytes) -> bytes:
 
 _CLAIMS_FILE = Path(os.environ.get("CLAIMS_FILE", "/data/claims.jsonl"))
 _PENDING_BAL_FILE = Path(os.environ.get("PENDING_BAL_FILE", "/data/pending_bal.json"))
+_SUCCESS_TRADES_FILE = Path(os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl"))
+
+_ERC20_ABI = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    }
+]
+
+
+def _hourly_pnl_from_file(hours: float = 1.0) -> tuple[float, int]:
+    """Sum actual net P&L from trades_success.jsonl for the last `hours` hours."""
+    cutoff = datetime.utcnow().timestamp() - hours * 3600
+    total_pnl = 0.0
+    count = 0
+    if not _SUCCESS_TRADES_FILE.exists():
+        return 0.0, 0
+    try:
+        with _SUCCESS_TRADES_FILE.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    ts_str = row.get("ts", "")
+                    if not ts_str:
+                        continue
+                    ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
+                    if ts < cutoff:
+                        continue
+                    if not row.get("ok"):
+                        continue
+                    lr = row.get("live_hedge_recheck") or {}
+                    if not lr:
+                        continue
+                    hq = float(lr.get("hedge_qty") or 0)
+                    pb = float(lr.get("pred_bid") or 0)
+                    vwap = float(lr.get("live_poly_vwap") or 0)
+                    lf = float(lr.get("live_poly_fee") or 0)
+                    fee_bps = float(
+                        ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
+                    )
+                    gross = hq * (1.0 - pb - vwap)
+                    poly_fee = lf * hq
+                    pred_fee = fee_bps / 10_000 * pb * hq
+                    total_pnl += gross - poly_fee - pred_fee
+                    count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return total_pnl, count
 
 
 def _append_claims(record: dict) -> None:
@@ -758,7 +813,51 @@ def main() -> None:
                 log.info("predict_skip no_account_or_pk_or_api_key")
 
             _write_pending_bal(_poly_pending_usd, _pred_pending_usd)
+
+            # ── Hourly summary ──────────────────────────────────────────────
+            try:
+                _h1_pnl, _h1_n = _hourly_pnl_from_file()
+
+                _poly_usdc_bal: float | None = None
+                if owner_pk and safe_address:
+                    try:
+                        _w3_usdc = _get_web3(poly_rpc_urls)
+                        _usdc_c = _w3_usdc.eth.contract(
+                            address=Web3.to_checksum_address(POLY_USDC_ADDRESS),
+                            abi=_ERC20_ABI,
+                        )
+                        _poly_usdc_bal = _usdc_c.functions.balanceOf(
+                            Web3.to_checksum_address(safe_address)
+                        ).call() / 1e6
+                    except Exception as _e_bal:
+                        log.warning(f"poly_usdc_balance_failed err={_e_bal}")
+
+                _bal_line = ""
+                if _poly_usdc_bal is not None:
+                    _bal_line = f"Poly кошелёк: <b>${_poly_usdc_bal:.2f}</b>\n"
+
+                _pending_total = _poly_pending_usd + _pred_pending_usd
+                _pending_line = ""
+                if _pending_total > 0:
+                    _pending_line = (
+                        f"Pending клеймы: <b>${_pending_total:.2f}</b>"
+                        f" (Poly ${_poly_pending_usd:.2f} | Pred ${_pred_pending_usd:.2f})\n"
+                    )
+
+                _h1_emoji = "📈" if _h1_pnl >= 0 else "📉"
+                _notify(
+                    f"📊 <b>HOURLY BALANCE CHECK</b>\n"
+                    f"\n"
+                    + _bal_line
+                    + _pending_line
+                    + f"\n"
+                    f"{_h1_emoji} За час: <b>{_h1_pnl:+.2f}$</b> ({_h1_n} трейдов)"
+                )
+            except Exception as _e_sum:
+                log.warning(f"hourly_summary_failed err={_e_sum}")
+
             log.info("=== claimer_cycle_done ===")
+
         except Exception as e:
             log.error(f"claimer_main_loop_error err={e}")
             traceback.print_exc()

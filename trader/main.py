@@ -204,6 +204,16 @@ _predict_market_in_flight_lock = _threading.Lock()
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
 
+# In-memory hourly P&L log: list of (unix_ts, net_pnl) for the last hour
+_trade_pnl_log: list[tuple[float, float]] = []
+
+
+def _pnl_last_hour() -> tuple[float, int]:
+    """Return (sum_net_pnl, count) for all trades in the last 60 minutes."""
+    cutoff = time.time() - 3600
+    recent = [(ts, pnl) for ts, pnl in _trade_pnl_log if ts >= cutoff]
+    return sum(pnl for _, pnl in recent), len(recent)
+
 
 def _fmt_usd(x: float | int | None) -> str:
     if x is None:
@@ -2324,6 +2334,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_pred_fee_paid = _ba_pred_fee_bps / 10_000 * _ba_pred_price * _ba_hedge_qty
                 _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
                 _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
+                _trade_pnl_log.append((time.time(), _ba_net_pnl))
 
                 _tkey = str(poly_leg.token_id)
                 _prev = _ba_fill_state.get(_tkey)
@@ -2340,6 +2351,8 @@ def opportunity(opp: Opportunity) -> dict:
                 )
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b> 🟢🟢🟢" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b> 🟢🟢🟢"
+                _h1_pnl, _h1_n = _pnl_last_hour()
+                _h1_line = f"<i>📊 за час: {_h1_pnl:+.2f}$ ({_h1_n} трейдов)</i>\n"
 
                 _msg_id = notify(
                     f"{_title}\n"
@@ -2354,7 +2367,8 @@ def opportunity(opp: Opportunity) -> dict:
                     + _pnl_line
                     + _cum_line
                     + f"\n"
-                    f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>",
+                    f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>\n"
+                    + _h1_line,
                     reply_to_message_id=_reply_to_id,
                 )
                 # Store state: use original msg_id for the whole group so all replies chain to first
