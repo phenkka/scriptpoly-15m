@@ -2121,6 +2121,18 @@ def opportunity(opp: Opportunity) -> dict:
             # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
             # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
             _ba_actual_pred_bid = float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask)
+            # Correct for tick-rounding: use actual on-chain order price (makerAmount/takerAmount)
+            # which accounts for tick-snap applied inside _build_and_post.
+            # E.g. final_bid_price=0.7272 → displayed as 0.73, but actual order placed at 0.72 tick.
+            try:
+                _ba_ord_data = (_ba_pred_resp.get("get") or {}).get("data") or {}
+                _ba_ord = _ba_ord_data.get("order") or {}
+                _ba_mk = int(_ba_ord.get("makerAmount") or 0)
+                _ba_tk = int(_ba_ord.get("takerAmount") or 0)
+                if _ba_mk > 0 and _ba_tk > 0:
+                    _ba_actual_pred_bid = _ba_mk / _ba_tk
+            except Exception:
+                pass
             _ba_fee_rate = float(opp.poly_fee_rate or 0.072)
             _ba_pred_fee_bps = float(opp.predict_fee_bps or 0)
             _ba_safety_bps = float(opp.safety_buffer_bps or 0)
