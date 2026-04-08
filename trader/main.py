@@ -1010,7 +1010,7 @@ def _place_predict_limit_buy(
         _passive_ticks_miss = int(os.environ.get("PREDICT_PASSIVE_BID_MAX_TICKS_MISS", "5") or "5")
         _ticks_behind = round((best_bid - max_bid) / tick_size) if best_bid > max_bid else 0
         if best_bid > max_bid:
-            if _ticks_behind > _passive_ticks_miss:
+            if _ticks_behind >= _passive_ticks_miss:
                 q_meta["decision"] = "skip_best_bid_exceeds_max"
                 return None, q_meta
             # Within passive threshold: place at max_bid and wait.
@@ -2207,6 +2207,16 @@ def opportunity(opp: Opportunity) -> dict:
                 print(
                     f"[TRADER][INCIDENT] BID_ASK_HEDGE_BELOW_MIN label={opp.label} "
                     f"pred_filled={_ba_hedge_qty:.4f} hedge_cost=${_ba_hedge_cost_usd:.2f} min=${_poly_min_hedge}"
+                )
+                notify(
+                    f"🟡 <b>INCIDENT: HEDGE BELOW MIN</b>\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Predict заполнил частично: <b>{_ba_hedge_qty:.2f} шарес</b>\n"
+                    f"Стоимость хеджа: <b>${_ba_hedge_cost_usd:.2f}</b> (мин Poly: ${_poly_min_hedge:.2f})\n"
+                    f"\n"
+                    f"⚠️ Позиция НЕ захеджирована — ручная проверка!"
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_below_min"}

@@ -26,6 +26,12 @@ from typing import Any
 import requests
 from eth_account import Account
 
+# web3 v6 compatibility shim: predict_sdk imports ExtraDataToPOAMiddleware (web3 v7 name)
+# but we run web3 6.x where it's called geth_poa_middleware
+import web3.middleware as _w3mw
+if not hasattr(_w3mw, "ExtraDataToPOAMiddleware"):
+    _w3mw.ExtraDataToPOAMiddleware = getattr(_w3mw, "geth_poa_middleware", None)
+
 sys.path.insert(0, "/app")
 try:
     from notify import notify as _notify
@@ -268,7 +274,8 @@ def _gnosis_safe_execute(
     # Legacy type-0 tx — compatible with Polygon (and consistent with balancer)
     tx.pop("maxFeePerGas", None)
     tx.pop("maxPriorityFeePerGas", None)
-    tx.setdefault("gasPrice", int(w3.eth.gas_price))
+    # Use 130% of current gas price to handle replacement (underpriced) errors
+    tx["gasPrice"] = int(w3.eth.gas_price * 1.3)
 
     signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
     raw = signed_tx.raw_transaction if hasattr(signed_tx, "raw_transaction") else signed_tx.rawTransaction
