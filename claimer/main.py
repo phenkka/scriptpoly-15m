@@ -400,22 +400,76 @@ def _claim_polymarket(
 
 # ── Predict.fun JWT auth + positions ────────────────────────────────────────
 
+def _predict_sign_account_message(pk: str, predict_account: str, message: str) -> str:
+    """
+    Вручную реализует sign_predict_account_message из predict_sdk,
+    обходя баг двойного '0x' в hexbytes v0.3+ при использовании web3 v6.
+
+    Алгоритм (Kernel Smart Wallet EIP-712):
+    1. EIP-191 hash сообщения
+    2. Kernel-обёртка через EIP-712
+    3. Подпись EOA приватным ключом
+    4. Формат: 0x01 + ECDSA_VALIDATOR + signature
+    """
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    from eth_abi import encode as abi_encode
+    from web3 import Web3
+
+    ECDSA_VALIDATOR = "0x845ADb2C711129d4f3966735eD98a9F09fC4cE57"
+    CHAIN_ID = 56  # BNB Mainnet
+
+    # Step 1: EIP-191 hash (кrackt без web3.HexBytes)
+    eip191_prefix = b"\x19Ethereum Signed Message:\n" + str(len(message)).encode() + message.encode()
+    message_hash_bytes: bytes = bytes(Web3.keccak(eip191_prefix))  # bytes(), не HexBytes
+
+    # Step 2: Kernel type hash = keccak("Kernel(bytes32 hash)")
+    kernel_type_hash: bytes = bytes(Web3.keccak(text="Kernel(bytes32 hash)"))
+
+    # Step 3: hash_kernel_message
+    encoded_km = abi_encode(["bytes32", "bytes32"], [kernel_type_hash, message_hash_bytes])
+    kernel_hash: bytes = bytes(Web3.keccak(encoded_km))
+
+    # Step 4: EIP-712 domain separator для Kernel
+    domain_type_hash: bytes = bytes(Web3.keccak(
+        text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    ))
+    predict_account_cs = Web3.to_checksum_address(predict_account)
+    domain_sep = abi_encode(
+        ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+        [
+            domain_type_hash,
+            bytes(Web3.keccak(text="Kernel")),
+            bytes(Web3.keccak(text="0.3.1")),
+            CHAIN_ID,
+            predict_account_cs,
+        ],
+    )
+    domain_separator: bytes = bytes(Web3.keccak(domain_sep))
+
+    # Step 5: EIP-712 final digest = keccak("\x19\x01" + domain_sep + kernel_hash)
+    digest: bytes = bytes(Web3.keccak(b"\x19\x01" + domain_separator + kernel_hash))
+
+    # Step 6: Sign digest with EOA
+    acct = Account.from_key(pk)
+    signable = encode_defunct(primitive=digest)
+    signed = acct.sign_message(signable)
+    sig_hex: str = signed.signature.hex()
+    if not sig_hex.startswith("0x"):
+        sig_hex = "0x" + sig_hex
+
+    # Step 7: Kernel format: 0x01 + ECDSA_VALIDATOR (без 0x) + signature (без 0x)
+    return "0x01" + ECDSA_VALIDATOR[2:] + sig_hex[2:]
+
+
 def _predict_get_jwt(
     session: requests.Session,
     pk: str,
     predict_account: str,
 ) -> str:
     """Получает JWT токен predict.fun через EIP-1271 подпись Smart Wallet."""
-    from predict_sdk import ChainId, OrderBuilder, OrderBuilderOptions
-    builder = OrderBuilder.make(
-        ChainId.BNB_MAINNET,
-        pk,
-        OrderBuilderOptions(predict_account=predict_account),
-    )
     msg = session.get("https://api.predict.fun/v1/auth/message", timeout=8).json()["data"]["message"]
-    sig = builder.sign_predict_account_message(msg)
-    if not str(sig).startswith("0x"):
-        sig = "0x" + str(sig)
+    sig = _predict_sign_account_message(pk, predict_account, msg)
     r = session.post(
         "https://api.predict.fun/v1/auth",
         json={"signer": predict_account, "message": msg, "signature": sig},
@@ -449,7 +503,10 @@ def _claim_predict(
         predict_pk,
         OrderBuilderOptions(predict_account=predict_account),
     )
-    ctf = _get_web3(bsc_rpc_urls).eth.contract(
+    # Override SDK's internal web3 with our own (proxy-aware + multi-RPC fallback)
+    _our_w3 = _get_web3(bsc_rpc_urls)
+    builder._web3 = _our_w3
+    ctf = _our_w3.eth.contract(
         address=Web3.to_checksum_address(BSC_CTF_ADDRESS),
         abi=_CTF_ABI,
     )
@@ -612,10 +669,14 @@ def main() -> None:
     )
     predict_api_key = os.environ.get("PREDICT_API_KEY", "").strip()
     _bsc_rpc_fallbacks = [
-        "https://bsc-dataseed.binance.org",
+        "https://bsc-dataseed1.binance.org",
+        "https://bsc-dataseed2.binance.org",
+        "https://bsc-dataseed3.binance.org",
+        "https://bsc-dataseed4.binance.org",
+        "https://bsc.publicnode.com",
         "https://bsc-dataseed1.defibit.io",
         "https://bsc-dataseed1.ninicoin.io",
-        "https://bsc.publicnode.com",
+        "https://bsc-dataseed.bnbchain.org",
     ]
     _bsc_user = (
         os.environ.get("BSC_RPC_URLS", "").strip()
