@@ -213,7 +213,7 @@ _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
 
 # In-memory hourly P&L log: list of (unix_ts, net_pnl) for the last hour
 _trade_pnl_log: list[tuple[float, float]] = []
-_pnl_checkpoint_ts: float = time.time()  # set at startup; tracks start of current window
+_pnl_checkpoint_ts: float = time.time() - 3600  # rolling 1-hour window, survives restarts
 
 
 def _pnl_last_hour() -> tuple[float, int]:
