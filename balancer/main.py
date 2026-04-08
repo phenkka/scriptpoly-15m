@@ -558,13 +558,13 @@ def _sleep(sec: float) -> None:
     time.sleep(sec)
 
 
-def _hourly_pnl(since_ts: float) -> tuple[float, int]:
-    """Return (net_pnl, count) for successful trades in the last hour."""
+def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
+    """Return (net_pnl, total_count, plus_count, minus_count) for successful trades since since_ts."""
     success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
     p = Path(success_file)
     if not p.exists():
-        return 0.0, 0
-    total, count = 0.0, 0
+        return 0.0, 0, 0, 0
+    total, count, plus_n, minus_n = 0.0, 0, 0, 0
     for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line:
@@ -587,11 +587,16 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int]:
                 ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
             )
             gross = hq * (1.0 - pb - vwap)
-            total += gross - lf * hq - fee_bps / 10_000 * pb * hq
+            trade_pnl = gross - lf * hq - fee_bps / 10_000 * pb * hq
+            total += trade_pnl
             count += 1
+            if trade_pnl >= 0:
+                plus_n += 1
+            else:
+                minus_n += 1
         except Exception:
             pass
-    return total, count
+    return total, count, plus_n, minus_n
 
 
 def _hourly_trade_stats(since_ts: float) -> str:
@@ -892,6 +897,24 @@ def main() -> None:
                 + (f"→ will equalize to {equal_each:.2f}$ each" if abs(imbalance) > threshold_usd else "→ balanced")
             )
 
+            # ── Low balance halt ────────────────────────────────────────────
+            _stop_threshold = float(os.environ.get("BOT_STOP_TOTAL_USD", "25") or "25")
+            _halt_file = Path("/data/halt")
+            if total_bal < _stop_threshold:
+                if not _halt_file.exists():
+                    _halt_file.write_text(f"total={total_bal:.2f} < {_stop_threshold:.2f}")
+                    _notify(
+                        f"🛑 <b>BOT STOPPED</b>\n"
+                        f"\n"
+                        f"Баланс упал ниже ${_stop_threshold:.0f}\n"
+                        f"TOTAL: <b>${total_bal:.2f}</b>\n"
+                        f"\n"
+                        f"Трейдер приостановлен. Пополни баланс и удали /data/halt для возобновления."
+                    )
+            else:
+                if _halt_file.exists():
+                    _halt_file.unlink(missing_ok=True)
+
             # Hourly balance notify at :02
             _tm = time.localtime()
             if _tm.tm_min == 2 and _tm.tm_hour != _last_balance_notify_hour:
@@ -901,13 +924,16 @@ def main() -> None:
                     _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
                     _pending_total = float(_pb.get("poly_usd", 0)) + float(_pb.get("pred_usd", 0))
                     if _pending_total > 0:
-                        _pending_line = f"Pending claim: <b>${_pending_total:.2f}</b>\n"
+                        _pending_line = f"💰 Pending claim: <b>${_pending_total:.2f}</b>\n"
                 except Exception:
                     pass
-                _h1_pnl, _h1_n = _hourly_pnl(since_ts=_last_pnl_checkpoint_ts)
-                _last_pnl_checkpoint_ts = time.time()  # advance window to now
+                _h1_pnl, _h1_n, _h1_plus, _h1_minus = _hourly_pnl(since_ts=_last_pnl_checkpoint_ts)
+                _last_pnl_checkpoint_ts = time.time()
                 _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
-                _pnl_line = f"{_pnl_emoji} PnL за час: <b>{_h1_pnl:+.2f}$</b> ({_h1_n} трейдов)\n"
+                _trades_line = ""
+                if _h1_n > 0:
+                    _trades_line = f"✅ {_h1_plus}  ❌ {_h1_minus}  из {_h1_n} трейдов\n"
+                _halt_line = "🛑 <b>Трейдер остановлен (низкий баланс)</b>\n" if _halt_file.exists() else ""
                 _notify(
                     f"📊 <b>HOURLY BALANCE CHECK</b>\n"
                     f"\n"
@@ -916,7 +942,9 @@ def main() -> None:
                     f"<b>TOTAL: ${total_bal:.2f}</b>\n"
                     f"\n"
                     + _pending_line
-                    + _pnl_line
+                    + f"{_pnl_emoji} PnL за час: <b>{_h1_pnl:+.2f}$</b>\n"
+                    + _trades_line
+                    + _halt_line
                 )
 
             if (now - last_action_ts) < cooldown_sec:

@@ -1728,6 +1728,12 @@ def test_predict(opp: Opportunity) -> dict:
 
 @app.post("/opportunity")
 def opportunity(opp: Opportunity) -> dict:
+    # Check halt flag written by balancer when total balance < BOT_STOP_TOTAL_USD
+    _halt_path = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent / "halt"
+    if _halt_path.exists():
+        print(f"[TRADER] HALTED — halt file exists at {_halt_path}, skipping opportunity")
+        return {"status": "halted", "reason": "low_balance"}
+
     opp = _cap_opportunity(opp)
 
     trace_id = next(_TRACE_COUNTER)
