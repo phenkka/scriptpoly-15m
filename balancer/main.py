@@ -558,6 +558,42 @@ def _sleep(sec: float) -> None:
     time.sleep(sec)
 
 
+def _hourly_pnl(since_ts: float) -> tuple[float, int]:
+    """Return (net_pnl, count) for successful trades in the last hour."""
+    success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
+    p = Path(success_file)
+    if not p.exists():
+        return 0.0, 0
+    total, count = 0.0, 0
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+            ts_str = row.get("ts", "")
+            if not ts_str:
+                continue
+            from datetime import datetime
+            ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
+            if ts < since_ts or not row.get("ok"):
+                continue
+            lr = row.get("live_hedge_recheck") or {}
+            hq = float(lr.get("hedge_qty") or 0)
+            pb = float(lr.get("pred_bid") or 0)
+            vwap = float(lr.get("live_poly_vwap") or 0)
+            lf = float(lr.get("live_poly_fee") or 0)
+            fee_bps = float(
+                ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
+            )
+            gross = hq * (1.0 - pb - vwap)
+            total += gross - lf * hq - fee_bps / 10_000 * pb * hq
+            count += 1
+        except Exception:
+            pass
+    return total, count
+
+
 def _hourly_trade_stats(since_ts: float) -> str:
     """Build hourly trade stats message from trades.jsonl. Returns '' if no data."""
     import json
@@ -855,7 +891,7 @@ def main() -> None:
                 + (f"→ will equalize to {equal_each:.2f}$ each" if abs(imbalance) > threshold_usd else "→ balanced")
             )
 
-            # Hourly balance notify at :02 (claimer runs at :01, so balance lands at :02)
+            # Hourly balance notify at :02
             _tm = time.localtime()
             if _tm.tm_min == 2 and _tm.tm_hour != _last_balance_notify_hour:
                 _last_balance_notify_hour = _tm.tm_hour
@@ -864,20 +900,22 @@ def main() -> None:
                     _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
                     _pending_total = float(_pb.get("poly_usd", 0)) + float(_pb.get("pred_usd", 0))
                     if _pending_total > 0:
-                        _pending_line = f"Pending: ${_pending_total:.2f}\n"
+                        _pending_line = f"Pending claim: <b>${_pending_total:.2f}</b>\n"
                 except Exception:
                     pass
+                _h1_pnl, _h1_n = _hourly_pnl(since_ts=time.time() - 3600)
+                _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
+                _pnl_line = f"{_pnl_emoji} PnL за час: <b>{_h1_pnl:+.2f}$</b> ({_h1_n} трейдов)\n"
                 _notify(
                     f"📊 <b>HOURLY BALANCE CHECK</b>\n"
                     f"\n"
                     f"Polymarket: ${poly_display:.2f}\n"
                     f"Predict: ${pred_trigger_bal:.2f}\n"
+                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"
+                    f"\n"
                     + _pending_line
-                    + f"<b>TOTAL: ${total_bal:.2f}</b>"
+                    + _pnl_line
                 )
-                _stats_msg = _hourly_trade_stats(since_ts=time.time() - 3600)
-                if _stats_msg:
-                    _notify(_stats_msg)
 
             if (now - last_action_ts) < cooldown_sec:
                 _sleep(interval_sec)

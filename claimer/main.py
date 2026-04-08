@@ -682,9 +682,9 @@ _JWT_TTL = 3 * 3600  # обновляем JWT раз в 3 часа
 
 
 def _next_run_at() -> datetime:
-    """Следующий запуск в :01 текущего или следующего часа."""
+    """Следующий запуск в :02 текущего или следующего часа."""
     now = datetime.now()
-    candidate = now.replace(minute=1, second=0, microsecond=0)
+    candidate = now.replace(minute=2, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(hours=1)
     return candidate
@@ -754,12 +754,14 @@ def main() -> None:
     jwt_ts: float = 0.0
 
     while True:
-        # ── Ждём :01 следующего часа ────────────────────────────────────────
+        # ── Ждём :02 следующего часа ────────────────────────────────────────
         target = _next_run_at()
         wait = (target - datetime.now()).total_seconds()
-        if wait > 0:
-            log.info(f"claimer_sleep until={target.strftime('%H:%M:%S')} ({wait:.0f}s)")
-            time.sleep(wait)
+        # Всегда спим хотя бы 1 секунду — исключает двойной запуск при старте
+        if wait < 1:
+            wait = (target + timedelta(hours=1) - datetime.now()).total_seconds()
+        log.info(f"claimer_sleep until={target.strftime('%H:%M:%S')} ({wait:.0f}s)")
+        time.sleep(wait)
 
         try:
             log.info(f"=== claimer_cycle_start ts={datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
@@ -813,48 +815,6 @@ def main() -> None:
                 log.info("predict_skip no_account_or_pk_or_api_key")
 
             _write_pending_bal(_poly_pending_usd, _pred_pending_usd)
-
-            # ── Hourly summary ──────────────────────────────────────────────
-            try:
-                _h1_pnl, _h1_n = _hourly_pnl_from_file()
-
-                _poly_usdc_bal: float | None = None
-                if owner_pk and safe_address:
-                    try:
-                        _w3_usdc = _get_web3(poly_rpc_urls)
-                        _usdc_c = _w3_usdc.eth.contract(
-                            address=Web3.to_checksum_address(POLY_USDC_ADDRESS),
-                            abi=_ERC20_ABI,
-                        )
-                        _poly_usdc_bal = _usdc_c.functions.balanceOf(
-                            Web3.to_checksum_address(safe_address)
-                        ).call() / 1e6
-                    except Exception as _e_bal:
-                        log.warning(f"poly_usdc_balance_failed err={_e_bal}")
-
-                _bal_line = ""
-                if _poly_usdc_bal is not None:
-                    _bal_line = f"Poly кошелёк: <b>${_poly_usdc_bal:.2f}</b>\n"
-
-                _pending_total = _poly_pending_usd + _pred_pending_usd
-                _pending_line = ""
-                if _pending_total > 0:
-                    _pending_line = (
-                        f"Pending клеймы: <b>${_pending_total:.2f}</b>"
-                        f" (Poly ${_poly_pending_usd:.2f} | Pred ${_pred_pending_usd:.2f})\n"
-                    )
-
-                _h1_emoji = "📈" if _h1_pnl >= 0 else "📉"
-                _notify(
-                    f"📊 <b>HOURLY BALANCE CHECK</b>\n"
-                    f"\n"
-                    + _bal_line
-                    + _pending_line
-                    + f"\n"
-                    f"{_h1_emoji} За час: <b>{_h1_pnl:+.2f}$</b> ({_h1_n} трейдов)"
-                )
-            except Exception as _e_sum:
-                log.warning(f"hourly_summary_failed err={_e_sum}")
 
             log.info("=== claimer_cycle_done ===")
 
