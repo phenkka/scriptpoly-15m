@@ -441,10 +441,10 @@ def _claim_polymarket(
                 "size": size,
                 "tx_hash": txh,
             })
-            _notify(                f"💰 <b>КЛЕЙМ POLYMARKET</b>\n"
+            _notify(                
+                f"💰 <b>CLAIM FROM POLYMARKET</b>\n"
                 f"+{size:.2f}$\n"
-                f"\n"
-                f"<tg-spoiler>tx={txh}</tg-spoiler>\n"            )
+            )
             time.sleep(3)  # brief pause between consecutive txs
         except Exception as e:
             log.error(f"poly_redeem_failed condition={condition_id[:14]}... err={e}")
@@ -660,10 +660,10 @@ def _claim_predict(
                     "tx_hash": txh,
                     "market_id": market_id,
                 })
-                _notify(                    f"💰 <b>КЛЕЙМ PREDICT</b>\n"
+                _notify(                    
+                    f"💰 <b>CLAIM FROM PREDICT</b>\n"
                     f"+{shares:.2f}$\n"
-                    f"\n"
-                    f"<tg-spoiler>tx={txh}</tg-spoiler>\n"                )
+                )
             else:
                 log.error(
                     f"predict_redeem_failed market={market_id} "

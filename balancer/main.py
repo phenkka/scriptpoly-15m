@@ -599,75 +599,38 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
     return total, count, plus_n, minus_n
 
 
-def _hourly_trade_stats(since_ts: float) -> str:
-    """Build hourly trade stats message from trades.jsonl. Returns '' if no data."""
-    import json
-    from pathlib import Path
-    from datetime import datetime
-
-    trades_file = os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")
-
-    def _read_jsonl(path: str) -> list[dict]:
-        p = Path(path)
-        if not p.exists():
-            return []
-        rows = []
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
-        return rows
-
-    def _epoch(ts: str) -> float:
+def _hourly_trade_details(since_ts: float) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Return (ok_count, incidents_by_code, skips_by_code) for trades since since_ts."""
+    p = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl"))
+    if not p.exists():
+        return 0, {}, {}
+    ok_n = 0
+    incidents: dict[str, int] = {}
+    skips: dict[str, int] = {}
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            row = json.loads(line)
+            ts_str = row.get("ts", "")
+            if not ts_str:
+                continue
+            ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
+            if ts < since_ts:
+                continue
+            if row.get("ok"):
+                ok_n += 1
+            elif row.get("skipped"):
+                sr = row.get("skip_reason") or {}
+                code = sr.get("code") or (row.get("summary") or {}).get("reason_code") or "unknown"
+                skips[code] = skips.get(code, 0) + 1
+            else:
+                code = (row.get("summary") or {}).get("reason_code") or "incident"
+                incidents[code] = incidents.get(code, 0) + 1
         except Exception:
-            return 0.0
-
-    trades = [t for t in _read_jsonl(trades_file) if _epoch(t.get("ts", "")) >= since_ts]
-    if not trades:
-        return ""
-
-    total = len(trades)
-    ok_count = sum(1 for t in trades if t.get("ok"))
-    incident_count = sum(1 for t in trades if not t.get("ok") and not t.get("skipped"))
-    skipped = [t for t in trades if t.get("skipped")]
-
-    # Count by reason_code; for predict_limit_not_filled also break down by cancel_reason
-    reason_counts: dict[str, int] = {}
-    cancel_sub: dict[str, int] = {}
-    for t in skipped:
-        sr = t.get("skip_reason") or {}
-        code = sr.get("code") or (t.get("summary") or {}).get("reason_code") or "unknown"
-        reason_counts[code] = reason_counts.get(code, 0) + 1
-        if code == "predict_limit_not_filled":
-            cr_raw = sr.get("cancel_reason") or "unknown"
-            # strip trailing float noise: "poly_hedge_no_edge:-0.0183" → "poly_hedge_no_edge"
-            cr = cr_raw
-            cancel_sub[cr] = cancel_sub.get(cr, 0) + 1
-
-    lines = [
-        "📈 <b>HOURLY TRADE STATS</b>",
-        "",
-        f"Total calls:    <b>{total}</b>",
-        f"✅ Successful:  <b>{ok_count}</b>",
-        f"🔴 Incidents:   <b>{incident_count}</b>",
-        f"⏭ Skipped:     <b>{len(skipped)}</b>",
-    ]
-
-    if reason_counts:
-        lines.append("")
-        lines.append("<b>Skipped by reason:</b>")
-        for code, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"  • {code}: <b>{cnt}</b>")
-            if code == "predict_limit_not_filled" and cancel_sub:
-                for cr, ccnt in sorted(cancel_sub.items(), key=lambda x: -x[1]):
-                    lines.append(f"      ↳ {cr}: {ccnt}")
-
-    return "\n".join(lines)
+            pass
+    return ok_n, incidents, skips
 
 
 def main() -> None:
@@ -904,12 +867,11 @@ def main() -> None:
                 if not _halt_file.exists():
                     _halt_file.write_text(f"total={total_bal:.2f} < {_stop_threshold:.2f}")
                     _notify(
-                        f"🛑 <b>BOT STOPPED</b>\n"
+                        f"🛑🛑🛑 <b>BOT STOPPED</b>\n"
                         f"\n"
-                        f"Баланс упал ниже ${_stop_threshold:.0f}\n"
+                        f"Balance dropped below ${_stop_threshold:.0f}\n"
                         f"TOTAL: <b>${total_bal:.2f}</b>\n"
                         f"\n"
-                        f"Трейдер приостановлен. Пополни баланс и удали /data/halt для возобновления."
                     )
             else:
                 if _halt_file.exists():
@@ -919,32 +881,54 @@ def main() -> None:
             _tm = time.localtime()
             if _tm.tm_min == 2 and _tm.tm_hour != _last_balance_notify_hour:
                 _last_balance_notify_hour = _tm.tm_hour
-                _pending_line = ""
+                _pending_poly = 0.0
+                _pending_pred = 0.0
                 try:
                     _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
-                    _pending_total = float(_pb.get("poly_usd", 0)) + float(_pb.get("pred_usd", 0))
-                    if _pending_total > 0:
-                        _pending_line = f"💰 Pending claim: <b>${_pending_total:.2f}</b>\n"
+                    _pending_poly = float(_pb.get("poly_usd", 0))
+                    _pending_pred = float(_pb.get("pred_usd", 0))
                 except Exception:
                     pass
-                _h1_pnl, _h1_n, _h1_plus, _h1_minus = _hourly_pnl(since_ts=_last_pnl_checkpoint_ts)
+                _pending_total = _pending_poly + _pending_pred
+                _full_poly = poly_display + _pending_poly
+                _full_pred = pred_trigger_bal + _pending_pred
+                _full_total = total_bal + _pending_total
+                _since_ts = _last_pnl_checkpoint_ts
+                _h1_pnl, _, _, _ = _hourly_pnl(since_ts=_since_ts)
                 _last_pnl_checkpoint_ts = time.time()
+                _ok_n, _incidents, _skips = _hourly_trade_details(since_ts=_since_ts)
+                _inc_n = sum(_incidents.values())
+                _skip_n = sum(_skips.values())
                 _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
-                _trades_line = ""
-                if _h1_n > 0:
-                    _trades_line = f"✅ {_h1_plus}  ❌ {_h1_minus}  из {_h1_n} трейдов\n"
+                _poly_line = f"Polymarket: ${poly_display:.2f}" + (f" (${_full_poly:.2f})" if _pending_poly > 0 else "") + "\n"
+                _pred_line = f"Predict: ${pred_trigger_bal:.2f}" + (f" (${_full_pred:.2f})" if _pending_pred > 0 else "") + "\n"
+                _total_line = f"<b>TOTAL: ${total_bal:.2f}" + (f" (${_full_total:.2f})" if _pending_total > 0 else "") + "</b>\n"
+                _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
+                if _incidents:
+                    _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
+                    for _code, _cnt in sorted(_incidents.items(), key=lambda x: -x[1]):
+                        _tlines.append(f"  • {_code}: {_cnt}")
+                else:
+                    _tlines.append("🔴 Incidents: <b>0</b>")
+                if _skips:
+                    _tlines.append(f"⏭ Skipped: <b>{_skip_n}</b>")
+                    for _code, _cnt in sorted(_skips.items(), key=lambda x: -x[1]):
+                        _tlines.append(f"  • {_code}: {_cnt}")
+                else:
+                    _tlines.append("⏭ Skipped: <b>0</b>")
                 _halt_line = "🛑 <b>Трейдер остановлен (низкий баланс)</b>\n" if _halt_file.exists() else ""
                 _notify(
-                    f"📊 <b>HOURLY BALANCE CHECK</b>\n"
+                    f"📊 <b>HOURLY STATS</b>\n"
                     f"\n"
-                    f"Polymarket: ${poly_display:.2f}\n"
-                    f"Predict: ${pred_trigger_bal:.2f}\n"
-                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"
-                    f"\n"
-                    + _pending_line
-                    + f"{_pnl_emoji} PnL за час: <b>{_h1_pnl:+.2f}$</b>\n"
-                    + _trades_line
-                    + _halt_line
+                    f"<b>BALANCE</b>\n"
+                    + _poly_line
+                    + _pred_line
+                    + _total_line
+                    + f"\n"
+                    + f"{_pnl_emoji} PnL per hour: <b>{_h1_pnl:+.2f}$</b>\n"
+                    + f"\n"
+                    + "\n".join(_tlines) + "\n"
+                    + (_halt_line)
                 )
 
             if (now - last_action_ts) < cooldown_sec:
@@ -1012,7 +996,7 @@ def main() -> None:
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
                     _notify(
-                        f"🔴 <b>TRANSFER FAILED</b>\n"
+                        f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
                         f"\n"
                         f"poly → predict  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
@@ -1020,10 +1004,10 @@ def main() -> None:
                 _notify(
                     f"🔄 <b>TRANSFER: POLY → PREDICT</b>\n"
                     f"\n"
-                    f"${amt:.2f} bridged  •  status: {st}\n"
+                    f"${amt:.2f} bridged - status: {st}\n"
                     f"\n"
                     f"Polymarket:   ${poly_display:.2f}\n"
-                    f"Predict.fun:  ${pred_trigger_bal:.2f}\n"
+                    f"Predict:  ${pred_trigger_bal:.2f}\n"
                     f"\n"
                     f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
 
@@ -1132,7 +1116,7 @@ def main() -> None:
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
                     _notify(
-                        f"🔴 <b>TRANSFER FAILED</b>\n"
+                        f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
                         f"\n"
                         f"predict → poly  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
@@ -1140,10 +1124,10 @@ def main() -> None:
                 _notify(
                     f"🔄 <b>TRANSFER: PREDICT → POLY</b>\n"
                     f"\n"
-                    f"${amt:.2f} bridged  •  status: {st}\n"
+                    f"${amt:.2f} bridged - status: {st}\n"
                     f"\n"
                     f"Polymarket:   ${poly_display:.2f}\n"
-                    f"Predict.fun:  ${pred_trigger_bal:.2f}\n"
+                    f"Predict:  ${pred_trigger_bal:.2f}\n"
                     f"\n"
                     f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
 

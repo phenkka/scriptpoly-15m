@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import itertools
 import json
@@ -679,7 +678,7 @@ def _append_jsonl(path_s: str, row: dict[str, Any]) -> None:
 def _preflight(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: OpportunityLeg) -> list[str]:
     errs: list[str] = []
 
-    if opp.type not in {"arbitrage", "bid_ask_arbitrage"}:
+    if opp.type != "bid_ask_arbitrage":
         errs.append(f"unsupported_type:{opp.type}")
 
     if poly_leg.token_id is None or not str(poly_leg.token_id).strip():
@@ -707,7 +706,7 @@ def _preflight(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: Opportunity
 
 def _preflight_test(opp: Opportunity, poly_leg: OpportunityLeg, pred_leg: OpportunityLeg) -> list[str]:
     errs: list[str] = []
-    if opp.type not in {"arbitrage", "bid_ask_arbitrage"}:
+    if opp.type != "bid_ask_arbitrage":
         errs.append(f"unsupported_type:{opp.type}")
     if poly_leg.token_id is None or not str(poly_leg.token_id).strip():
         errs.append("polymarket_missing_token_id")
@@ -2454,7 +2453,7 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                     _uw_status = "✅ продано" if _uw_filled else "❌ не продано — ручная проверка!"
                     notify(
-                        f"🟡 <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
+                        f"🟡🟡🟡 <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
                         f"\n"
                         f"<b>{opp.label}</b>\n"
                         f"\n"
@@ -2630,7 +2629,7 @@ def opportunity(opp: Opportunity) -> dict:
                     else f"<b>{_ba_net_pnl:+.2f}$</b>\n"
                 )
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
-                _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b> 🟢🟢🟢" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b> 🟢🟢🟢"
+                _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b> 🟢🟢🟢"
                 _h1_pnl, _h1_n = _pnl_last_hour()
                 _h1_line = f"<i>📊 за час: {_h1_pnl:+.2f}$ ({_h1_n} трейдов)</i>\n"
 
@@ -2681,8 +2680,8 @@ def opportunity(opp: Opportunity) -> dict:
                     f"residual={_ba_residual:.6f}"
                 )
                 notify(
-                    f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b> 🔴🔴🔴\n"
-                    f"\n"
+                    f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b>\n"
+                    f"/n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
                     f"Predict ({pred_leg.side.upper()} BID)\n"
@@ -2694,425 +2693,8 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
 
-        # ════════════════════════════════════════════════════════════════
-        # ASK+ASK: параллельная отправка обеих ног (оригинальная логика)
-        # ════════════════════════════════════════════════════════════════
-        _pred_timing: dict[str, Any] = {}
-        _poly_timing: dict[str, Any] = {}
 
-        def _run_predict_leg() -> dict[str, Any]:
-            _pred_timing["submit_ts"] = time.time()
-            try:
-                res = _place_predict_market_buy(pred_leg, timing=_pred_timing)
-                _pred_timing["ack_ts"] = time.time()
-                return res
-            except Exception:
-                _pred_timing["fail_ts"] = time.time()
-                raise
-            finally:
-                _pred_timing["end"] = time.time()
 
-        def _run_poly_leg() -> dict[str, Any]:
-            _poly_timing["submit_ts"] = time.time()
-            try:
-                res = _place_polymarket_fok_market_buy(poly_leg)
-                _poly_timing["ack_ts"] = time.time()
-                return res
-            except Exception:
-                _poly_timing["fail_ts"] = time.time()
-                raise
-            finally:
-                _poly_timing["end"] = time.time()
-
-        print(
-            f"[TRADER] parallel_exec_start label={opp.label} "
-            f"pred_stake={_fmt_usd(pred_leg.stake_usd)} poly_stake={_fmt_usd(poly_leg.stake_usd)} "
-            f"poly_book_age={_book_freshness.get('poly_book_age_at_submit_ms', 'n/a'):.0f}ms "
-            f"pred_book_age={_book_freshness.get('pred_book_age_at_submit_ms', 'n/a'):.0f}ms"
-        )
-
-        predict_result: dict[str, Any] | None = None
-        polymarket_result: dict[str, Any] | None = None
-        pred_exec_error: Exception | None = None
-        poly_exec_error: Exception | None = None
-
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="leg") as _pool:
-            _pred_future = _pool.submit(_run_predict_leg)
-            _poly_future = _pool.submit(_run_poly_leg)
-
-            try:
-                predict_result = _pred_future.result()
-            except Exception as _e:
-                pred_exec_error = _e
-                _pred_timing.setdefault("end", time.time())
-            try:
-                polymarket_result = _poly_future.result()
-            except Exception as _e:
-                poly_exec_error = _e
-                _poly_timing.setdefault("end", time.time())
-
-        # ── Timing ──────────────────────────────────────────────────────
-        row["timing"]["predict_start"] = _pred_timing.get("submit_ts")
-        row["timing"]["predict_end"] = _pred_timing.get("end")
-        row["timing"]["predict_ack_ts"] = _pred_timing.get("ack_ts")
-        row["timing"]["predict_create_request_ts"] = _pred_timing.get("predict_create_request_ts")
-        row["timing"]["poly_start"] = _poly_timing.get("submit_ts")
-        row["timing"]["poly_end"] = _poly_timing.get("end")
-        row["timing"]["poly_ack_ts"] = _poly_timing.get("ack_ts")
-        row["timing"]["t_end"] = time.time()
-        row["timing"]["total_ms"] = (row["timing"]["t_end"] - t0) * 1000.0
-
-        _ps = _pred_timing.get("submit_ts")
-        _pe = _pred_timing.get("end")
-        _pys = _poly_timing.get("submit_ts")
-        _pye = _poly_timing.get("end")
-        if _ps and _pe:
-            row["timing"]["predict_ms"] = (_pe - _ps) * 1000.0
-        if _pys and _pye:
-            row["timing"]["poly_ms"] = (_pye - _pys) * 1000.0
-        # submit_gap: разница старта двух submit (0 = идеально одновременно)
-        if _ps and _pys:
-            row["timing"]["submit_gap_ms"] = abs(_ps - _pys) * 1000.0
-        # overlap: сколько мс обе ноги работали одновременно
-        if _ps and _pe and _pys and _pye:
-            overlap_start = max(_ps, _pys)
-            overlap_end = min(_pe, _pye)
-            row["timing"]["overlap_ms"] = max(0.0, (overlap_end - overlap_start) * 1000.0)
-
-        # first_ack / second_ack / unhedged_ms
-        _pred_ack = _pred_timing.get("ack_ts")
-        _poly_ack = _poly_timing.get("ack_ts")
-        if _pred_ack and _poly_ack:
-            _first_ack_ts = min(_pred_ack, _poly_ack)
-            _submit_start = min(_ps or _pred_ack, _pys or _poly_ack)
-            row["timing"]["first_ack_ms"] = (_first_ack_ts - _submit_start) * 1000.0
-            row["timing"]["second_ack_ms"] = (max(_pred_ack, _poly_ack) - _submit_start) * 1000.0
-            row["timing"]["unhedged_ms"] = abs(_pred_ack - _poly_ack) * 1000.0
-            row["timing"]["first_fill_venue"] = "predict" if _pred_ack <= _poly_ack else "polymarket"
-        elif _pred_ack:
-            row["timing"]["first_fill_venue"] = "predict"
-            row["timing"]["unhedged_ms"] = ((_pye or time.time()) - _pred_ack) * 1000.0
-        elif _poly_ack:
-            row["timing"]["first_fill_venue"] = "polymarket"
-            row["timing"]["unhedged_ms"] = ((_pe or time.time()) - _poly_ack) * 1000.0
-
-        create_req_ts = row["timing"].get("predict_create_request_ts")
-        if isinstance(create_req_ts, (int, float)):
-            calc_epoch = _dt_to_epoch_s(analyzer_calc_dt)
-            tick_epoch = _dt_to_epoch_s(analyzer_tick_max_dt)
-            if calc_epoch is not None:
-                row["timing"]["analyzer_calc_to_predict_create_ms"] = (create_req_ts - calc_epoch) * 1000.0
-            if tick_epoch is not None:
-                row["timing"]["tick_ts_to_predict_create_ms"] = (create_req_ts - tick_epoch) * 1000.0
-
-        # ── Predict result processing ───────────────────────────────────
-        pred_filled = False
-        pred_hash: str | None = None
-        filled_shares_dbg: float | None = None
-        _pred_filled_qty: float = 0.0
-
-        if predict_result is not None:
-            row["predict"] = predict_result
-            resp_obj = predict_result.get("response") or {}
-            pred_hash = resp_obj.get("orderHash")
-            if not pred_hash:
-                try:
-                    pred_hash = (((resp_obj.get("create") or {}).get("data") or {}) or {}).get("orderHash")
-                except Exception:
-                    pred_hash = None
-
-            filled_shares_dbg = _extract_predict_filled_shares(predict_result, requested_shares=float(pred_leg.shares))
-            _pred_filled_qty = filled_shares_dbg if (filled_shares_dbg is not None and filled_shares_dbg > 1e-9) else 0.0
-            try:
-                last_get = resp_obj.get("get") or {}
-                data = (last_get.get("data") or {}) if isinstance(last_get, dict) else {}
-                status = str(data.get("status") or "")
-                amount_filled_usdt_wei = data.get("amountFilled")
-            except Exception:
-                status = ""
-                amount_filled_usdt_wei = None
-
-            row["summary"]["predict_exec"] = {
-                "order_hash": pred_hash,
-                "status": status,
-                "amountFilled_usdt_wei": amount_filled_usdt_wei,
-                "filled_shares": filled_shares_dbg,
-                "requested_shares": float(pred_leg.shares),
-                "requested_stake_usd": float(pred_leg.stake_usd),
-            }
-
-            pred_filled = _predict_resp_is_filled(resp_obj)
-            # Дополнительная защита: если amountFilled=0 и статус CANCELLED — сброс
-            if pred_filled:
-                try:
-                    _lg = resp_obj.get("get") or {}
-                    _ld = (_lg.get("data") or {}) if isinstance(_lg, dict) else {}
-                    _lst = str(_ld.get("status") or "").upper()
-                    _laf = int(str(_ld.get("amountFilled") or "0"))
-                    if _lst in {"CANCELLED", "EXPIRED", "REJECTED"} and _laf <= 0:
-                        pred_filled = False
-                except Exception:
-                    pass
-            if not pred_filled:
-                _pred_filled_qty = 0.0
-                filled_shares_dbg = None
-            print(
-                "[TRADER] predict_done "
-                f"order_hash={pred_hash} status={status} "
-                f"amountFilled_usdt_wei={amount_filled_usdt_wei} "
-                f"filled_shares={filled_shares_dbg} filled={pred_filled}"
-            )
-            if pred_filled and filled_shares_dbg is not None and filled_shares_dbg > 1e-9 and pred_leg.market_id is not None:
-                _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
-        else:
-            print(f"[TRADER] predict_error err={pred_exec_error}")
-
-        # ── Poly result processing ──────────────────────────────────────
-        poly_filled = False
-        _poly_filled_qty: float = 0.0
-        if polymarket_result is not None:
-            row["polymarket"] = polymarket_result
-            _poly_resp = (polymarket_result.get("response") or {})
-            poly_filled = _poly_resp.get("success") is True
-            try:
-                _poly_filled_qty = float(_poly_resp.get("takingAmount") or 0)
-            except (ValueError, TypeError):
-                _poly_filled_qty = 0.0
-            print(
-                "[TRADER] poly_done "
-                f"success={poly_filled} status={_poly_resp.get('status')} "
-                f"making={_poly_resp.get('makingAmount')} taking={_poly_resp.get('takingAmount')}"
-            )
-        else:
-            print(f"[TRADER] poly_error err={poly_exec_error}")
-
-        row["predict_filled_shares"] = filled_shares_dbg
-
-        # ── Fill analysis: 5 ключевых метрик ────────────────────────────
-        _first_fill_venue = row["timing"].get("first_fill_venue")
-        _first_fill_qty = _pred_filled_qty if _first_fill_venue == "predict" else _poly_filled_qty
-        _residual_qty = abs(_pred_filled_qty - _poly_filled_qty)
-
-        # hedge_drift_bps: насколько реальная цена хедж-ноги отклонилась от trigger
-        _hedge_drift_bps: float | None = None
-        if pred_filled and poly_filled:
-            try:
-                _pr = (polymarket_result.get("response") or {})
-                _poly_mk = float(_pr.get("makingAmount") or 0)
-                _poly_tk = float(_pr.get("takingAmount") or 0)
-                if _poly_tk > 0:
-                    _actual_poly_price = _poly_mk / _poly_tk
-                    _trigger_poly_price = float(poly_leg.ask)
-                    if _trigger_poly_price > 0:
-                        _hedge_drift_bps = ((_actual_poly_price - _trigger_poly_price) / _trigger_poly_price) * 10_000
-            except Exception:
-                pass
-
-        row["fill_analysis"] = {
-            "unhedged_ms": row["timing"].get("unhedged_ms"),
-            "first_fill_venue": _first_fill_venue,
-            "first_fill_qty": round(_first_fill_qty, 6),
-            "hedge_drift_bps": round(_hedge_drift_bps, 2) if _hedge_drift_bps is not None else None,
-            "residual_qty_after_abort": round(_residual_qty, 6),
-            "pred_filled_qty": round(_pred_filled_qty, 6),
-            "poly_filled_qty": round(_poly_filled_qty, 6),
-            "requested_qty": round(float(opp.shares), 6),
-        }
-
-        row["parallel_result"] = {
-            "pred_filled": pred_filled,
-            "poly_filled": poly_filled,
-            "pred_error": str(pred_exec_error) if pred_exec_error else None,
-            "poly_error": str(poly_exec_error) if poly_exec_error else None,
-        }
-
-        # ── Incident helper ─────────────────────────────────────────────
-        def _write_incident(incident_type: str, details: dict[str, Any]) -> None:
-            incident = {
-                "ts": datetime.utcnow().isoformat() + "Z",
-                "type": incident_type,
-                "label": opp.label,
-                "fill_analysis": row.get("fill_analysis"),
-                "book_freshness": row.get("book_freshness"),
-                "timing": {
-                    "total_ms": row["timing"].get("total_ms"),
-                    "unhedged_ms": row["timing"].get("unhedged_ms"),
-                    "submit_gap_ms": row["timing"].get("submit_gap_ms"),
-                    "predict_ms": row["timing"].get("predict_ms"),
-                    "poly_ms": row["timing"].get("poly_ms"),
-                },
-                "trigger_book": {
-                    "poly_ask": float(poly_leg.ask),
-                    "poly_ask_sz": float(poly_leg.ask_sz),
-                    "pred_ask": float(pred_leg.ask),
-                    "pred_ask_sz": float(pred_leg.ask_sz),
-                },
-                **details,
-            }
-            _append_jsonl(incidents_file, incident)
-
-        # ── Outcome routing ─────────────────────────────────────────────
-        if pred_filled and poly_filled:
-            # ✓ Обе ноги исполнены
-            row["ok"] = True
-            row["summary"]["status"] = "ok"
-            row["summary"]["reason_code"] = "ok"
-        elif not pred_filled and not poly_filled:
-            # Обе ноги не исполнены — чисто, ничего не потеряно
-            skip_code = "both_legs_failed"
-            if pred_exec_error and "insufficient_collateral_balance" in str(pred_exec_error):
-                skip_code = "predict_insufficient_collateral_balance"
-            row["skipped"] = True
-            row["skip_reason"] = {"code": skip_code, "pred_error": str(pred_exec_error), "poly_error": str(poly_exec_error)}
-            row["summary"]["status"] = "skipped"
-            row["summary"]["reason_code"] = skip_code
-            row["summary"]["reason"] = row["skip_reason"]
-            print(f"[TRADER]{_t}[SKIP] label={opp.label} reason={skip_code}")
-            _append_jsonl(trades_file, row)
-            return {"status": "skipped", "reason": skip_code}
-        elif pred_filled and not poly_filled:
-            # ⚠ Predict исполнен, Poly нет — незахеджированная predict позиция
-            row["ok"] = False
-            row["summary"]["status"] = "incident"
-            row["summary"]["reason_code"] = "unhedged_predict"
-            row["summary"]["reason"] = {"poly_error": str(poly_exec_error)}
-            row["unhedged"] = {
-                "leg": "predict",
-                "side": pred_leg.side,
-                "market_id": pred_leg.market_id,
-                "filled_shares": _pred_filled_qty,
-                "stake_usd": float(pred_leg.stake_usd),
-                "residual_qty": _residual_qty,
-            }
-            _write_incident("unhedged_predict", {
-                "unhedged_leg": "predict",
-                "unhedged_side": pred_leg.side,
-                "unhedged_market_id": pred_leg.market_id,
-                "unhedged_qty": _pred_filled_qty,
-                "unhedged_stake_usd": float(pred_leg.stake_usd),
-                "poly_error": str(poly_exec_error),
-            })
-            print(
-                f"[TRADER][INCIDENT] UNHEDGED_PREDICT label={opp.label} "
-                f"pred_filled_qty={_pred_filled_qty:.6f} poly_error={poly_exec_error} "
-                f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
-            )
-            notify(
-                f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b> 🔴🔴🔴\n"
-                f"\n"
-                f"<b>{opp.label}</b>\n"
-                f"\n"
-                f"Predict ({pred_leg.side.upper()} ASK)\n"
-                f"stake: ${float(pred_leg.stake_usd):.2f} - shares: {_pred_filled_qty:.2f}\n"
-                f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
-                f"err: {str(poly_exec_error)[:60] if poly_exec_error else 'unknown'}\n"
-                f"\n"
-                f"<b>TYANUCHKA</b>\n"            )
-            _append_jsonl(trades_file, row)
-            return {"status": "incident", "reason": "unhedged_predict", "unhedged": "predict"}
-        else:
-            # ⚠ Poly исполнен, Predict нет — незахеджированная poly позиция
-            _cancel_result: dict[str, Any] | None = None
-            if predict_result is not None:
-                _resp = predict_result.get("response") or {}
-                _oid = _resp.get("orderId")
-                if _oid:
-                    try:
-                        _cancel_result = _predict_remove_orders(session=_predict_client.get()[0], ids=[_oid])
-                        row["predict_cancel"] = _cancel_result
-                        print(f"[TRADER] predict_cancel_attempt order_id={_oid} result={_cancel_result}")
-                    except Exception as _ce:
-                        row["predict_cancel"] = {"error": str(_ce)}
-                        _cancel_result = {"error": str(_ce)}
-                        print(f"[TRADER] predict_cancel_failed order_id={_oid} err={_ce}")
-
-            row["ok"] = False
-            row["summary"]["status"] = "incident"
-            row["summary"]["reason_code"] = "unhedged_poly"
-            row["summary"]["reason"] = {"pred_error": str(pred_exec_error)}
-            row["unhedged"] = {
-                "leg": "polymarket",
-                "side": poly_leg.side,
-                "token_id": poly_leg.token_id,
-                "filled_shares": _poly_filled_qty,
-                "stake_usd": float(poly_leg.stake_usd),
-                "residual_qty": _residual_qty,
-                "predict_cancel": _cancel_result,
-            }
-            _write_incident("unhedged_poly", {
-                "unhedged_leg": "polymarket",
-                "unhedged_side": poly_leg.side,
-                "unhedged_token_id": poly_leg.token_id,
-                "unhedged_qty": _poly_filled_qty,
-                "unhedged_stake_usd": float(poly_leg.stake_usd),
-                "pred_error": str(pred_exec_error),
-                "predict_cancel": _cancel_result,
-            })
-            print(
-                f"[TRADER][INCIDENT] UNHEDGED_POLY label={opp.label} "
-                f"poly_filled_qty={_poly_filled_qty:.6f} pred_error={pred_exec_error} "
-                f"cancel={_cancel_result} unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')}"
-            )
-            _append_jsonl(trades_file, row)
-            return {"status": "incident", "reason": "unhedged_poly", "unhedged": "polymarket"}
-
-        # ── Реальные исполнения для статистики (обе ноги OK) ────────────
-        try:
-            poly_resp_data = (polymarket_result.get("response") or {})
-            poly_making = float(poly_resp_data.get("makingAmount") or 0)
-            poly_taking = float(poly_resp_data.get("takingAmount") or 0)
-            poly_actual_price = (poly_making / poly_taking) if poly_taking > 0 else None
-        except Exception:
-            poly_making = poly_taking = 0.0
-            poly_actual_price = None
-
-        try:
-            pred_req_order = (((predict_result.get("request") or {}).get("data") or {}).get("order") or {})
-            pred_making = int(str(pred_req_order.get("makerAmount") or "0")) / 10**18
-            pred_taking = int(str(pred_req_order.get("takerAmount") or "0")) / 10**18
-            pred_price_per_share = (pred_making / pred_taking) if pred_taking > 0 else None
-        except Exception:
-            pred_making = pred_taking = 0.0
-            pred_price_per_share = None
-
-        total_spent = poly_making + pred_making
-        bundle_sum = (poly_actual_price + pred_price_per_share) if (poly_actual_price and pred_price_per_share) else None
-        min_shares = min(poly_taking, pred_taking) if (poly_taking > 0 and pred_taking > 0) else None
-        actual_profit = (min_shares - total_spent) if (min_shares and total_spent > 0) else None
-
-        row["actual_execution"] = {
-            "poly": {
-                "spent_usd": round(poly_making, 6),
-                "shares_received": round(poly_taking, 6),
-                "price_per_share": round(poly_actual_price, 6) if poly_actual_price else None,
-                "side": poly_leg.side,
-            },
-            "pred": {
-                "spent_usd": round(pred_making, 6),
-                "shares_received": round(pred_taking, 6),
-                "price_per_share": round(pred_price_per_share, 6) if pred_price_per_share else None,
-                "side": pred_leg.side,
-            },
-            "total_spent_usd": round(total_spent, 6),
-            "bundle_sum": round(bundle_sum, 6) if bundle_sum else None,
-            "min_shares": round(min_shares, 6) if min_shares else None,
-            "actual_profit_usd": round(actual_profit, 6) if actual_profit else None,
-            "estimated_profit_usd": round(opp.profit_usd, 6),
-        }
-        row["summary"]["actual_execution"] = row["actual_execution"]
-
-        print(
-            "[TRADER][OK] "
-            f"label={opp.label} shares={opp.shares:.4f} stake={_fmt_usd(opp.stake_usd)} "
-            f"actual_bundle={f'{bundle_sum:.4f}' if bundle_sum else 'n/a'} actual_profit={_fmt_usd(actual_profit)} "
-            f"unhedged_ms={row['timing'].get('unhedged_ms', 'n/a')} "
-            f"submit_gap_ms={row['timing'].get('submit_gap_ms', 'n/a')} "
-            f"hedge_drift_bps={_hedge_drift_bps or 'n/a'} "
-            f"residual_qty={_residual_qty:.6f}"
-        )
-        _append_jsonl(trades_file, row)
-        _append_jsonl(success_trades_file, row)
-        return {"status": "ok"}
     except Exception as e:
         row["error"] = str(e)
         row["summary"]["status"] = "error"
