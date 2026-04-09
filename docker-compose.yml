@@ -16,6 +16,8 @@ services:
       TRADER_TIMEOUT_SEC: ${TRADER_TIMEOUT_SEC:-0.5}
     ports:
       - "8000:8000"
+    volumes:
+      - ./data:/data
 
   trader:
     build:

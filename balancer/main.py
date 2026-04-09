@@ -558,6 +558,98 @@ def _sleep(sec: float) -> None:
     time.sleep(sec)
 
 
+def _fetch_poly_portfolio_usd(safe_address: str, proxy: str | None = None) -> float:
+    """Returns current USD value of all open Polymarket positions (shares * curPrice)."""
+    try:
+        s = requests.Session()
+        if proxy:
+            s.proxies.update({"http": proxy, "https": proxy})
+        r = s.get(
+            f"https://data-api.polymarket.com/positions?user={safe_address}&sizeThreshold=0.01&limit=500",
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data = data.get("positions", data.get("data", [])) or []
+        return sum(float(p.get("size", 0)) * float(p.get("curPrice", 0)) for p in (data or []))
+    except Exception as e:
+        print(f"[BALANCER][WARN] poly_portfolio_fetch_failed err={e}")
+        return 0.0
+
+
+def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str | None = None) -> float:
+    """Returns current USD value of all open Predict.fun positions."""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        from eth_abi import encode as abi_encode
+        from web3 import Web3
+
+        s = requests.Session()
+        if proxy:
+            s.proxies.update({"http": proxy, "https": proxy})
+
+        # ── JWT auth (same as claimer) ──
+        ECDSA_VALIDATOR = "0x845ADb2C711129d4f3966735eD98a9F09fC4cE57"
+        CHAIN_ID = 56
+
+        message = s.get("https://api.predict.fun/v1/auth/message", timeout=8).json()["data"]["message"]
+
+        eip191_prefix = b"\x19Ethereum Signed Message:\n" + str(len(message)).encode() + message.encode()
+        message_hash_bytes: bytes = bytes(Web3.keccak(eip191_prefix))
+        kernel_type_hash: bytes = bytes(Web3.keccak(text="Kernel(bytes32 hash)"))
+        encoded_km = abi_encode(["bytes32", "bytes32"], [kernel_type_hash, message_hash_bytes])
+        kernel_hash: bytes = bytes(Web3.keccak(encoded_km))
+        domain_type_hash: bytes = bytes(Web3.keccak(
+            text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        ))
+        predict_account_cs = Web3.to_checksum_address(predict_account)
+        domain_sep = abi_encode(
+            ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+            [domain_type_hash, bytes(Web3.keccak(text="Kernel")), bytes(Web3.keccak(text="0.3.1")), CHAIN_ID, predict_account_cs],
+        )
+        domain_separator: bytes = bytes(Web3.keccak(domain_sep))
+        digest: bytes = bytes(Web3.keccak(b"\x19\x01" + domain_separator + kernel_hash))
+        acct = Account.from_key(pred_pk)
+        signable = encode_defunct(primitive=digest)
+        signed = acct.sign_message(signable)
+        sig_hex = signed.signature.hex()
+        if not sig_hex.startswith("0x"):
+            sig_hex = "0x" + sig_hex
+        signature = "0x01" + ECDSA_VALIDATOR[2:] + sig_hex[2:]
+
+        resp = s.post(
+            "https://api.predict.fun/v1/auth",
+            json={"signer": predict_account, "message": message, "signature": signature},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        token = resp.json()["data"]["token"]
+        s.headers.update({"Authorization": f"Bearer {token}"})
+
+        # ── Fetch positions ──
+        positions = s.get("https://api.predict.fun/v1/positions?limit=500", timeout=12).json().get("data") or []
+        total = 0.0
+        for pos in positions:
+            market = pos.get("market") or {}
+            outcome = pos.get("outcome") or {}
+            if market.get("status") == "RESOLVED":
+                continue  # claimed separately
+            amount_wei = int(pos.get("amount", 0))
+            shares = amount_wei / 1e18
+            if shares <= 0:
+                continue
+            cur_yes = float(market.get("curYesPrice", 0) or 0)
+            side = (outcome.get("side") or "YES").upper()
+            price = cur_yes if side == "YES" else (1.0 - cur_yes)
+            total += shares * price
+        return total
+    except Exception as e:
+        print(f"[BALANCER][WARN] predict_portfolio_fetch_failed err={e}")
+        return 0.0
+
+
 def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
     """Return (net_pnl, total_count, plus_count, minus_count) for successful trades since since_ts."""
     success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
@@ -889,10 +981,16 @@ def main() -> None:
                     _pending_pred = float(_pb.get("pred_usd", 0))
                 except Exception:
                     pass
-                _pending_total = _pending_poly + _pending_pred
-                _full_poly = poly_display + _pending_poly
-                _full_pred = pred_trigger_bal + _pending_pred
-                _full_total = total_bal + _pending_total
+                # Portfolio value (open positions at current price) — for display only
+                _proxy = os.environ.get("PROXY_URL", "").strip() or None
+                _poly_portfolio = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
+                _pred_portfolio = 0.0
+                if predict_account_addr and pred_pk:
+                    _pred_portfolio = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=_proxy)
+                # Full balances = liquid cash + open positions + pending claims
+                _poly_full = poly_display + _poly_portfolio + _pending_poly
+                _pred_full = pred_trigger_bal + _pred_portfolio + _pending_pred
+                _total_full = _poly_full + _pred_full
                 _since_ts = _last_pnl_checkpoint_ts
                 _h1_pnl, _, _, _ = _hourly_pnl(since_ts=_since_ts)
                 _last_pnl_checkpoint_ts = time.time()
@@ -900,9 +998,22 @@ def main() -> None:
                 _inc_n = sum(_incidents.values())
                 _skip_n = sum(_skips.values())
                 _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
-                _poly_line = f"Polymarket: ${poly_display:.2f}" + (f" (${_full_poly:.2f})" if _pending_poly > 0 else "") + "\n"
-                _pred_line = f"Predict: ${pred_trigger_bal:.2f}" + (f" (${_full_pred:.2f})" if _pending_pred > 0 else "") + "\n"
-                _total_line = f"<b>TOTAL: ${total_bal:.2f}" + (f" (${_full_total:.2f})" if _pending_total > 0 else "") + "</b>\n"
+
+                def _bal_line(name: str, cash: float, portfolio: float, pending: float) -> str:
+                    full = cash + portfolio + pending
+                    parts = []
+                    if portfolio > 0.01:
+                        parts.append(f"${cash:.2f} cash")
+                    if portfolio > 0.01:
+                        parts.append(f"${portfolio:.2f} pos")
+                    if pending > 0.01:
+                        parts.append(f"${pending:.2f} claim")
+                    detail = f" ({', '.join(parts)})" if parts else ""
+                    return f"{name}: <b>${full:.2f}</b>{detail}\n"
+
+                _poly_line = _bal_line("Polymarket", poly_display, _poly_portfolio, _pending_poly)
+                _pred_line = _bal_line("Predict", pred_trigger_bal, _pred_portfolio, _pending_pred)
+                _total_line = f"<b>TOTAL: ${_total_full:.2f}</b>\n"
                 _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
                 if _incidents:
                     _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
