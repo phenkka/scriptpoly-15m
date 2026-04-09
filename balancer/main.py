@@ -589,12 +589,20 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
         s = requests.Session()
         if proxy:
             s.proxies.update({"http": proxy, "https": proxy})
+        _api_key = os.environ.get("PREDICT_API_KEY", "").strip()
+        if _api_key:
+            s.headers.update({"x-api-key": _api_key})
 
         # ── JWT auth (same as claimer) ──
         ECDSA_VALIDATOR = "0x845ADb2C711129d4f3966735eD98a9F09fC4cE57"
         CHAIN_ID = 56
 
-        message = s.get("https://api.predict.fun/v1/auth/message", timeout=8).json()["data"]["message"]
+        _msg_resp = s.get("https://api.predict.fun/v1/auth/message", timeout=8)
+        _msg_json = _msg_resp.json()
+        if "data" not in _msg_json:
+            print(f"[BALANCER][WARN] predict_auth_message_unexpected status={_msg_resp.status_code} body={str(_msg_json)[:300]}")
+            return 0.0
+        message = _msg_json["data"]["message"]
 
         eip191_prefix = b"\x19Ethereum Signed Message:\n" + str(len(message)).encode() + message.encode()
         message_hash_bytes: bytes = bytes(Web3.keccak(eip191_prefix))
@@ -625,7 +633,11 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
             timeout=8,
         )
         resp.raise_for_status()
-        token = resp.json()["data"]["token"]
+        _auth_json = resp.json()
+        if "data" not in _auth_json:
+            print(f"[BALANCER][WARN] predict_auth_unexpected status={resp.status_code} body={str(_auth_json)[:300]}")
+            return 0.0
+        token = _auth_json["data"]["token"]
         s.headers.update({"Authorization": f"Bearer {token}"})
 
         # ── Fetch positions ──
@@ -704,6 +716,7 @@ def _hourly_trade_details(since_ts: float) -> tuple[int, dict[str, int], dict[st
         if not line:
             continue
         try:
+            from datetime import datetime
             row = json.loads(line)
             ts_str = row.get("ts", "")
             if not ts_str:
@@ -969,78 +982,77 @@ def main() -> None:
                 if _halt_file.exists():
                     _halt_file.unlink(missing_ok=True)
 
-            # Hourly balance notify at :02
+            # Hourly balance notify at :04
             _tm = time.localtime()
-            if _tm.tm_min == 2 and _tm.tm_hour != _last_balance_notify_hour:
+            if _tm.tm_min == 4 and _tm.tm_hour != _last_balance_notify_hour:
                 _last_balance_notify_hour = _tm.tm_hour
-                _pending_poly = 0.0
-                _pending_pred = 0.0
                 try:
-                    _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
-                    _pending_poly = float(_pb.get("poly_usd", 0))
-                    _pending_pred = float(_pb.get("pred_usd", 0))
-                except Exception:
-                    pass
-                # Portfolio value (open positions at current price) — for display only
-                _proxy = os.environ.get("PROXY_URL", "").strip() or None
-                _poly_portfolio = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
-                _pred_portfolio = 0.0
-                if predict_account_addr and pred_pk:
-                    _pred_portfolio = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=_proxy)
-                # Full balances = liquid cash + open positions + pending claims
-                _poly_full = poly_display + _poly_portfolio + _pending_poly
-                _pred_full = pred_trigger_bal + _pred_portfolio + _pending_pred
-                _total_full = _poly_full + _pred_full
-                _since_ts = _last_pnl_checkpoint_ts
-                _h1_pnl, _, _, _ = _hourly_pnl(since_ts=_since_ts)
-                _last_pnl_checkpoint_ts = time.time()
-                _ok_n, _incidents, _skips = _hourly_trade_details(since_ts=_since_ts)
-                _inc_n = sum(_incidents.values())
-                _skip_n = sum(_skips.values())
-                _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
+                    _pending_poly = 0.0
+                    _pending_pred = 0.0
+                    try:
+                        _pb = json.loads(Path("/data/pending_bal.json").read_text(encoding="utf-8"))
+                        _pending_poly = float(_pb.get("poly_usd", 0))
+                        _pending_pred = float(_pb.get("pred_usd", 0))
+                    except Exception:
+                        pass
+                    # Portfolio value (open positions at current price) — for display only
+                    _proxy = os.environ.get("PROXY_URL", "").strip() or None
+                    _poly_portfolio = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
+                    _pred_portfolio = 0.0
+                    if predict_account_addr and pred_pk:
+                        _pred_portfolio = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=_proxy)
+                    # cash — liquid only; with_pos — cash + open positions (no claim)
+                    _poly_with_pos = poly_display + _poly_portfolio
+                    _pred_with_pos = pred_trigger_bal + _pred_portfolio
+                    _total_cash = poly_display + pred_trigger_bal
+                    _total_with_pos = _poly_with_pos + _pred_with_pos
+                    _since_ts = time.time() - 3600
+                    _h1_pnl, _, _, _ = _hourly_pnl(since_ts=_since_ts)
+                    _ok_n, _incidents, _skips = _hourly_trade_details(since_ts=_since_ts)
+                    _inc_n = sum(_incidents.values())
+                    _skip_n = sum(_skips.values())
+                    _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
 
-                def _bal_line(name: str, cash: float, portfolio: float, pending: float) -> str:
-                    full = cash + portfolio + pending
-                    parts = []
-                    if portfolio > 0.01:
-                        parts.append(f"${cash:.2f} cash")
-                    if portfolio > 0.01:
-                        parts.append(f"${portfolio:.2f} pos")
-                    if pending > 0.01:
-                        parts.append(f"${pending:.2f} claim")
-                    detail = f" ({', '.join(parts)})" if parts else ""
-                    return f"{name}: <b>${full:.2f}</b>{detail}\n"
+                    def _bal_line(name: str, cash: float, with_pos: float) -> str:
+                        if with_pos > cash + 0.01:
+                            return f"{name}: <b>${cash:.2f}</b> (${with_pos:.2f})\n"
+                        return f"{name}: <b>${cash:.2f}</b>\n"
 
-                _poly_line = _bal_line("Polymarket", poly_display, _poly_portfolio, _pending_poly)
-                _pred_line = _bal_line("Predict", pred_trigger_bal, _pred_portfolio, _pending_pred)
-                _total_line = f"<b>TOTAL: ${_total_full:.2f}</b>\n"
-                _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
-                if _incidents:
-                    _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
-                    for _code, _cnt in sorted(_incidents.items(), key=lambda x: -x[1]):
-                        _tlines.append(f"  • {_code}: {_cnt}")
-                else:
-                    _tlines.append("🔴 Incidents: <b>0</b>")
-                if _skips:
-                    _tlines.append(f"⏭ Skipped: <b>{_skip_n}</b>")
-                    for _code, _cnt in sorted(_skips.items(), key=lambda x: -x[1]):
-                        _tlines.append(f"  • {_code}: {_cnt}")
-                else:
-                    _tlines.append("⏭ Skipped: <b>0</b>")
-                _halt_line = "🛑 <b>Трейдер остановлен (низкий баланс)</b>\n" if _halt_file.exists() else ""
-                _notify(
-                    f"📊 <b>HOURLY STATS</b>\n"
-                    f"\n"
-                    f"<b>BALANCE</b>\n"
-                    + _poly_line
-                    + _pred_line
-                    + _total_line
-                    + f"\n"
-                    + f"{_pnl_emoji} PnL per hour: <b>{_h1_pnl:+.2f}$</b>\n"
-                    + f"\n"
-                    + "\n".join(_tlines) + "\n"
-                    + (_halt_line)
-                )
+                    _poly_line = _bal_line("Polymarket", poly_display, _poly_with_pos)
+                    _pred_line = _bal_line("Predict", pred_trigger_bal, _pred_with_pos)
+                    if _total_with_pos > _total_cash + 0.01:
+                        _total_line = f"<b>TOTAL: ${_total_cash:.2f}</b> (${_total_with_pos:.2f})\n"
+                    else:
+                        _total_line = f"<b>TOTAL: ${_total_cash:.2f}</b>\n"
+                    _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
+                    if _incidents:
+                        _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
+                        for _code, _cnt in sorted(_incidents.items(), key=lambda x: -x[1]):
+                            _tlines.append(f"  • {_code}: {_cnt}")
+                    else:
+                        _tlines.append("🔴 Incidents: <b>0</b>")
+                    if _skips:
+                        _tlines.append(f"⏭ Skipped: <b>{_skip_n}</b>")
+                        for _code, _cnt in sorted(_skips.items(), key=lambda x: -x[1]):
+                            _tlines.append(f"  - {_code}: {_cnt}")
+                    else:
+                        _tlines.append("⏭ Skipped: <b>0</b>")
+                    _halt_line = "🛑 <b>Трейдер остановлен (низкий баланс)</b>\n" if _halt_file.exists() else ""
+                    _notify(
+                        f"📊 <b>HOURLY STATS</b>\n"
+                        f"\n"
+                        f"<b>BALANCE</b>\n"
+                        + _poly_line
+                        + _pred_line
+                        + _total_line
+                        + f"\n"
+                        + f"{_pnl_emoji} PnL per hour: <b>{_h1_pnl:+.2f}$</b>\n"
+                        + f"\n"
+                        + "\n".join(_tlines) + "\n"
+                        + (_halt_line)
+                    )
+                except Exception as _notify_err:
+                    print(f"[BALANCER][WARN] hourly_notify_failed err={_notify_err}")
 
             if (now - last_action_ts) < cooldown_sec:
                 _sleep(interval_sec)

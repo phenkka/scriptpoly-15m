@@ -180,19 +180,6 @@ def _settings_keyboard(page: int) -> InlineKeyboardMarkup:
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
-
-@router.message(Command("start", "help"))
-async def cmd_help(message: Message) -> None:
-    if message.chat.id != _allowed_chat_id:
-        return
-    await message.answer(
-        "🤖 <b>scriptpoly bot</b>\n\n"
-        "/help     — this message\n"
-        "/settings — bot parameters",
-        parse_mode="HTML",
-    )
-
-
 @router.message(Command("settings"))
 async def cmd_settings(message: Message) -> None:
     if message.chat.id != _allowed_chat_id:

@@ -2629,9 +2629,8 @@ def opportunity(opp: Opportunity) -> dict:
                     else f"<b>{_ba_net_pnl:+.2f}$</b>\n"
                 )
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
-                _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b> 🟢🟢🟢"
+                _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
                 _h1_pnl, _h1_n = _pnl_last_hour()
-                _h1_line = f"<i>📊 за час: {_h1_pnl:+.2f}$ ({_h1_n} трейдов)</i>\n"
 
                 _msg_id = notify(
                     f"{_title}\n"
@@ -2646,8 +2645,7 @@ def opportunity(opp: Opportunity) -> dict:
                     + _pnl_line
                     + _cum_line
                     + f"\n"
-                    f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>\n"
-                    + _h1_line,
+                    f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>\n",
                     reply_to_message_id=_reply_to_id,
                 )
                 # Store state: use original msg_id for the whole group so all replies chain to first
