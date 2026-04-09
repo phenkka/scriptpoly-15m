@@ -1470,6 +1470,7 @@ def _place_predict_limit_sell(
     sell_qty: float,
     sell_price: float,
     fill_timeout_sec: float = 30.0,
+    replace_interval_sec: float = 10.0,
     trace_id: int | None = None,
 ) -> dict[str, Any]:
     """Place a LIMIT SELL on Predict to unwind a partial position.
@@ -1558,31 +1559,111 @@ def _place_predict_limit_sell(
         f"qty={sell_qty:.4f} price={sell_price:.4f}"
     )
 
-    # Poll for fill
+    # Poll for fill with periodic cancel+re-place one tick lower
     filled = False
     filled_wei = 0
     last_get: dict[str, Any] | None = None
     t_deadline = time.time() + fill_timeout_sec
-    while time.time() < t_deadline and order_hash:
-        try:
-            last_get = _predict_get_order_by_hash(session, order_hash)
-            _data = last_get.get("data") if isinstance(last_get, dict) else None
-            if isinstance(_data, dict):
-                try:
-                    filled_wei = max(0, int(str(_data.get("amountFilled") or "0")))
-                except Exception:
-                    pass
-            if _predict_resp_is_filled(last_get):
-                filled = True
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
+    current_price = sell_price
+    _active_order_id = order_id
+    _active_order_hash = order_hash
 
-    # Cancel remainder
-    if order_id:
+    while _active_order_hash and time.time() < t_deadline:
+        t_replace = time.time() + replace_interval_sec
+        # Poll until filled or replace-interval elapsed
+        while time.time() < min(t_replace, t_deadline):
+            try:
+                last_get = _predict_get_order_by_hash(session, _active_order_hash)
+                _data = last_get.get("data") if isinstance(last_get, dict) else None
+                if isinstance(_data, dict):
+                    try:
+                        filled_wei = max(0, int(str(_data.get("amountFilled") or "0")))
+                    except Exception:
+                        pass
+                if _predict_resp_is_filled(last_get):
+                    filled = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if filled:
+            break
+        if time.time() >= t_deadline:
+            break
+
+        # Cancel current order and re-place one tick lower
+        if _active_order_id:
+            try:
+                _predict_remove_orders(session, [_active_order_id])
+            except Exception:
+                pass
+        current_price = max(_tick, round(current_price - _tick, 6))
+        print(
+            f"[TRADER]{_trace} predict_limit_sell replace → new_price={current_price:.4f} "
+            f"remaining_sec={(t_deadline - time.time()):.1f}"
+        )
         try:
-            _predict_remove_orders(session, [order_id])
+            _rep_price_wei = _wei_from_float(current_price)
+            _rep_amounts = builder.get_limit_order_amounts(
+                LimitHelperInput(side=Side.SELL, price_per_share_wei=_rep_price_wei, quantity_wei=quantity_wei)
+            )
+            _rep_order = builder.build_order(
+                "LIMIT",
+                BuildOrderInput(
+                    side=Side.SELL,
+                    token_id=str(token_id),
+                    maker_amount=str(_rep_amounts.maker_amount),
+                    taker_amount=str(_rep_amounts.taker_amount),
+                    fee_rate_bps=fee_rate_bps,
+                ),
+            )
+            _rep_typed = builder.build_typed_data(_rep_order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
+            _rep_signed = builder.sign_typed_data_order(_rep_typed)
+            _rep_dump = _dump_obj(_rep_signed)
+            if not isinstance(_rep_dump, dict):
+                break
+            _rep_obj = _rep_dump.get("order") if isinstance(_rep_dump.get("order"), dict) else None
+            _rep_sig = _rep_dump.get("signature")
+            if not _rep_obj or not _rep_sig:
+                _rep_obj = {k: v for k, v in _rep_dump.items() if k != "signature"}
+                _rep_sig = _rep_dump.get("signature")
+            if not str(_rep_sig).startswith("0x"):
+                _rep_sig = "0x" + str(_rep_sig)
+            if "signature" not in _rep_obj:
+                _rep_obj["signature"] = _rep_sig
+            _rep_api = _predict_order_to_api(_rep_obj)
+            _rep_payload = {
+                "data": {
+                    "pricePerShare": str(_rep_amounts.price_per_share),
+                    "strategy": "LIMIT",
+                    "slippageBps": "0",
+                    "order": _rep_api,
+                }
+            }
+            _rep_r = session.post(
+                "https://api.predict.fun/v1/orders",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(_rep_payload),
+                timeout=float(CFG.timeout_sec),
+            )
+            if _rep_r.ok:
+                _rep_out = _rep_r.json()
+                _rep_create = _rep_out.get("data") if isinstance(_rep_out.get("data"), dict) else {}
+                _active_order_id = str(_rep_create.get("orderId") or "").strip() or None
+                _active_order_hash = str(_rep_create.get("orderHash") or "").strip() or None
+                print(f"[TRADER]{_trace} predict_limit_sell re-placed hash={_active_order_hash} price={current_price:.4f}")
+            else:
+                print(f"[TRADER]{_trace} predict_limit_sell re-place http_{_rep_r.status_code} — stop")
+                break
+        except Exception as _rep_e:
+            print(f"[TRADER]{_trace} predict_limit_sell re-place err={_rep_e} — stop")
+            break
+
+    # Cancel remainder if still open
+    if _active_order_id:
+        try:
+            _predict_remove_orders(session, [_active_order_id])
         except Exception:
             pass
 
@@ -1590,8 +1671,8 @@ def _place_predict_limit_sell(
     return {
         "filled": filled,
         "filled_qty": filled_qty,
-        "sell_price": sell_price,
-        "order_hash": order_hash,
+        "sell_price": current_price,
+        "order_hash": _active_order_hash or order_hash,
         "get": last_get,
     }
 
@@ -2657,7 +2738,26 @@ def opportunity(opp: Opportunity) -> dict:
                     _ba_fill_state[_tkey] = (_stored_id, _cum_pnl, _fill_n, time.time())
                 return {"status": "ok"}
             else:
-                # Predict filled, poly failed → unhedged predict incident
+                # Predict filled, poly failed → try to unwind on Predict before declaring incident
+                _unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                _unwind_sell_price = max(_unwind_tick, _ba_actual_pred_bid - _unwind_tick)
+                _uw2_result: dict[str, Any] = {}
+                _uw2_err: str | None = None
+                try:
+                    _uw2_result = _place_predict_limit_sell(
+                        pred_leg,
+                        sell_qty=_ba_hedge_qty,
+                        sell_price=_unwind_sell_price,
+                        fill_timeout_sec=30.0,
+                        trace_id=trace_id,
+                    )
+                except Exception as _uw2_e:
+                    _uw2_err = str(_uw2_e)
+                    print(f"[TRADER][UNWIND_ERROR] unhedged_predict unwind err={_uw2_e}")
+
+                _uw2_filled = _uw2_result.get("filled", False)
+                _uw2_qty = _uw2_result.get("filled_qty", 0.0)
+
                 _ba_inc2 = {
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "bid_ask_unhedged_predict",
@@ -2669,6 +2769,8 @@ def opportunity(opp: Opportunity) -> dict:
                     "unhedged_qty": float(_ba_hedge_qty),
                     "unhedged_stake_usd": float(pred_leg.stake_usd),
                     "poly_error": str(poly_exec_error_ba) if poly_exec_error_ba else None,
+                    "unwind": _uw2_result,
+                    "unwind_error": _uw2_err,
                     "quote_meta": _ba_quote_meta,
                 }
                 _append_jsonl(incidents_file, _ba_inc2)
@@ -2678,8 +2780,9 @@ def opportunity(opp: Opportunity) -> dict:
                 print(
                     f"[TRADER][INCIDENT] BID_ASK_UNHEDGED_PREDICT label={opp.label} "
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
-                    f"residual={_ba_residual:.6f}"
+                    f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f}"
                 )
+                _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}" if _uw2_filled else f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:60]) if _uw2_err else ''}"
                 notify(
                     f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b> 🔴🔴🔴\n"
                     f"\n"
@@ -2690,7 +2793,8 @@ def opportunity(opp: Opportunity) -> dict:
                     f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
                     f"price: {_live_vwap_ba:.2f} (est.) - err: {str(poly_exec_error_ba)[:50] if poly_exec_error_ba else 'unknown'}\n"
                     f"\n"
-                    f"<b>{_ba_hedge_qty * (_live_vwap_ba - (1.0 - _ba_actual_pred_bid)):+.2f}$ - TYANUCHKA</b>\n"                )
+                    f"Unwind на Predict: {_uw2_status}\n"
+                )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
 
