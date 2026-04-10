@@ -196,6 +196,63 @@ async def cmd_settings(message: Message) -> None:
     )
 
 
+@router.message(Command("balance"))
+async def cmd_balance(message: Message) -> None:
+    if message.chat.id != _allowed_chat_id:
+        return
+    url = os.environ.get("BALANCER_STATUS_URL", "http://balancer:8081/status")
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=6) as resp:
+                data = await resp.json()
+    except Exception as e:
+        await message.answer(f"❌ Failed to fetch balance: {e}")
+        return
+
+    poly_cash = data.get("poly_cash")
+    poly_portfolio = data.get("poly_portfolio")
+    poly_total = data.get("poly_total")
+    bsc_cash = data.get("bsc_cash")
+    predict_account_cash = data.get("predict_account_cash")
+    predict_portfolio = data.get("predict_portfolio")
+    pred_trigger_bal = data.get("pred_trigger_bal")
+    total_cash = data.get("total_cash")
+    total_with_pos = data.get("total_with_pos")
+
+    def _fmt(v):
+        try:
+            return f"${float(v):.2f}"
+        except Exception:
+            return "unknown"
+
+    # Polymarket: show Portfolio (positions) and Funds (liquid)
+    poly_portfolio_str = _fmt(poly_portfolio) if poly_portfolio is not None else "unknown"
+    poly_funds_str = _fmt(poly_cash) if poly_cash is not None else "unknown"
+    poly_total_str = _fmt(poly_total) if poly_total is not None else "unknown"
+
+    pred_portfolio_str = _fmt(predict_portfolio) if predict_portfolio is not None else "unknown"
+    pred_funds_str = _fmt(pred_trigger_bal) if pred_trigger_bal is not None else "unknown"
+    pred_total_str = _fmt((predict_portfolio or 0.0) + (pred_trigger_bal or 0.0)) if (predict_portfolio is not None or pred_trigger_bal is not None) else "unknown"
+
+    overall_total_str = _fmt(total_with_pos) if total_with_pos is not None else (_fmt(total_cash) if total_cash is not None else "unknown")
+
+    text = (
+        "<b>📊 CURRENT BALANCE</b>\n\n"
+        "<b>Polymarket</b>\n"
+        f"Portfolio: <b>{poly_portfolio_str}</b>\n"
+        f"Funds: <b>{poly_funds_str}</b>\n"
+        f"Subtotal: <b>{poly_total_str}</b>\n\n"
+        "<b>Predict</b>\n"
+        f"Portfolio: <b>{pred_portfolio_str}</b>\n"
+        f"Funds: <b>{pred_funds_str}</b>\n"
+        f"Subtotal: <b>{pred_total_str}</b>\n\n"
+        f"<b>TOTAL (incl. positions): {overall_total_str}</b>\n"
+    )
+
+    await message.answer(text, parse_mode="HTML")
+
+
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
     if message.chat.id != _allowed_chat_id:

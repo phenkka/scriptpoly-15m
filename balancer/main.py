@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -644,15 +646,30 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
         positions = s.get("https://api.predict.fun/v1/positions?limit=500", timeout=12).json().get("data") or []
         total = 0.0
         for pos in positions:
+            # Prefer explicit USD valuation fields if present
+            try:
+                val = pos.get("valueUsd") or pos.get("currentValue") or pos.get("value")
+                if val is not None:
+                    total += float(val)
+                    continue
+            except Exception:
+                pass
+
             market = pos.get("market") or {}
             outcome = pos.get("outcome") or {}
             if market.get("status") == "RESOLVED":
                 continue  # claimed separately
-            amount_wei = int(pos.get("amount", 0))
+            try:
+                amount_wei = int(pos.get("amount", 0))
+            except Exception:
+                amount_wei = 0
             shares = amount_wei / 1e18
             if shares <= 0:
                 continue
-            cur_yes = float(market.get("curYesPrice", 0) or 0)
+            try:
+                cur_yes = float(market.get("curYesPrice", 0) or 0)
+            except Exception:
+                cur_yes = 0.0
             side = (outcome.get("side") or "YES").upper()
             price = cur_yes if side == "YES" else (1.0 - cur_yes)
             total += shares * price
@@ -852,6 +869,42 @@ def main() -> None:
     last_action_ts: float = 0.0
     _last_balance_notify_hour: int = -1
     _last_pnl_checkpoint_ts: float = time.time() - 3600  # tracks start of current PnL window
+    # Shared status published via simple HTTP server for bots/monitoring
+    BALANCER_STATUS: dict = {}
+    BALANCER_STATUS_LOCK = threading.Lock()
+
+    class _StatusHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/status":
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                with BALANCER_STATUS_LOCK:
+                    body = json.dumps(BALANCER_STATUS).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+
+    def _start_status_server(port: int) -> None:
+        try:
+            server = HTTPServer(("0.0.0.0", port), _StatusHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            print(f"[BALANCER] status_server_started port={port}")
+        except Exception as e:
+            print(f"[BALANCER][WARN] failed_start_status_server err={e}")
+
+    try:
+        status_port = int(os.environ.get("BALANCER_STATUS_PORT", "8081"))
+    except Exception:
+        status_port = 8081
+    _start_status_server(status_port)
 
     while True:
         now = time.time()
@@ -964,6 +1017,39 @@ def main() -> None:
                 f"imbalance={imbalance:+.2f}$ threshold=±{threshold_usd:.2f}$ "
                 + (f"→ will equalize to {equal_each:.2f}$ each" if abs(imbalance) > threshold_usd else "→ balanced")
             )
+
+            # Publish status for external callers (bot, monitoring)
+            try:
+                _poly_portfolio = 0.0
+                _pred_portfolio = 0.0
+                try:
+                    _poly_portfolio = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=proxy_url)
+                except Exception:
+                    _poly_portfolio = 0.0
+                try:
+                    if predict_account_addr and pred_pk:
+                        _pred_portfolio = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=proxy_url)
+                except Exception:
+                    _pred_portfolio = 0.0
+                with BALANCER_STATUS_LOCK:
+                    BALANCER_STATUS.update({
+                        "poly_cash": round(poly_display, 6),
+                        "poly_portfolio": round(_poly_portfolio, 6),
+                        "poly_total": round(poly_display + _poly_portfolio, 6),
+                        "poly_wallet": polygon.wallet_address,
+                        "poly_funder": poly_funder or "",
+                        "bsc_cash": round(bsc_bal, 6),
+                        "predict_account_cash": round(predict_acct_bal or 0.0, 6),
+                        "predict_portfolio": round(_pred_portfolio, 6),
+                        "pred_trigger_bal": round(pred_trigger_bal, 6),
+                        "total_cash": round(total_bal, 6),
+                        "total_with_pos": round(poly_display + _poly_portfolio + pred_trigger_bal + _pred_portfolio, 6),
+                        "imbalance": round(imbalance, 6),
+                        "predict_account": predict_account_addr or "",
+                        "last_update_ts": time.time(),
+                    })
+            except Exception:
+                pass
 
             # ── Low balance halt ────────────────────────────────────────────
             _stop_threshold = float(os.environ.get("BOT_STOP_TOTAL_USD", "25") or "25")
@@ -1124,15 +1210,30 @@ def main() -> None:
                         f"poly → predict  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
+                try:
+                    _proxy = proxy_url or None
+                    _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
+                except Exception:
+                    _poly_portfolio_now = 0.0
+                try:
+                    _pred_portfolio_now = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=_proxy) if predict_account_addr and pred_pk else 0.0
+                except Exception:
+                    _pred_portfolio_now = 0.0
+
+                _poly_sub = poly_display + (_poly_portfolio_now or 0.0)
+                _pred_sub = pred_trigger_bal + (_pred_portfolio_now or 0.0)
+                _total_with_pos_now = _poly_sub + _pred_sub
+
                 _notify(
                     f"🔄 <b>TRANSFER: POLY → PREDICT</b>\n"
                     f"\n"
                     f"${amt:.2f} bridged - status: {st}\n"
                     f"\n"
-                    f"Polymarket:   ${poly_display:.2f}\n"
-                    f"Predict:  ${pred_trigger_bal:.2f}\n"
+                    f"Polymarket: Portfolio: ${_poly_portfolio_now:.2f} — Funds: ${poly_display:.2f} — Subtotal: ${_poly_sub:.2f}\n"
+                    f"Predict:    Portfolio: ${_pred_portfolio_now:.2f} — Funds: ${pred_trigger_bal:.2f} — Subtotal: ${_pred_sub:.2f}\n"
                     f"\n"
-                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
+                    f"<b>TOTAL (incl. positions): ${_total_with_pos_now:.2f}</b>\n"
+                )
 
                 # Forward USDT from EOA funder to PREDICT_ACCOUNT so it is available for trading
                 # Ждём дольше — мост может задержать зачисление на BSC на несколько секунд
@@ -1244,15 +1345,30 @@ def main() -> None:
                         f"predict → poly  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
+                try:
+                    _proxy = proxy_url or None
+                    _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
+                except Exception:
+                    _poly_portfolio_now = 0.0
+                try:
+                    _pred_portfolio_now = _fetch_predict_portfolio_usd(predict_account_addr, pred_pk, proxy=_proxy) if predict_account_addr and pred_pk else 0.0
+                except Exception:
+                    _pred_portfolio_now = 0.0
+
+                _poly_sub = poly_display + (_poly_portfolio_now or 0.0)
+                _pred_sub = pred_trigger_bal + (_pred_portfolio_now or 0.0)
+                _total_with_pos_now = _poly_sub + _pred_sub
+
                 _notify(
                     f"🔄 <b>TRANSFER: PREDICT → POLY</b>\n"
                     f"\n"
                     f"${amt:.2f} bridged - status: {st}\n"
                     f"\n"
-                    f"Polymarket:   ${poly_display:.2f}\n"
-                    f"Predict:  ${pred_trigger_bal:.2f}\n"
+                    f"Polymarket: Portfolio: ${_poly_portfolio_now:.2f} — Funds: ${poly_display:.2f} — Subtotal: ${_poly_sub:.2f}\n"
+                    f"Predict:    Portfolio: ${_pred_portfolio_now:.2f} — Funds: ${pred_trigger_bal:.2f} — Subtotal: ${_pred_sub:.2f}\n"
                     f"\n"
-                    f"<b>TOTAL: ${total_bal:.2f}</b>\n"                )
+                    f"<b>TOTAL (incl. positions): ${_total_with_pos_now:.2f}</b>\n"
+                )
 
                 last_action_ts = time.time()
 
