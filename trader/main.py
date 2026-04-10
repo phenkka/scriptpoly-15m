@@ -200,6 +200,51 @@ def _startup_warmup() -> None:
             print(f"[TRADER] predict_client warmup failed (non-fatal): {e}")
     threading.Thread(target=_warmup, daemon=True).start()
 
+    # VPN watchdog: проверяем доступность прокси каждые 60 секунд.
+    # Если прокси недоступен — создаём /data/halt_vpn и уведомляем.
+    # Как только восстановился — удаляем файл и уведомляем.
+    _vpn_check_url = os.environ.get("VPN_CHECK_URL", "https://clob.polymarket.com/health").strip()
+    _vpn_check_interval = float(os.environ.get("VPN_CHECK_INTERVAL_SEC", "60") or "60")
+    _halt_vpn_path = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent / "halt_vpn"
+
+    def _vpn_watchdog() -> None:
+        _was_down = False
+        while True:
+            time.sleep(_vpn_check_interval)
+            if not _proxy_url:
+                continue  # прокси не настроен — проверять нечего
+            _ok = False
+            try:
+                _r = httpx.get(
+                    _vpn_check_url,
+                    proxy=_proxy_url,
+                    timeout=httpx.Timeout(connect=5.0, read=8.0),
+                )
+                _ok = _r.status_code < 500
+            except Exception as _ve:
+                print(f"[TRADER][VPN_WATCHDOG] check_failed err={_ve}")
+            if not _ok and not _was_down:
+                _was_down = True
+                _halt_vpn_path.write_text("vpn_down")
+                print("[TRADER][VPN_WATCHDOG] VPN DOWN — halt_vpn created")
+                notify(
+                    "🔴 <b>VPN УПАЛ — БОТ ОСТАНОВЛЕН</b>\n"
+                    "\n"
+                    f"Прокси недоступен: <code>{_proxy_url}</code>\n"
+                    f"Проверка каждые {_vpn_check_interval:.0f}s\n"
+                )
+            elif _ok and _was_down:
+                _was_down = False
+                _halt_vpn_path.unlink(missing_ok=True)
+                print("[TRADER][VPN_WATCHDOG] VPN RESTORED — halt_vpn removed")
+                notify(
+                    "🟢 <b>VPN ВОССТАНОВЛЕН — БОТ ВОЗОБНОВИЛ РАБОТУ</b>\n"
+                    "\n"
+                    f"Прокси снова доступен: <code>{_proxy_url}</code>\n"
+                )
+
+    threading.Thread(target=_vpn_watchdog, daemon=True, name="vpn_watchdog").start()
+
 
 # In-memory cooldown to prevent repeated buys during testing.
 _predict_market_last_buy_ts: dict[int, float] = {}
@@ -1940,11 +1985,17 @@ def test_predict(opp: Opportunity) -> dict:
 
 @app.post("/opportunity")
 def opportunity(opp: Opportunity) -> dict:
+    _data_dir = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent
     # Check halt flag written by balancer when total balance < BOT_STOP_TOTAL_USD
-    _halt_path = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent / "halt"
+    _halt_path = _data_dir / "halt"
     if _halt_path.exists():
         print(f"[TRADER] HALTED — halt file exists at {_halt_path}, skipping opportunity")
         return {"status": "halted", "reason": "low_balance"}
+    # Check halt flag written by VPN watchdog
+    _halt_vpn_path = _data_dir / "halt_vpn"
+    if _halt_vpn_path.exists():
+        print(f"[TRADER] HALTED — VPN down, halt_vpn exists at {_halt_vpn_path}, skipping opportunity")
+        return {"status": "halted", "reason": "vpn_down"}
 
     opp = _cap_opportunity(opp)
 
