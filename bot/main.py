@@ -405,21 +405,36 @@ async def handle_any_message(message: Message) -> None:
 async def handle_notify(request: web.Request) -> web.Response:
     """POST /notify  body: {"text": "..."}  — отправляет сообщение в чат."""
     bot: Bot = request.app["bot"]
-    chat_id: str = request.app["chat_id"]
+    # store chat_id as string in app; convert to int for send_message
     try:
-        body = await request.json()
+        chat_id = int(request.app["chat_id"])
+    except Exception:
+        chat_id = request.app.get("chat_id")
+
+    try:
+        # Accept JSON, form-encoded, or raw text bodies for compatibility
+        try:
+            body = await request.json()
+        except Exception:
+            raw = (await request.text()).strip()
+            body = {"text": raw} if raw else {}
+
         text = str(body.get("text", "")).strip()
         if not text:
             return web.json_response({"ok": False, "error": "empty text"}, status=400)
-        reply_to = body.get("reply_to_message_id")
+
+        reply_to = body.get("reply_to_message_id") or body.get("reply_to")
         reply_to_id = int(reply_to) if reply_to else None
+
+        log.info(f"notify: sending to chat_id={chat_id} reply_to={reply_to_id}")
+
         msg = await bot.send_message(
             chat_id, text, parse_mode="HTML",
             reply_to_message_id=reply_to_id,
         )
         return web.json_response({"ok": True, "message_id": msg.message_id})
     except Exception as e:
-        log.error(f"notify_error {e}")
+        log.exception("notify_error")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
