@@ -208,7 +208,8 @@ def _startup_warmup() -> None:
     _halt_vpn_path = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent / "halt_vpn"
 
     def _vpn_watchdog() -> None:
-        _was_down = False
+        # Инициализируем состояние из файла — если файл уже есть после rebuild, сразу считаем что был down
+        _was_down = _halt_vpn_path.exists()
         while True:
             time.sleep(_vpn_check_interval)
             if not _proxy_url:
