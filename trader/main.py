@@ -218,7 +218,7 @@ def _startup_warmup() -> None:
                 _r = httpx.get(
                     _vpn_check_url,
                     proxy=_proxy_url,
-                    timeout=httpx.Timeout(connect=5.0, read=8.0),
+                    timeout=httpx.Timeout(10.0, connect=5.0, read=8.0),
                 )
                 _ok = _r.status_code < 500
             except Exception as _ve:
