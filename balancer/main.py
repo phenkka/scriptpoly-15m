@@ -1226,13 +1226,7 @@ def main() -> None:
 
                 _notify(
                     f"🔄 <b>TRANSFER: POLY → PREDICT</b>\n"
-                    f"\n"
                     f"${amt:.2f} bridged - status: {st}\n"
-                    f"\n"
-                    f"Polymarket: Portfolio: ${_poly_portfolio_now:.2f} — Funds: ${poly_display:.2f} — Subtotal: ${_poly_sub:.2f}\n"
-                    f"Predict:    Portfolio: ${_pred_portfolio_now:.2f} — Funds: ${pred_trigger_bal:.2f} — Subtotal: ${_pred_sub:.2f}\n"
-                    f"\n"
-                    f"<b>TOTAL (incl. positions): ${_total_with_pos_now:.2f}</b>\n"
                 )
 
                 # Forward USDT from EOA funder to PREDICT_ACCOUNT so it is available for trading
@@ -1361,13 +1355,7 @@ def main() -> None:
 
                 _notify(
                     f"🔄 <b>TRANSFER: PREDICT → POLY</b>\n"
-                    f"\n"
                     f"${amt:.2f} bridged - status: {st}\n"
-                    f"\n"
-                    f"Polymarket: Portfolio: ${_poly_portfolio_now:.2f} — Funds: ${poly_display:.2f} — Subtotal: ${_poly_sub:.2f}\n"
-                    f"Predict:    Portfolio: ${_pred_portfolio_now:.2f} — Funds: ${pred_trigger_bal:.2f} — Subtotal: ${_pred_sub:.2f}\n"
-                    f"\n"
-                    f"<b>TOTAL (incl. positions): ${_total_with_pos_now:.2f}</b>\n"
                 )
 
                 last_action_ts = time.time()
