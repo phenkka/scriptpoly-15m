@@ -211,8 +211,8 @@ def _startup_warmup() -> None:
         # Инициализируем состояние из файла — если файл уже есть после rebuild, сразу считаем что был down
         _was_down = _halt_vpn_path.exists()
         while True:
-            time.sleep(_vpn_check_interval)
             if not _proxy_url:
+                time.sleep(_vpn_check_interval)
                 continue  # прокси не настроен — проверять нечего
             _ok = False
             try:
@@ -243,6 +243,7 @@ def _startup_warmup() -> None:
                     "\n"
                     f"Прокси снова доступен: <code>{_proxy_url}</code>\n"
                 )
+            time.sleep(_vpn_check_interval)
 
     threading.Thread(target=_vpn_watchdog, daemon=True, name="vpn_watchdog").start()
 
