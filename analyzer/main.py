@@ -31,6 +31,7 @@ class TickMeta(BaseModel):
     market_id: int | None = None
     title: str | None = None
     poly_fee_rate: float | None = None  # dynamic taker fee rate from CLOB API
+    end_date: str | None = None
 
 
 class Tick(BaseModel):
@@ -365,6 +366,7 @@ def _check_arbitrage() -> None:
                 },
             ],
             "sent_at": datetime.utcnow().isoformat() + "Z",
+            "end_date": t_pred.meta.end_date if t_pred.meta else None,
         }
         print(
             f"[BID+ASK] {ba_label} sum={ba_s_eff:.4f} edge={ba_edge:.4f} net_edge_bps={ba_net_edge_bps:.1f} "

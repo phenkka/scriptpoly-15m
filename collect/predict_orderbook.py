@@ -486,6 +486,7 @@ def run_loop(session: requests.Session) -> None:
                         "slot": market_slot,
                         "market_id": market_id,
                         "title": market_title,
+                        "end_date": market_ends.isoformat() if market_ends is not None else None,
                     },
                 }
                 try:

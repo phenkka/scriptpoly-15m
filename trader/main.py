@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import itertools
 import json
 import os
@@ -179,6 +179,7 @@ class Opportunity(BaseModel):
     predict_fee_bps: float | None = None
     safety_buffer_bps: float | None = None
     predict_max_bid_price: float | None = None
+    end_date: str | None = None
 
 
 app = FastAPI()
@@ -2031,6 +2032,20 @@ def opportunity(opp: Opportunity) -> dict:
     if pred_leg is None or poly_leg is None:
         raise HTTPException(status_code=400, detail="Expected both polymarket and predict legs")
 
+    # Guard: не торговать если до закрытия рынка < 30 секунд
+    if opp.end_date:
+        try:
+            _end_dt = datetime.fromisoformat(opp.end_date.rstrip("Z")).replace(tzinfo=timezone.utc)
+            _secs_to_end = (_end_dt - datetime.now(timezone.utc)).total_seconds()
+            if _secs_to_end < 30:
+                print(
+                    f"[TRADER]{_t}[SKIP] label={opp.label} "
+                    f"reason=market_close_imminent secs_to_end={_secs_to_end:.1f}"
+                )
+                return {"status": "skipped", "reason": "market_close_imminent", "secs_to_end": round(_secs_to_end, 1)}
+        except Exception:
+            pass
+
     # Apply min(bank, pool) across BOTH legs while preserving equal payout (same shares on both).
     # We cap shares by each leg's available top-of-book size (ask_sz).
     sizing: dict[str, Any] = {
@@ -2841,7 +2856,7 @@ def opportunity(opp: Opportunity) -> dict:
                     f"Predict ({pred_leg.side.upper()} BID)\n"
                     f"price: {_ba_actual_pred_bid:.2f} - stake: ${_ba_hedge_qty * _ba_actual_pred_bid:.2f} - shares: {_ba_hedge_qty:.2f}\n"
                     f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
-                    f"price: {_live_vwap_ba:.2f} (est.) - err: {str(poly_exec_error_ba)[:50] if poly_exec_error_ba else 'unknown'}\n"
+                    f"price: {(_live_vwap_ba if _live_vwap_ba is not None else float(poly_leg.ask)):.2f} (est.) - err: {str(poly_exec_error_ba)[:50] if poly_exec_error_ba else 'unknown'}\n"
                     f"\n"
                     f"Unwind на Predict: {_uw2_status}\n"
                 )
