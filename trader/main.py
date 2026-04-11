@@ -2446,6 +2446,19 @@ def opportunity(opp: Opportunity) -> dict:
             # Determine hedge quantity: use actual filled shares from predict, not requested
             _ba_hedge_qty = _ba_total_filled_shares if _ba_total_filled_shares > 0 else float(pred_leg.shares)
 
+            # Net sell quantity for unwind: Predict deducts feeRateBps from the shares credited
+            # to your wallet on a BUY (amountFilled reports gross shares, but balance = gross * (1-fee)).
+            # Using gross qty on a SELL causes "insufficient_shares_balance" 400 error.
+            _ba_net_sell_qty = _ba_hedge_qty
+            if pred_leg.market_id is not None:
+                try:
+                    _pred_mkt_fee = _predict_client.get_market(int(pred_leg.market_id))
+                    _pred_fee_bps = int(_pred_mkt_fee.get("feeRateBps") or 0)
+                    if _pred_fee_bps > 0:
+                        _ba_net_sell_qty = _ba_hedge_qty * (1.0 - _pred_fee_bps / 10_000)
+                except Exception:
+                    pass
+
             # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
             # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
             _ba_actual_pred_bid = float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask)
@@ -2566,7 +2579,7 @@ def opportunity(opp: Opportunity) -> dict:
                     try:
                         _unwind_result = _place_predict_limit_sell(
                             pred_leg,
-                            sell_qty=_ba_hedge_qty,
+                            sell_qty=_ba_net_sell_qty,
                             sell_price=_unwind_price,
                             fill_timeout_sec=30.0,
                             trace_id=trace_id,
@@ -2811,7 +2824,7 @@ def opportunity(opp: Opportunity) -> dict:
                 try:
                     _uw2_result = _place_predict_limit_sell(
                         pred_leg,
-                        sell_qty=_ba_hedge_qty,
+                        sell_qty=_ba_net_sell_qty,
                         sell_price=_unwind_sell_price,
                         fill_timeout_sec=30.0,
                         trace_id=trace_id,
