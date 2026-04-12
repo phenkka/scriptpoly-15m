@@ -1491,8 +1491,7 @@ def _place_predict_limit_buy(
                 time.sleep(_FINAL_GET_SLEEP_SEC)
 
     # ── Final fill check (partial fills count as filled) ──
-    total_filled_wei = prev_filled_wei
-    if not filled and total_filled_wei > 0:
+    if not filled and prev_filled_wei > 0:
         filled = True  # partial fill → still hedge what we got
 
     # ── Cleanup: cancel unfilled remainder ──
@@ -1503,6 +1502,52 @@ def _place_predict_limit_buy(
             remove_resp = _predict_remove_orders(session, [order_id])
         except Exception as _re:
             remove_resp = {"success": False, "error": str(_re)}
+
+    # ── Post-cancel fill sweep ──
+    # BSC block confirmation lag: fills can land AFTER the cancel API call returns.
+    # Poll until terminal state to capture ALL fills and size the hedge correctly.
+    # Without this, partially-filled orders that cancel slowly leave unhedged positions.
+    if order_hash:
+        _PC_MAX_SEC = float(os.environ.get("PREDICT_POSTCANCEL_SWEEP_SEC", "5.0") or "5.0")
+        _PC_POLL_SEC = 0.5
+        _pc_deadline = time.time() + _PC_MAX_SEC
+        while time.time() < _pc_deadline:
+            time.sleep(_PC_POLL_SEC)
+            try:
+                _pc_get = _predict_get_order_by_hash(session, order_hash)
+                _pc_wei = _get_filled_wei(_pc_get)
+                if _pc_wei > prev_filled_wei:
+                    _pc_delta = _pc_wei - prev_filled_wei
+                    _pc_now = time.time()
+                    if first_fill_ts is None:
+                        first_fill_ts = _pc_now
+                    partial_fills.append({
+                        "ts": _pc_now,
+                        "delta_wei": _pc_delta,
+                        "cumulative_wei": _pc_wei,
+                        "delta_shares": _pc_delta / 10**18,
+                        "cumulative_shares": _pc_wei / 10**18,
+                    })
+                    prev_filled_wei = _pc_wei
+                    print(
+                        f"[PREDICT_LIMIT]{_trace} post_cancel_fill hash={order_hash} "
+                        f"delta={_pc_delta / 10**18:.4f} cumulative={_pc_wei / 10**18:.4f}"
+                    )
+                _pc_st = _get_status(_pc_get)
+                if _pc_st in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
+                    break
+                # Order still OPEN — cancel may have failed; retry
+                if _pc_st == "OPEN" and order_id:
+                    try:
+                        _predict_remove_orders(session, [order_id])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    total_filled_wei = prev_filled_wei
+    if not filled and total_filled_wei > 0:
+        filled = True  # post-cancel fill found
 
     quote_total_age_ms = (time.time() - (quote_post_ts - (quote_ttl_sec * replace_count if replace_count else 0))) * 1000.0
 
