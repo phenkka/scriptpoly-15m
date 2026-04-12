@@ -262,6 +262,10 @@ _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
 _trade_pnl_log: list[tuple[float, float]] = []
 _pnl_checkpoint_ts: float = time.time() - 3600  # rolling 1-hour window, survives restarts
 
+# Cooldown for insufficient_collateral notify — don't spam on every order failure
+_insufficient_collateral_last_notify_ts: float = 0.0
+_INSUFFICIENT_COLLATERAL_NOTIFY_COOLDOWN_SEC: float = 600.0  # 10 minutes
+
 
 def _pnl_last_hour() -> tuple[float, int]:
     """Return (sum_net_pnl, count) for trades since _pnl_checkpoint_ts, reading from file."""
@@ -442,6 +446,40 @@ def _predict_remove_orders(session: requests.Session, ids: list[str]) -> dict[st
     if not isinstance(j, dict):
         raise RuntimeError("predict_remove_order_bad_response")
     return j
+
+
+def _predict_cancel_all_open_orders(session: requests.Session) -> int:
+    """Fetch all OPEN orders on Predict and cancel them to release locked collateral.
+
+    Returns number of orders cancelled.
+    """
+    try:
+        r = session.get(
+            "https://api.predict.fun/v1/orders",
+            params={"status": "OPEN", "limit": "100"},
+            timeout=10,
+        )
+        if not r.ok:
+            print(f"[TRADER] predict_cancel_all_open_orders fetch_failed http={r.status_code}")
+            return 0
+        data = r.json()
+        orders = []
+        if isinstance(data, dict):
+            orders = data.get("data") or data.get("orders") or []
+        elif isinstance(data, list):
+            orders = data
+        if not orders:
+            return 0
+        ids = [str(o.get("orderId") or o.get("id") or "").strip() for o in orders if isinstance(o, dict)]
+        ids = [x for x in ids if x]
+        if not ids:
+            return 0
+        _predict_remove_orders(session, ids)
+        print(f"[TRADER] predict_cancel_all_open_orders cancelled={len(ids)} ids={ids[:5]}")
+        return len(ids)
+    except Exception as _e:
+        print(f"[TRADER] predict_cancel_all_open_orders error={_e}")
+        return 0
 
 
 def _polymarket_book(token_id: str) -> dict[str, Any]:
@@ -2436,16 +2474,31 @@ def opportunity(opp: Opportunity) -> dict:
                     f"replaces={_ba_quote_meta.get('replace_count')} "
                     f"quote_age_ms={_ba_quote_meta.get('quote_age_ms')} err={pred_exec_error_ba}"
                 )
-                # Alert on insufficient collateral — balance critically low
+                # Handle insufficient collateral — likely locked by stale open orders.
+                # Auto-cancel all open orders to free collateral, then notify if still recurring.
+                # Cooldown: fire notify at most once per 10 minutes to avoid spam.
                 if pred_exec_error_ba and "insufficient_collateral" in str(pred_exec_error_ba):
-                    notify(
-                        f"🚨🚨🚨 <b>КРИТИЧНО: НЕТ БАЛАНСА НА PREDICT</b>\n"
-                        f"\n"
-                        f"<b>{opp.label}</b>\n"
-                        f"\n"
-                        f"Ошибка: <code>insufficient_collateral_balance</code>\n"
-                        f"Пополни баланс Predict — бот не может открывать новые позиции!\n"
-                    )
+                    # Always try to cancel stale open orders to release locked collateral
+                    try:
+                        _session_ic, _ = _predict_client.get()
+                        _freed = _predict_cancel_all_open_orders(_session_ic)
+                        if _freed:
+                            print(f"[TRADER] insufficient_collateral_freed_by_cancel freed={_freed}")
+                    except Exception as _ic_e:
+                        print(f"[TRADER] insufficient_collateral_cancel_err={_ic_e}")
+                    global _insufficient_collateral_last_notify_ts
+                    _now_ic = time.time()
+                    if _now_ic - _insufficient_collateral_last_notify_ts >= _INSUFFICIENT_COLLATERAL_NOTIFY_COOLDOWN_SEC:
+                        _insufficient_collateral_last_notify_ts = _now_ic
+                        notify(
+                            f"⚠️ <b>PREDICT: залог заблокирован (insufficient_collateral)</b>\n"
+                            f"\n"
+                            f"<b>{opp.label}</b>\n"
+                            f"\n"
+                            f"Ошибка: <code>insufficient_collateral_balance</code>\n"
+                            f"Открытые ордера отменены автоматически — залог освобождён.\n"
+                            f"Если ошибка повторяется — пополни баланс Predict.\n"
+                        )
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
 
