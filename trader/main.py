@@ -2436,6 +2436,16 @@ def opportunity(opp: Opportunity) -> dict:
                     f"replaces={_ba_quote_meta.get('replace_count')} "
                     f"quote_age_ms={_ba_quote_meta.get('quote_age_ms')} err={pred_exec_error_ba}"
                 )
+                # Alert on insufficient collateral — balance critically low
+                if pred_exec_error_ba and "insufficient_collateral" in str(pred_exec_error_ba):
+                    notify(
+                        f"🚨🚨🚨 <b>КРИТИЧНО: НЕТ БАЛАНСА НА PREDICT</b>\n"
+                        f"\n"
+                        f"<b>{opp.label}</b>\n"
+                        f"\n"
+                        f"Ошибка: <code>insufficient_collateral_balance</code>\n"
+                        f"Пополни баланс Predict — бот не может открывать новые позиции!\n"
+                    )
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
 
@@ -2559,9 +2569,10 @@ def opportunity(opp: Opportunity) -> dict:
             if _ba_hedge_cost_usd < _poly_min_hedge:
                 if _ba_hedge_cost_usd >= _poly_over_hedge_threshold:
                     # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
+                    # Add 2% buffer to ensure Poly's actual execution amount >= min after tick-rounding.
                     _ba_hedge_qty_orig = _ba_hedge_qty
-                    _ba_hedge_qty = _poly_min_hedge / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
-                    _ba_hedge_cost_usd = _poly_min_hedge
+                    _ba_hedge_qty = (_poly_min_hedge * 1.02) / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+                    _ba_hedge_cost_usd = _poly_min_hedge * 1.02
                     print(
                         f"[TRADER] BID_ASK_OVER_HEDGE label={opp.label} "
                         f"pred_filled={_ba_hedge_qty_orig:.4f} → boosted={_ba_hedge_qty:.4f} "
@@ -2570,6 +2581,19 @@ def opportunity(opp: Opportunity) -> dict:
                     # fall through to Step 3 hedge below
                 else:
                     # ── Unwind: sell back on Predict at current bid price ──
+                    # Guard: if position is dust (< $0.01 value), skip unwind — Predict rejects tiny orders.
+                    _min_unwind_usd = 0.01
+                    if _ba_net_sell_qty * _ba_actual_pred_bid < _min_unwind_usd:
+                        print(
+                            f"[TRADER] BID_ASK_BELOW_MIN_DUST_SKIP label={opp.label} "
+                            f"qty={_ba_net_sell_qty:.6f} value=${_ba_net_sell_qty * _ba_actual_pred_bid:.4f} "
+                            f"— below unwind threshold, skipping"
+                        )
+                        row["ok"] = False
+                        row["summary"]["status"] = "skipped"
+                        row["summary"]["reason_code"] = "below_min_dust"
+                        _append_jsonl(trades_file, row)
+                        return {"status": "skipped", "reason": "below_min_dust"}
                     _unwind_price = max(
                         _poly_over_hedge_threshold / 10,  # floor sanity
                         _ba_actual_pred_bid - float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
@@ -2696,7 +2720,8 @@ def opportunity(opp: Opportunity) -> dict:
                 ) * 1000.0
 
             _ba_poly_resp = (polymarket_result_ba.get("response") or {}) if polymarket_result_ba else {}
-            poly_filled_ba = _ba_poly_resp.get("success") is True
+            _ba_poly_txhashes = _ba_poly_resp.get("transactionsHashes") or []
+            poly_filled_ba = _ba_poly_resp.get("success") is True and bool(_ba_poly_txhashes)
             _ba_poly_qty: float = 0.0
             try:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
@@ -2728,6 +2753,7 @@ def opportunity(opp: Opportunity) -> dict:
                 f"[TRADER] bid_ask_poly_done success={poly_filled_ba} "
                 f"status={_ba_poly_resp.get('status')} making={_ba_poly_resp.get('makingAmount')} "
                 f"taking={_ba_poly_resp.get('takingAmount')} "
+                f"txhashes={len(_ba_poly_txhashes)} "
                 f"pred_filled={_ba_hedge_qty:.4f} residual={_ba_residual:.4f}"
             )
 
