@@ -201,6 +201,18 @@ def _startup_warmup() -> None:
             print(f"[TRADER] predict_client warmup failed (non-fatal): {e}")
     threading.Thread(target=_warmup, daemon=True).start()
 
+    # Restore fill-state for Telegram reply chaining across container restarts
+    _load_ba_fill_state()
+    print(f"[TRADER] ba_fill_state loaded entries={len(_ba_fill_state)}")
+
+    # Check for Predict orders that were in-flight when the container last stopped.
+    # Runs in a background thread so it doesn't block server startup.
+    threading.Thread(target=_check_inflight_on_startup, daemon=True, name="inflight_startup_check").start()
+
+    # Background late-fill watcher: detects ghost fills that arrive after the 60s
+    # ghost_fill_watch window has expired (real BSC confirmation lag edge case).
+    threading.Thread(target=_late_fill_watcher, daemon=True, name="late_fill_watcher").start()
+
     # VPN watchdog: проверяем доступность прокси каждые 60 секунд.
     # Если прокси недоступен — создаём /data/halt_vpn и уведомляем.
     # Как только восстановился — удаляем файл и уведомляем.
@@ -254,9 +266,263 @@ _predict_market_last_buy_ts: dict[int, float] = {}
 # Набор market_id которые сейчас в процессе исполнения — блокирует параллельные трейды
 _predict_market_in_flight: set[int] = set()
 _predict_market_in_flight_lock = _threading.Lock()
+# Disk-persisted in-flight orders: survives container restarts so we can detect
+# unhedged Predict positions after crash/restart.
+# key: str(market_id)  value: {market_id, order_hash, order_id, token_id, shares, ts}
+_INFLIGHT_ORDERS_FILE = Path("/data/predict_inflight.json")
+_inflight_orders_file_lock = _threading.Lock()
+# Late-fill watcher: orders cancelled by poly_hedge_no_edge whose ghost_fill_watch
+# timed out (60s). Background thread checks these for up to 10 min.
+# key: order_hash  value: {order_hash, market_id, token_id, shares, ts}
+_LATE_WATCH_FILE = Path("/data/predict_late_watch.json")
+_late_watch_file_lock = _threading.Lock()
 # State for grouping repeated HEDGE FILLED notifications in the same market
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
+_BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
 _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
+
+
+def _save_inflight_order(market_id: int, order_hash: str, order_id: str | None, token_id: str | None, shares: float) -> None:
+    """Write a Predict order to the on-disk in-flight registry."""
+    try:
+        with _inflight_orders_file_lock:
+            data: dict = {}
+            if _INFLIGHT_ORDERS_FILE.exists():
+                try:
+                    data = json.loads(_INFLIGHT_ORDERS_FILE.read_text())
+                except Exception:
+                    data = {}
+            data[str(market_id)] = {
+                "market_id": market_id,
+                "order_hash": order_hash,
+                "order_id": order_id,
+                "token_id": token_id,
+                "shares": shares,
+                "ts": time.time(),
+            }
+            _INFLIGHT_ORDERS_FILE.write_text(json.dumps(data))
+    except Exception as _e:
+        print(f"[TRADER] save_inflight_order error={_e}")
+
+
+def _remove_inflight_order(market_id: int) -> None:
+    """Remove a market_id entry from the on-disk in-flight registry."""
+    try:
+        with _inflight_orders_file_lock:
+            if not _INFLIGHT_ORDERS_FILE.exists():
+                return
+            try:
+                data = json.loads(_INFLIGHT_ORDERS_FILE.read_text())
+            except Exception:
+                return
+            data.pop(str(market_id), None)
+            if data:
+                _INFLIGHT_ORDERS_FILE.write_text(json.dumps(data))
+            else:
+                _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+    except Exception as _e:
+        print(f"[TRADER] remove_inflight_order error={_e}")
+
+
+def _check_inflight_on_startup() -> None:
+    """On startup, look for Predict orders that were in-flight when container last died.
+
+    If any such orders exist (< 10 min old), cancel all open Predict orders and notify the
+    user so they can check for unhedged positions manually.
+    """
+    try:
+        if not _INFLIGHT_ORDERS_FILE.exists():
+            return
+        try:
+            data = json.loads(_INFLIGHT_ORDERS_FILE.read_text())
+        except Exception:
+            _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+            return
+        if not data:
+            _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+            return
+
+        cutoff = time.time() - 600  # only care about orders < 10 min old
+        fresh = {k: v for k, v in data.items() if isinstance(v, dict) and float(v.get("ts", 0)) > cutoff}
+        # Delete stale entries regardless
+        if not fresh:
+            _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+            print("[TRADER][STARTUP] inflight_file stale entries cleared")
+            return
+
+        print(f"[TRADER][STARTUP] ⚠️  inflight orders found at startup count={len(fresh)}: {list(fresh.keys())}")
+
+        # Cancel all open Predict orders (the orders may still be open on-chain)
+        try:
+            session, _ = _predict_client.get()
+            n_cancelled = _predict_cancel_all_open_orders(session)
+            print(f"[TRADER][STARTUP] cancelled open orders n={n_cancelled}")
+        except Exception as _ce:
+            print(f"[TRADER][STARTUP] cancel_open_orders error={_ce}")
+            n_cancelled = -1
+
+        # Build notification
+        lines = []
+        for entry in fresh.values():
+            mkt = entry.get("market_id", "?")
+            oh = str(entry.get("order_hash") or "?")[:12]
+            sh = entry.get("shares", "?")
+            age_s = int(time.time() - float(entry.get("ts", time.time())))
+            lines.append(f"market_id={mkt} hash={oh}... shares={sh} age={age_s}s")
+
+        cancel_line = f"\n🗑 Отменено открытых ордеров на Predict: {n_cancelled}" if n_cancelled >= 0 else ""
+        notify(
+            "⚠️ <b>RESTART: ОТКРЫТЫЕ PREDICT ОРДЕРА ПРИ ПЕРЕЗАПУСКЕ</b>\n"
+            "\n"
+            "Контейнер перезапустился пока Predict-ордер был в процессе.\n"
+            "Возможна <b>неезахеджированная позиция</b> на Predict!\n"
+            "\n"
+            + "\n".join(lines)
+            + cancel_line
+            + "\n\n⚠️ Проверь позиции вручную!"
+        )
+
+        # Clean up the file after alerting
+        _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+
+    except Exception as _e:
+        print(f"[TRADER][STARTUP] check_inflight error={_e}")
+
+
+def _parse_predict_filled_wei(resp: dict[str, Any]) -> int:
+    """Parse amountFilled (wei) from Predict GET /orders/{hash} response."""
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return max(0, int(str(data.get("amountFilled") or "0")))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shares: float) -> None:
+    """Register a cancelled Predict order for background late-fill monitoring."""
+    try:
+        with _late_watch_file_lock:
+            data: dict = {}
+            if _LATE_WATCH_FILE.exists():
+                try:
+                    data = json.loads(_LATE_WATCH_FILE.read_text())
+                except Exception:
+                    data = {}
+            data[order_hash] = {
+                "order_hash": order_hash,
+                "market_id": market_id,
+                "token_id": token_id,
+                "shares": shares,
+                "ts": time.time(),
+            }
+            _LATE_WATCH_FILE.write_text(json.dumps(data))
+    except Exception as _e:
+        print(f"[TRADER] late_watch_save error={_e}")
+
+
+def _late_fill_watcher() -> None:
+    """Background thread: checks cancelled Predict order hashes for late fills.
+
+    When ghost_fill_watch (60s) times out without finding a fill, the order hash
+    is saved to _LATE_WATCH_FILE. This thread keeps polling those hashes every 15s
+    for up to 10 minutes. If a late fill is detected it sends a Telegram alert —
+    the position on Predict is unhedged and requires manual intervention.
+    """
+    _POLL_INTERVAL = 15.0
+    _MAX_WATCH_SEC = 600  # 10 minutes
+    while True:
+        time.sleep(_POLL_INTERVAL)
+        try:
+            if not _LATE_WATCH_FILE.exists():
+                continue
+            with _late_watch_file_lock:
+                try:
+                    data = json.loads(_LATE_WATCH_FILE.read_text())
+                except Exception:
+                    continue
+            if not data:
+                _LATE_WATCH_FILE.unlink(missing_ok=True)
+                continue
+
+            now = time.time()
+            cutoff = now - _MAX_WATCH_SEC
+            to_remove: list[str] = []
+            try:
+                session, _ = _predict_client.get()
+            except Exception as _se:
+                print(f"[TRADER][LATE_WATCH] predict_client error={_se}")
+                continue
+
+            for oh, entry in list(data.items()):
+                age = now - float(entry.get("ts", 0))
+                if float(entry.get("ts", 0)) < cutoff:
+                    to_remove.append(oh)
+                    continue
+                try:
+                    resp = _predict_get_order_by_hash(session, oh)
+                    filled_wei = _parse_predict_filled_wei(resp)
+                    if filled_wei > 0:
+                        shares = filled_wei / 10 ** 18
+                        mkt_id = entry.get("market_id", "?")
+                        print(
+                            f"[TRADER][LATE_WATCH] ⚠️ LATE GHOST FILL DETECTED "
+                            f"hash={oh[:14]}... market_id={mkt_id} "
+                            f"shares={shares:.4f} age={age:.0f}s"
+                        )
+                        notify(
+                            f"🔴🔴🔴 <b>LATE GHOST FILL — НЕ ЗАХЕДЖИРОВАНО!</b>\n"
+                            f"\n"
+                            f"Ордер на Predict заполнился ПОСЛЕ отмены (+{age:.0f}s)\n"
+                            f"hash: <code>{oh[:18]}...</code>\n"
+                            f"market_id: <code>{mkt_id}</code>\n"
+                            f"shares: <b>{shares:.3f}</b>\n"
+                            f"\n"
+                            f"⚠️ Позиция на Predict <b>НЕ захеджирована</b>!\n"
+                            f"Закрой позицию вручную."
+                        )
+                        to_remove.append(oh)
+                except Exception as _pe:
+                    print(f"[TRADER][LATE_WATCH] check_error hash={oh[:14]} err={_pe}")
+
+            if to_remove:
+                with _late_watch_file_lock:
+                    try:
+                        data = json.loads(_LATE_WATCH_FILE.read_text())
+                        for k in to_remove:
+                            data.pop(k, None)
+                        if data:
+                            _LATE_WATCH_FILE.write_text(json.dumps(data))
+                        else:
+                            _LATE_WATCH_FILE.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception as _e:
+            print(f"[TRADER][LATE_WATCH] loop_error={_e}")
+
+
+def _load_ba_fill_state() -> None:
+    """Load persisted fill state from disk on startup."""
+    try:
+        if _BA_FILL_STATE_FILE.exists():
+            raw = json.loads(_BA_FILL_STATE_FILE.read_text())
+            cutoff = time.time() - 1800  # drop entries older than GROUP_TTL
+            for k, v in raw.items():
+                if isinstance(v, list) and len(v) == 4 and float(v[3]) > cutoff:
+                    _ba_fill_state[k] = (int(v[0]), float(v[1]), int(v[2]), float(v[3]))
+    except Exception:
+        pass
+
+
+def _save_ba_fill_state() -> None:
+    """Persist fill state to disk so replies survive container restarts."""
+    try:
+        _BA_FILL_STATE_FILE.write_text(
+            json.dumps({k: list(v) for k, v in _ba_fill_state.items()})
+        )
+    except Exception:
+        pass
 
 # In-memory hourly P&L log: list of (unix_ts, net_pnl) for the last hour
 _trade_pnl_log: list[tuple[float, float]] = []
@@ -286,16 +552,19 @@ def _pnl_last_hour() -> tuple[float, int]:
                 ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
                 if ts < cutoff:
                     continue
-                lr = row.get("live_hedge_recheck") or {}
-                hq = float(lr.get("hedge_qty") or 0)
-                pb = float(lr.get("pred_bid") or 0)
-                vwap = float(lr.get("live_poly_vwap") or 0)
-                lf = float(lr.get("live_poly_fee") or 0)
-                fee_bps = float(
-                    ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
-                )
-                gross = hq * (1.0 - pb - vwap)
-                total += gross - lf * hq - fee_bps / 10_000 * pb * hq
+                # Use stored net_pnl if available (most accurate)
+                if "net_pnl" in row:
+                    trade_pnl = float(row["net_pnl"])
+                else:
+                    lr = row.get("live_hedge_recheck") or {}
+                    hq = float(lr.get("hedge_qty") or 0)
+                    pb = float(lr.get("pred_bid") or 0)
+                    vwap = float(lr.get("live_poly_vwap") or 0)
+                    lf = float(lr.get("live_poly_fee") or 0)
+                    pred_fee_bps = float(os.environ.get("PREDICT_FEE_BPS", "0") or "0")
+                    gross = hq * (1.0 - pb - vwap)
+                    trade_pnl = gross - lf * hq - pred_fee_bps / 10_000 * pb * hq
+                total += trade_pnl
                 count += 1
             except Exception:
                 pass
@@ -311,6 +580,36 @@ def _fmt_usd(x: float | int | None) -> str:
         return f"${float(x):.4f}"
     except Exception:
         return "n/a"
+
+
+def _fetch_poly_position(token_id: str, timeout: float = 3.0) -> tuple[float, float] | None:
+    """Fetch current position for token_id from Polymarket data API.
+
+    Returns (total_shares, avg_price) or None on failure.
+    """
+    wallet = os.environ.get("POLY_FUNDER", "").strip()
+    if not wallet or not token_id:
+        return None
+    try:
+        proxy = os.environ.get("PROXY_URL", "").strip() or None
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": wallet, "sizeThreshold": -1, "limit": 500},
+            timeout=timeout,
+            proxies=proxies,
+        )
+        if resp.status_code != 200:
+            return None
+        positions = resp.json()
+        for pos in positions:
+            if str(pos.get("asset", "") or pos.get("token_id", "")) == str(token_id):
+                size = float(pos.get("size", 0) or pos.get("shares", 0) or 0)
+                avg = float(pos.get("avgPrice", 0) or pos.get("avg_price", 0) or 0)
+                return size, avg
+        return None
+    except Exception:
+        return None
 
 
 def _leg_summary(leg: "OpportunityLeg") -> dict[str, Any]:
@@ -1282,6 +1581,13 @@ def _place_predict_limit_buy(
     order_id = str(create_data.get("orderId") or "").strip() or None
     order_hash = str(create_data.get("orderHash") or "").strip() or None
 
+    # Persist to disk immediately — so on crash/restart we know this order was in-flight
+    if order_hash and leg.market_id is not None:
+        _save_inflight_order(
+            int(leg.market_id), order_hash, order_id, token_id,
+            float(leg.shares or 0)
+        )
+
     quote_post_ts = time.time()
     first_fill_ts: float | None = None
     partial_fills: list[dict[str, Any]] = []
@@ -1354,11 +1660,48 @@ def _place_predict_limit_buy(
                                 f"poly_ask={_pa_live:.4f} pred_bid={current_bid_price:.4f} "
                                 f"edge={_edge_live:.4f}"
                             )
-                            try:
-                                if order_id:
-                                    _predict_remove_orders(session, [order_id])
-                            except Exception:
-                                pass
+                            # Cancel + verify loop: retry cancel until status is no longer OPEN
+                            # BSC можно подтвердить транзакцию до того как cancel API успел —
+                            # поэтому проверяем что ордер реально отменился, иначе отменяем снова.
+                            _CANCEL_RETRIES = 5
+                            _CANCEL_VERIFY_SEC = 2.0
+                            for _ci in range(_CANCEL_RETRIES):
+                                try:
+                                    if order_id:
+                                        _predict_remove_orders(session, [order_id])
+                                except Exception as _ce:
+                                    print(f"[PREDICT_LIMIT]{_trace} cancel_attempt={_ci+1} err={_ce}")
+                                time.sleep(_CANCEL_VERIFY_SEC)
+                                try:
+                                    _cv_get = _predict_get_order_by_hash(session, order_hash)
+                                    _cv_status = _get_status(_cv_get)
+                                    _cv_filled = _get_filled_wei(_cv_get)
+                                    print(
+                                        f"[PREDICT_LIMIT]{_trace} cancel_verify attempt={_ci+1}/{_CANCEL_RETRIES} "
+                                        f"status={_cv_status} filled_wei={_cv_filled}"
+                                    )
+                                    if _cv_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
+                                        # Reached terminal state — update prev_filled_wei if filled
+                                        if _cv_filled > prev_filled_wei:
+                                            delta_wei = _cv_filled - prev_filled_wei
+                                            now_ts = time.time()
+                                            if first_fill_ts is None:
+                                                first_fill_ts = now_ts
+                                            partial_fills.append({
+                                                "ts": now_ts,
+                                                "delta_wei": delta_wei,
+                                                "cumulative_wei": _cv_filled,
+                                                "delta_shares": delta_wei / 10**18,
+                                                "cumulative_shares": _cv_filled / 10**18,
+                                            })
+                                            prev_filled_wei = _cv_filled
+                                            print(
+                                                f"[PREDICT_LIMIT]{_trace} cancel_verify_fill_detected "
+                                                f"hash={order_hash} filled={_cv_filled / 10**18:.4f}"
+                                            )
+                                        break  # terminal — stop retrying cancel
+                                except Exception as _cve:
+                                    print(f"[PREDICT_LIMIT]{_trace} cancel_verify_get_err attempt={_ci+1} err={_cve}")
                             need_final_get_check = True
                             break
                         # Also refresh max_bid so outbid check below uses latest
@@ -2524,6 +2867,12 @@ def opportunity(opp: Opportunity) -> dict:
                             print(f"[TRADER] insufficient_collateral_freed_by_cancel freed={_freed}")
                     except Exception as _ic_e:
                         print(f"[TRADER] insufficient_collateral_cancel_err={_ic_e}")
+                # Late-fill watch: ghost fill can arrive on BSC after the 60s ghost_fill_watch
+                # window. Register the hash for background monitoring up to 10 minutes.
+                _ba_cancel_rsn = _ba_quote_meta.get("cancel_reason") or ""
+                if pred_hash_ba and _ba_cancel_rsn.startswith("poly_hedge_no_edge") and pred_leg.market_id is not None:
+                    _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), pred_leg.token_id, float(opp.shares))
+                    print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}...")
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
 
@@ -2617,6 +2966,25 @@ def opportunity(opp: Opportunity) -> dict:
             # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
             _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
             if _live_vwap_ba is not None and _live_vwap_ba >= _poly_max_hedge_price:
+                # Unwind Predict position before declaring price_cap incident
+                _pc_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                _pc_unwind_price = max(_pc_unwind_tick, _ba_actual_pred_bid - _pc_unwind_tick)
+                _pc_unwind_result: dict[str, Any] = {}
+                _pc_unwind_err: str | None = None
+                try:
+                    _pc_unwind_result = _place_predict_limit_sell(
+                        pred_leg,
+                        sell_qty=_ba_net_sell_qty,
+                        sell_price=_pc_unwind_price,
+                        fill_timeout_sec=30.0,
+                        trace_id=trace_id,
+                    )
+                except Exception as _pc_uw_e:
+                    _pc_unwind_err = str(_pc_uw_e)
+                    print(f"[TRADER][UNWIND_ERROR] price_cap label={opp.label} err={_pc_uw_e}")
+                _pc_uw_filled = _pc_unwind_result.get("filled", False)
+                _pc_uw_qty = _pc_unwind_result.get("filled_qty", 0.0)
+
                 _ba_inc_hp = {
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "bid_ask_hedge_price_cap",
@@ -2626,6 +2994,8 @@ def opportunity(opp: Opportunity) -> dict:
                     "pred_bid": _ba_actual_pred_bid,
                     "pred_filled_qty": float(_ba_hedge_qty),
                     "quote_meta": _ba_quote_meta,
+                    "unwind": _pc_unwind_result,
+                    "unwind_error": _pc_unwind_err,
                 }
                 _append_jsonl(incidents_file, _ba_inc_hp)
                 row["ok"] = False
@@ -2633,7 +3003,20 @@ def opportunity(opp: Opportunity) -> dict:
                 row["summary"]["reason_code"] = "bid_ask_hedge_price_cap"
                 print(
                     f"[TRADER][INCIDENT] BID_ASK_HEDGE_PRICE_CAP label={opp.label} "
-                    f"live_vwap={_live_vwap_ba:.4f} cap={_poly_max_hedge_price:.4f}"
+                    f"live_vwap={_live_vwap_ba:.4f} cap={_poly_max_hedge_price:.4f} "
+                    f"unwind_filled={_pc_uw_filled} unwind_qty={_pc_uw_qty:.4f}"
+                )
+                _pc_uw_status = "✅ продано" if _pc_uw_filled else "❌ не продано — ручная проверка!"
+                notify(
+                    f"🟡🟡🟡 <b>INCIDENT: HEDGE PRICE CAP → UNWIND</b>\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Poly цена {_live_vwap_ba:.2f} ≥ лимит {_poly_max_hedge_price:.2f} → хедж отменён\n"
+                    f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
+                    f"\n"
+                    f"Продажа обратно на Predict по {_pc_unwind_price:.2f}: {_pc_uw_status}\n"
+                    + (f"Ошибка: {_pc_unwind_err}\n" if _pc_unwind_err else "")
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
@@ -2864,17 +3247,24 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
                 _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
                 _trade_pnl_log.append((time.time(), _ba_net_pnl))
+                # Store authoritative net_pnl so downstream code doesn't need to recalculate
+                row["net_pnl"] = round(_ba_net_pnl, 6)
                 # Update live_hedge_recheck with actual executed prices so stored PnL is accurate
+                _actual_poly_fee = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price)
+                _actual_net_edge = (_ba_net_pnl / _ba_hedge_qty) if _ba_hedge_qty > 0 else 0.0
                 if "live_hedge_recheck" in row:
                     row["live_hedge_recheck"]["live_poly_vwap"] = round(_ba_poly_price, 6)
-                    row["live_hedge_recheck"]["live_poly_fee"] = round(
-                        _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price), 6
-                    )
+                    row["live_hedge_recheck"]["live_poly_fee"] = round(_actual_poly_fee, 6)
+                    # Recalculate net_edge from actual execution prices (overrides pre-execution estimate)
+                    row["live_hedge_recheck"]["live_net_edge"] = round(_actual_net_edge, 6)
+                    row["live_hedge_recheck"]["live_net_edge_bps"] = round(_actual_net_edge * 10_000, 1)
                 else:
                     row["live_hedge_recheck"] = {
                         "pred_bid": round(_ba_pred_price, 6),
                         "live_poly_vwap": round(_ba_poly_price, 6),
-                        "live_poly_fee": round(_ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price), 6),
+                        "live_poly_fee": round(_actual_poly_fee, 6),
+                        "live_net_edge": round(_actual_net_edge, 6),
+                        "live_net_edge_bps": round(_actual_net_edge * 10_000, 1),
                         "hedge_qty": round(_ba_hedge_qty, 4),
                         "poly_fee_rate": _ba_fee_rate,
                     }
@@ -2889,26 +3279,54 @@ def opportunity(opp: Opportunity) -> dict:
                 _cum_pnl = (_prev[1] + _ba_net_pnl) if _is_grouped else _ba_net_pnl
                 _fill_n = (_prev[2] + 1) if _is_grouped else 1
 
-                _pnl_line = (
-                    f"<b>{_ba_net_pnl:+.2f}$ - TYANUCHKA IS CANCELED</b>\n"
-                    if (_ba_pred_price + _ba_poly_price) < 1.0
-                    else f"<b>{_ba_net_pnl:+.2f}$</b>\n"
-                )
+                # ROI relative to total stake
+                _total_stake = _ba_poly_qty * _ba_poly_price + _ba_hedge_qty * _ba_pred_price
+                _roi_pct = (_ba_net_pnl / _total_stake * 100) if _total_stake > 0 else 0.0
+
+                # Market title from legs
+                _mkt_title = ""
+                for _leg in (row.get("legs") or []):
+                    if _leg.get("title"):
+                        _mkt_title = _leg["title"]
+                        break
+
+                # Fetch current total position from Polymarket (best-effort, non-blocking)
+                _poly_pos_line = ""
+                try:
+                    _poly_pos = _fetch_poly_position(str(poly_leg.token_id), timeout=2.5)
+                    if _poly_pos is not None:
+                        _pos_shares, _pos_avg = _poly_pos
+                        if _pos_shares > 0:
+                            _poly_pos_line = (
+                                f"<i>💼 Poly total position: {_pos_shares:.2f} shares"
+                                f" @ avg {_pos_avg:.2f}</i>\n"
+                            )
+                except Exception:
+                    pass
+
+                _is_tyanuchka = (_ba_pred_price + _ba_poly_price) < 1.0
+                if _ba_net_pnl >= 0:
+                    _pnl_suffix = " — TYANUCHKA IS CANCELED"
+                else:
+                    _pnl_suffix = " — GG PROEBALI"
+                _pnl_emoji = "📈" if _ba_net_pnl >= 0 else "📉"
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
                 _h1_pnl, _h1_n = _pnl_last_hour()
 
                 _msg_id = notify(
                     f"{_title}\n"
-                    f"\n"
+                    + (f"<i>{_mkt_title}</i>\n" if _mkt_title else "")
+                    + f"\n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
-                    f"Polymarket ({poly_leg.side.upper()} ASK)\n"
-                    f"price: {_ba_poly_price:.2f} - stake: ${_ba_poly_qty * _ba_poly_price:.2f} - shares: {_ba_poly_qty:.2f}\n"
-                    f"Predict ({pred_leg.side.upper()} BID)\n"
-                    f"price: {_ba_pred_price:.2f} - stake: ${_ba_hedge_qty * _ba_pred_price:.2f} - shares: {_ba_hedge_qty:.2f}\n"
-                    f"\n"
-                    + _pnl_line
+                    f"<b>Polymarket</b>  {poly_leg.side.upper()}\n"
+                    f"  {_ba_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_ba_poly_qty * _ba_poly_price:.2f}</b>\n"
+                    f"<b>Predict</b>  {pred_leg.side.upper()}\n"
+                    f"  {_ba_hedge_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_ba_hedge_qty * _ba_pred_price:.2f}</b>\n"
+                    + _poly_pos_line
+                    + f"\n"
+                    f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
                     + _cum_line
                     + f"\n"
                     f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>\n",
@@ -2918,6 +3336,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _stored_id = (_prev[0] if _is_grouped else _msg_id) if _msg_id is not None else (_reply_to_id or 0)
                 if _stored_id:
                     _ba_fill_state[_tkey] = (_stored_id, _cum_pnl, _fill_n, time.time())
+                    _save_ba_fill_state()
                 return {"status": "ok"}
             else:
                 # Predict filled, poly failed → try to unwind on Predict before declaring incident
@@ -2996,3 +3415,4 @@ def opportunity(opp: Opportunity) -> dict:
         if _market_id_int is not None:
             with _predict_market_in_flight_lock:
                 _predict_market_in_flight.discard(_market_id_int)
+            _remove_inflight_order(_market_id_int)

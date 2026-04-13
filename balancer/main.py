@@ -700,6 +700,7 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
     if not p.exists():
         return 0.0, 0, 0, 0
     total, count, plus_n, minus_n = 0.0, 0, 0, 0
+    pred_fee_bps = float(os.environ.get("PREDICT_FEE_BPS", "0") or "0")
     for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line:
@@ -713,16 +714,17 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
             ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
             if ts < since_ts or not row.get("ok"):
                 continue
-            lr = row.get("live_hedge_recheck") or {}
-            hq = float(lr.get("hedge_qty") or 0)
-            pb = float(lr.get("pred_bid") or 0)
-            vwap = float(lr.get("live_poly_vwap") or 0)
-            lf = float(lr.get("live_poly_fee") or 0)
-            fee_bps = float(
-                ((row.get("predict") or {}).get("market") or {}).get("feeRateBps") or 200
-            )
-            gross = hq * (1.0 - pb - vwap)
-            trade_pnl = gross - lf * hq - fee_bps / 10_000 * pb * hq
+            # Use stored net_pnl if available (most accurate, avoids wrong fee defaults)
+            if "net_pnl" in row:
+                trade_pnl = float(row["net_pnl"])
+            else:
+                lr = row.get("live_hedge_recheck") or {}
+                hq = float(lr.get("hedge_qty") or 0)
+                pb = float(lr.get("pred_bid") or 0)
+                vwap = float(lr.get("live_poly_vwap") or 0)
+                lf = float(lr.get("live_poly_fee") or 0)
+                gross = hq * (1.0 - pb - vwap)
+                trade_pnl = gross - lf * hq - pred_fee_bps / 10_000 * pb * hq
             total += trade_pnl
             count += 1
             if trade_pnl >= 0:
