@@ -156,6 +156,20 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+_SETTINGS_FILE = Path("/data/settings.json")
+
+
+def _settings_float(name: str, default: float) -> float:
+    """Read float from /data/settings.json, fall back to env, then default."""
+    try:
+        data = json.loads(_SETTINGS_FILE.read_text())
+        if name in data:
+            return float(data[name])
+    except Exception:
+        pass
+    return _env_float(name, default)
+
+
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     if v is None or not v.strip():
@@ -759,8 +773,9 @@ def main() -> None:
     poly_wallet = os.environ.get("BALANCER_POLY_WALLET", "").strip() or "0x187042aEF3a09C534E76612440ED086e58c9ACaD"
     pred_wallet = os.environ.get("BALANCER_PREDICT_WALLET", "").strip() or "0x1b7FD55c2D2c243CE917eb998f12CDEB9E686Fc9"
 
-    threshold_usd = _env_float("BALANCER_THRESHOLD_USD", 10.0)
-    target_usd = _env_float("BALANCER_TARGET_USD", 25.0)
+    # Re-read dynamically inside the loop; initial values just for logging before loop starts
+    threshold_usd = _settings_float("BALANCER_THRESHOLD_USD", 10.0)
+    target_usd = _settings_float("BALANCER_TARGET_USD", 25.0)
     min_bridge_usd = _env_float("BALANCER_MIN_BRIDGE_USD", 3.0)
     enable_transfers = _env_bool("BALANCER_ENABLE_TRANSFERS", False)
     enable_bsc_to_poly = _env_bool("BALANCER_ENABLE_BSC_TO_POLY", enable_transfers)
@@ -908,6 +923,9 @@ def main() -> None:
 
     while True:
         now = time.time()
+        # Re-read configurable thresholds each cycle so bot /settings changes take effect
+        threshold_usd = _settings_float("BALANCER_THRESHOLD_USD", 10.0)
+        target_usd = _settings_float("BALANCER_TARGET_USD", 25.0)
         try:
             w3_bsc, bsc_rpc_used = _get_web3(bsc_rpcs)
             w3_poly, poly_rpc_used = _get_web3(polygon_rpcs)
@@ -1052,7 +1070,7 @@ def main() -> None:
                 pass
 
             # ── Low balance halt ────────────────────────────────────────────
-            _stop_threshold = float(os.environ.get("BOT_STOP_TOTAL_USD", "25") or "25")
+            _stop_threshold = _settings_float("BOT_STOP_TOTAL_USD", 25.0)
             _halt_file = Path("/data/halt")
             if total_bal < _stop_threshold:
                 if not _halt_file.exists():
