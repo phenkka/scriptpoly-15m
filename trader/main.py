@@ -34,7 +34,7 @@ from predict_sdk import (
 )
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 from trader.config import CONFIG as CFG
@@ -1416,6 +1416,79 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg, fak_fallback: bool = F
         )
         print("[TRADER][POLY][TRACE]\n" + traceback.format_exc())
         raise
+
+
+def _place_polymarket_limit_buy_exact_shares(
+    token_id: str,
+    shares: float,
+    price: float,
+    *,
+    private_key: str,
+    funder: str,
+    signature_type: int,
+    poly_api_key: str,
+    poly_secret: str,
+    poly_passphrase: str,
+    fak_fallback: bool = True,
+) -> dict[str, Any]:
+    """Place a limit BUY on Polymarket for an exact share count.
+
+    Uses OrderArgs (share-based) instead of MarketOrderArgs (USD-based),
+    so the credited shares == requested shares with no LP-fee deduction.
+    Price should be set slightly above live ask to ensure immediate fill.
+    """
+    host = "https://clob.polymarket.com"
+
+    def _build_client() -> ClobClient:
+        c = ClobClient(
+            host=host,
+            chain_id=137,
+            key=private_key,
+            signature_type=signature_type,
+            funder=funder,
+        )
+        if poly_api_key and poly_secret and poly_passphrase:
+            c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
+        else:
+            c.set_api_creds(c.create_or_derive_api_creds())
+        return c
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=round(price, 4),
+        size=round(shares, 4),
+        side=BUY,
+    )
+    for _attempt, _otype in enumerate([OrderType.FOK, OrderType.FAK] if fak_fallback else [OrderType.FOK]):
+        try:
+            client = _build_client()
+            signed = client.create_order(order_args)
+            resp = client.post_order(signed, _otype)
+            return {
+                "token_id": token_id,
+                "shares_requested": shares,
+                "price": price,
+                "response": resp,
+                "order_type": _otype,
+            }
+        except Exception as _e:
+            _es = str(_e)
+            _is_fok_kill = "couldn't be fully filled" in _es or "FOK" in _es
+            if _attempt == 0 and fak_fallback and _is_fok_kill:
+                print(
+                    f"[TRADER][POLY][LIMIT_FAK_FALLBACK] FOK killed, retrying FAK "
+                    f"token_id={token_id} shares={shares:.4f} price={price:.4f}"
+                )
+                continue
+            proxy_url = os.environ.get("PROXY_URL", "").strip()
+            print(
+                "[TRADER][POLY][LIMIT_ERROR] "
+                f"token_id={token_id} shares={shares:.4f} price={price:.4f} "
+                f"proxy_set={bool(proxy_url)} err_type={type(_e).__name__} err={_e}"
+            )
+            print("[TRADER][POLY][LIMIT_TRACE]\n" + traceback.format_exc())
+            raise
+    raise RuntimeError("unreachable")
 
 
 def _predict_get_jwt(
@@ -3238,22 +3311,19 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
 
-            # Step 3: FOK hedge on Polymarket — hedge actual filled quantity
-            # Guard: partial fill may be below Poly's $1 min order.
-            # Use net_sell_qty (gross minus predict fee) as the actual shares in wallet.
-            # Poly LP fee reduces credited shares: actual = gross × (1 − fee_rate × (1 − price)).
-            # To receive exactly net_sell_qty shares after fee, inflate the order by 1/fee_factor.
+            # Step 3: Exact-share limit BUY on Polymarket.
+            # Use limit order (OrderArgs) with size=net_sell_qty so credited shares == predict net.
+            # Price set to live_vwap × 1.02 (2% above) to guarantee immediate fill.
+            # Unlike USD market orders, limit orders credit exactly `size` shares (no LP-fee deduction).
             _ba_hedge_vwap = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
-            _ba_poly_fee_factor = 1.0 - _ba_fee_rate * (1.0 - _ba_hedge_vwap)
-            _ba_final_hedge_qty = _ba_net_sell_qty / _ba_poly_fee_factor if _ba_poly_fee_factor > 0 else _ba_net_sell_qty
-            _ba_hedge_cost_usd = _ba_net_sell_qty * _ba_hedge_vwap  # cost based on desired net shares
+            _ba_final_hedge_qty = _ba_net_sell_qty
+            _ba_hedge_cost_usd = _ba_net_sell_qty * _ba_hedge_vwap
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
             # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
             _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
             if _ba_hedge_cost_usd < _poly_min_hedge:
                 if _ba_hedge_cost_usd >= _poly_over_hedge_threshold:
                     # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
-                    # Add 2% buffer to ensure Poly's actual execution amount >= min after tick-rounding.
                     _ba_hedge_qty_orig = _ba_final_hedge_qty
                     _ba_final_hedge_qty = (_poly_min_hedge * 1.02) / _ba_hedge_vwap
                     _ba_hedge_cost_usd = _poly_min_hedge * 1.02
@@ -3338,17 +3408,36 @@ def opportunity(opp: Opportunity) -> dict:
                     return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
 
             _ba_hedge_price = _ba_hedge_vwap
+            # Limit price: 2% above VWAP to guarantee immediate fill
+            _ba_limit_price = min(0.99, round(_ba_hedge_vwap * 1.02, 4))
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
             )
             polymarket_result_ba: dict[str, Any] | None = None
             poly_exec_error_ba: Exception | None = None
             _poly_timing_ba["submit_ts"] = time.time()
+            _poly_pk = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
+            _poly_funder = os.environ.get("POLY_FUNDER", "").strip()
+            _poly_sig_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "0").strip() or "0")
+            _poly_api_key = os.environ.get("POLY_API_KEY", "").strip()
+            _poly_secret = os.environ.get("POLY_SECRET", "").strip()
+            _poly_passphrase = os.environ.get("POLY_PASSPHRASE", "").strip()
             # Retry poly hedge on network errors — predict is already filled so hedge is critical
             _POLY_HEDGE_RETRIES = 3
             for _poly_attempt in range(_POLY_HEDGE_RETRIES):
                 try:
-                    polymarket_result_ba = _place_polymarket_fok_market_buy(_ba_hedge_leg, fak_fallback=True)
+                    polymarket_result_ba = _place_polymarket_limit_buy_exact_shares(
+                        str(poly_leg.token_id),
+                        shares=_ba_final_hedge_qty,
+                        price=_ba_limit_price,
+                        private_key=_poly_pk,
+                        funder=_poly_funder,
+                        signature_type=_poly_sig_type,
+                        poly_api_key=_poly_api_key,
+                        poly_secret=_poly_secret,
+                        poly_passphrase=_poly_passphrase,
+                        fak_fallback=True,
+                    )
                     _poly_timing_ba["ack_ts"] = time.time()
                     poly_exec_error_ba = None
                     break
@@ -3411,11 +3500,9 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
             except (ValueError, TypeError):
                 pass
-            # takingAmount is GROSS shares before Poly fee deduction from your wallet.
-            # Actual credited shares = takingAmount × (1 − fee_rate × (1 − price)).
-            # Example: 15.0625 × (1 − 0.072 × 0.68) = 15.0625 × 0.9510 ≈ 14.3 shares.
-            _ba_poly_price_for_fee = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
-            _ba_poly_qty_actual = _ba_poly_qty * (1.0 - _ba_fee_rate * (1.0 - _ba_poly_price_for_fee))
+            # Limit orders credit exactly `size` shares — no LP-fee deduction from shares.
+            # takingAmount IS the actual credited amount for limit orders.
+            _ba_poly_qty_actual = _ba_poly_qty
             _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty_actual)
 
             row["fill_analysis"] = {
