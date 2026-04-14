@@ -310,6 +310,64 @@ def _startup_warmup() -> None:
 
     threading.Thread(target=_vpn_watchdog, daemon=True, name="vpn_watchdog").start()
 
+    # API health watchdogs: poll Predict and Polymarket health endpoints.
+    # If either is down — create halt_api file and stop trading until recovery.
+    _halt_api_path = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl")).parent / "halt_api"
+    _api_check_interval = float(os.environ.get("API_HEALTH_CHECK_INTERVAL_SEC", "30") or "30")
+
+    _PREDICT_HEALTH_URL = "https://api.predict.fun/v1/health"
+    _POLY_HEALTH_URL = "https://clob.polymarket.com/health"
+
+    def _api_health_watchdog() -> None:
+        _was_down = _halt_api_path.exists()
+        _down_reason = ""
+        while True:
+            time.sleep(_api_check_interval)
+            _predict_ok = False
+            _poly_ok = False
+            _reason = ""
+            try:
+                _r = httpx.get(_PREDICT_HEALTH_URL, timeout=httpx.Timeout(8.0, connect=4.0))
+                _predict_ok = _r.status_code < 500
+            except Exception as _e:
+                _reason = f"predict: {_e}"
+                print(f"[TRADER][API_WATCHDOG] predict_health_failed err={_e}")
+            try:
+                _kw: dict = {}
+                if _proxy_url:
+                    _kw["proxy"] = _proxy_url
+                _r2 = httpx.get(_POLY_HEALTH_URL, timeout=httpx.Timeout(8.0, connect=4.0), **_kw)
+                _poly_ok = _r2.status_code < 500
+            except Exception as _e2:
+                if not _reason:
+                    _reason = f"poly: {_e2}"
+                print(f"[TRADER][API_WATCHDOG] poly_health_failed err={_e2}")
+
+            _all_ok = _predict_ok and _poly_ok
+            if not _all_ok and not _was_down:
+                _was_down = True
+                _down_reason = _reason or f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
+                _halt_api_path.write_text(_down_reason)
+                print(f"[TRADER][API_WATCHDOG] API DOWN — halt_api created reason={_down_reason}")
+                notify(
+                    "🔴 <b>API УПАЛ — БОТ ОСТАНОВЛЕН</b>\n"
+                    "\n"
+                    f"predict_ok={_predict_ok} poly_ok={_poly_ok}\n"
+                    f"<code>{_down_reason[:200]}</code>\n"
+                    f"Проверка каждые {_api_check_interval:.0f}s — возобновлю автоматически\n"
+                )
+            elif _all_ok and _was_down:
+                _was_down = False
+                _halt_api_path.unlink(missing_ok=True)
+                print("[TRADER][API_WATCHDOG] API RESTORED — halt_api removed")
+                notify(
+                    "🟢 <b>API ВОССТАНОВЛЕН — БОТ ВОЗОБНОВИЛ РАБОТУ</b>\n"
+                    "\n"
+                    "predict ✅  polymarket ✅\n"
+                )
+
+    threading.Thread(target=_api_health_watchdog, daemon=True, name="api_health_watchdog").start()
+
 
 # In-memory cooldown to prevent repeated buys during testing.
 _predict_market_last_buy_ts: dict[int, float] = {}
@@ -2709,6 +2767,12 @@ def opportunity(opp: Opportunity) -> dict:
     if _halt_vpn_path.exists():
         print(f"[TRADER] HALTED — VPN down, halt_vpn exists at {_halt_vpn_path}, skipping opportunity")
         return {"status": "halted", "reason": "vpn_down"}
+    # Check halt flag written by API health watchdog
+    _halt_api_path = _data_dir / "halt_api"
+    if _halt_api_path.exists():
+        _reason_text = _halt_api_path.read_text()[:80]
+        print(f"[TRADER] HALTED — API down, halt_api exists reason={_reason_text}")
+        return {"status": "halted", "reason": "api_down"}
 
     opp = _cap_opportunity(opp)
 
