@@ -650,16 +650,7 @@ def _late_fill_watcher() -> None:
                             f"hash={oh[:14]}... market_id={mkt_id} "
                             f"shares={entry.get('shares', '?')} age={age:.0f}s"
                         )
-                        notify(
-                            f"⚠️ <b>Late watch истёк — BSC тоже пустой</b>\n"
-                            f"\n"
-                            f"Predict API и BSC оба возвращают 0 за всё время наблюдения.\n"
-                            f"Вероятно, отмена прошла чисто — позиция не открыта.\n"
-                            f"\n"
-                            f"hash: <code>{oh[:18]}...</code>\n"
-                            f"market_id: <code>{mkt_id}</code>\n"
-                            f"shares (ожидалось): <b>{entry.get('shares', '?')}</b>\n"
-                        )
+                        # No notify — BSC empty = clean cancel, position not open
                     to_remove.append(oh)
                     continue
                 try:
@@ -2014,16 +2005,14 @@ def _place_predict_limit_buy(
             time.sleep(max(0.05, poll_interval_sec))
 
     if order_hash and need_final_get_check and not filled:
-        # poly_hedge_no_edge cancels: on-chain fill can arrive up to ~30s after
-        # API cancel (BSC block confirmation lag). Poll longer to catch ghost fills.
-        _is_hedge_cancel = (cancel_reason or "").startswith("poly_hedge_no_edge")
-        _FINAL_GET_RETRIES = 60 if _is_hedge_cancel else 3
-        _FINAL_GET_SLEEP_SEC = 1.0 if _is_hedge_cancel else 0.25
-        if _is_hedge_cancel:
-            print(
-                f"[PREDICT_LIMIT]{_trace} ghost_fill_watch hash={order_hash} "
-                f"cancel_reason={cancel_reason} polling up to {_FINAL_GET_RETRIES}s"
-            )
+        # ANY cancel: on-chain fill can arrive up to ~30s after cancel (BSC block lag).
+        # ghost_fill_watch applies to all cancel_reasons — not just poly_hedge_no_edge.
+        _FINAL_GET_RETRIES = 60
+        _FINAL_GET_SLEEP_SEC = 1.0
+        print(
+            f"[PREDICT_LIMIT]{_trace} ghost_fill_watch hash={order_hash} "
+            f"cancel_reason={cancel_reason} polling up to {_FINAL_GET_RETRIES}s"
+        )
         for _attempt in range(_FINAL_GET_RETRIES):
             try:
                 last_get = _predict_get_order_by_hash(_predict_monitor.get(), order_hash)
@@ -3088,11 +3077,13 @@ def opportunity(opp: Opportunity) -> dict:
                     except Exception as _ic_e:
                         print(f"[TRADER] insufficient_collateral_cancel_err={_ic_e}")
                 # Late-fill watch: ghost fill can arrive on BSC after the 60s ghost_fill_watch
-                # window. Register the hash for background monitoring up to 10 minutes.
+                # window. Register ALL cancelled orders for background monitoring up to 30 min.
+                # (Previously only poly_hedge_no_edge — but terminal_status:CANCELLED and
+                # replace_* cancels can also race with on-chain fills.)
                 _ba_cancel_rsn = _ba_quote_meta.get("cancel_reason") or ""
-                if pred_hash_ba and _ba_cancel_rsn.startswith("poly_hedge_no_edge") and pred_leg.market_id is not None:
+                if pred_hash_ba and _ba_cancel_rsn and pred_leg.market_id is not None:
                     _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
-                    print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}...")
+                    print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}... cancel_reason={_ba_cancel_rsn}")
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
 
