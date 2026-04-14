@@ -3498,46 +3498,15 @@ def opportunity(opp: Opportunity) -> dict:
                         "poly_fee_rate": _ba_fee_rate,
                     }
 
-                # ── Share-mismatch correction ──────────────────────────────────────────────
-                # Poly FOK is sized in USD → actual shares depend on execution price.
-                # takingAmount is GROSS before Poly fee; actual wallet = takingAmount × (1 − fee_rate × (1 − price)).
-                # Compare pred net vs poly actual to determine excess predict shares to sell back.
+                # Log mismatch for diagnostics (no correction — extra Predict shares are a bonus,
+                # not a risk: both legs pay out on resolution, just slightly asymmetric amounts).
                 _ba_mismatch_shares = _ba_net_sell_qty - _ba_poly_qty_actual
-                _BA_MISMATCH_MIN = float(os.environ.get("BA_MISMATCH_MIN_SHARES", "0.05") or "0.05")
-                _ba_mismatch_result: dict[str, Any] | None = None
-                if _ba_mismatch_shares > _BA_MISMATCH_MIN:
-                    _ba_fix_price = max(
-                        0.01,
-                        _ba_actual_pred_bid - float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
-                    )
-                    print(
-                        f"[TRADER] BA_MISMATCH_CORRECT label={opp.label} "
-                        f"pred_net={_ba_net_sell_qty:.4f} poly_actual={_ba_poly_qty_actual:.4f} poly_gross={_ba_poly_qty:.4f} "
-                        f"excess={_ba_mismatch_shares:.4f} sell_price={_ba_fix_price:.4f}"
-                    )
-                    try:
-                        _ba_mismatch_result = _place_predict_limit_sell(
-                            pred_leg,
-                            sell_qty=_ba_mismatch_shares,
-                            sell_price=_ba_fix_price,
-                            fill_timeout_sec=30.0,
-                            trace_id=trace_id,
-                        )
-                        _ba_fix_filled = _ba_mismatch_result.get("filled", False)
-                        _ba_fix_qty = float(_ba_mismatch_result.get("filled_qty") or 0.0)
-                        print(
-                            f"[TRADER] BA_MISMATCH_CORRECT_DONE label={opp.label} "
-                            f"fix_filled={_ba_fix_filled} fix_qty={_ba_fix_qty:.4f}"
-                        )
-                    except Exception as _ba_fix_err:
-                        print(f"[TRADER] BA_MISMATCH_CORRECT_ERROR label={opp.label} err={_ba_fix_err}")
                 row["mismatch_correction"] = {
                     "pred_net_qty": round(_ba_net_sell_qty, 6),
                     "poly_filled_qty_actual": round(_ba_poly_qty_actual, 6),
                     "poly_filled_qty_gross": round(_ba_poly_qty, 6),
                     "mismatch_shares": round(_ba_mismatch_shares, 6),
-                    "corrected": _ba_mismatch_shares > _BA_MISMATCH_MIN,
-                    "result": _ba_mismatch_result,
+                    "corrected": False,
                 }
 
                 _append_jsonl(trades_file, row)
@@ -3585,15 +3554,6 @@ def opportunity(opp: Opportunity) -> dict:
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
                 _h1_pnl, _h1_n = _pnl_last_hour()
-                # Build mismatch correction line for notify
-                _ba_mismatch_line = ""
-                if _ba_mismatch_shares > _BA_MISMATCH_MIN:
-                    _fix_r = _ba_mismatch_result or {}
-                    _fix_ok = "✅" if _fix_r.get("filled") else "❌"
-                    _fix_qty_n = float(_fix_r.get("filled_qty") or 0.0)
-                    _ba_mismatch_line = (
-                        f"<i>⚖️ mismatch {_ba_mismatch_shares:.3f}sh → sold {_fix_qty_n:.3f} {_fix_ok}</i>\n"
-                    )
 
                 _msg_id = notify(
                     f"{_title}\n"
@@ -3605,7 +3565,6 @@ def opportunity(opp: Opportunity) -> dict:
                     f"  {_ba_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_ba_poly_qty * _ba_poly_price:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
                     f"  {_ba_hedge_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_ba_hedge_qty * _ba_pred_price:.2f}</b>\n"
-                    + _ba_mismatch_line
                     + _poly_pos_line
                     + f"\n"
                     f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
