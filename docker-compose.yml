@@ -38,7 +38,7 @@ services:
       POLY_API_KEY: ${POLY_API_KEY}
       POLY_SECRET: ${POLY_SECRET}
       POLY_PASSPHRASE: ${POLY_PASSPHRASE}
-      PREDICT_API_KEY: ${PREDICT_API_KEY_2}
+      PREDICT_API_KEY: ${PREDICT_API_KEY}
       PREDICT_PRIVATE_KEY: ${PREDICT_PRIVATE_KEY}
       PREDICT_ACCOUNT: ${PREDICT_ACCOUNT:-}
       BOT_NOTIFY_URL: ${BOT_NOTIFY_URL:-http://bot:8080/notify}
@@ -100,7 +100,7 @@ services:
       - .env
     environment:
       ANALYZER_URL: http://analyzer:8000/ingest
-      PREDICT_API_KEY: ${PREDICT_API_KEY}
+      PREDICT_API_KEY: ${PREDICT_API_KEY_2}
     command: ["python", "-m", "collect.predict_orderbook"]
 
   claimer:
