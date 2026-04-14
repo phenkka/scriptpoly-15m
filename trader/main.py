@@ -3241,8 +3241,12 @@ def opportunity(opp: Opportunity) -> dict:
             # Step 3: FOK hedge on Polymarket — hedge actual filled quantity
             # Guard: partial fill may be below Poly's $1 min order.
             # Use net_sell_qty (gross minus predict fee) as the actual shares in wallet.
-            _ba_final_hedge_qty = _ba_net_sell_qty
-            _ba_hedge_cost_usd = _ba_net_sell_qty * (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+            # Poly LP fee reduces credited shares: actual = gross × (1 − fee_rate × (1 − price)).
+            # To receive exactly net_sell_qty shares after fee, inflate the order by 1/fee_factor.
+            _ba_hedge_vwap = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
+            _ba_poly_fee_factor = 1.0 - _ba_fee_rate * (1.0 - _ba_hedge_vwap)
+            _ba_final_hedge_qty = _ba_net_sell_qty / _ba_poly_fee_factor if _ba_poly_fee_factor > 0 else _ba_net_sell_qty
+            _ba_hedge_cost_usd = _ba_net_sell_qty * _ba_hedge_vwap  # cost based on desired net shares
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
             # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
             _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
@@ -3251,7 +3255,7 @@ def opportunity(opp: Opportunity) -> dict:
                     # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
                     # Add 2% buffer to ensure Poly's actual execution amount >= min after tick-rounding.
                     _ba_hedge_qty_orig = _ba_final_hedge_qty
-                    _ba_final_hedge_qty = (_poly_min_hedge * 1.02) / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+                    _ba_final_hedge_qty = (_poly_min_hedge * 1.02) / _ba_hedge_vwap
                     _ba_hedge_cost_usd = _poly_min_hedge * 1.02
                     print(
                         f"[TRADER] BID_ASK_OVER_HEDGE label={opp.label} "
@@ -3333,7 +3337,7 @@ def opportunity(opp: Opportunity) -> dict:
                     _append_jsonl(trades_file, row)
                     return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
 
-            _ba_hedge_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
+            _ba_hedge_price = _ba_hedge_vwap
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
             )
@@ -3407,7 +3411,12 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
             except (ValueError, TypeError):
                 pass
-            _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty)
+            # takingAmount is GROSS shares before Poly fee deduction from your wallet.
+            # Actual credited shares = takingAmount × (1 − fee_rate × (1 − price)).
+            # Example: 15.0625 × (1 − 0.072 × 0.68) = 15.0625 × 0.9510 ≈ 14.3 shares.
+            _ba_poly_price_for_fee = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
+            _ba_poly_qty_actual = _ba_poly_qty * (1.0 - _ba_fee_rate * (1.0 - _ba_poly_price_for_fee))
+            _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty_actual)
 
             row["fill_analysis"] = {
                 "unhedged_ms": row["timing"].get("unhedged_ms"),
@@ -3417,7 +3426,8 @@ def opportunity(opp: Opportunity) -> dict:
                 "first_fill_qty": round(_ba_hedge_qty, 6),
                 "residual_unhedged_qty": round(_ba_residual, 6),
                 "pred_filled_qty": round(_ba_hedge_qty, 6),
-                "poly_filled_qty": round(_ba_poly_qty, 6),
+                "poly_filled_qty": round(_ba_poly_qty_actual, 6),
+                "poly_filled_qty_gross": round(_ba_poly_qty, 6),
                 "requested_qty": round(float(opp.shares), 6),
                 "partial_fill_count": len(_ba_partial_fills),
                 "replace_count": _ba_quote_meta.get("replace_count"),
@@ -3432,7 +3442,7 @@ def opportunity(opp: Opportunity) -> dict:
             print(
                 f"[TRADER] bid_ask_poly_done success={poly_filled_ba} "
                 f"status={_ba_poly_resp.get('status')} making={_ba_poly_resp.get('makingAmount')} "
-                f"taking={_ba_poly_resp.get('takingAmount')} "
+                f"taking={_ba_poly_resp.get('takingAmount')} taking_actual={_ba_poly_qty_actual:.4f} "
                 f"txhashes={len(_ba_poly_txhashes)} "
                 f"pred_filled={_ba_hedge_qty:.4f} residual={_ba_residual:.4f}"
             )
@@ -3490,9 +3500,9 @@ def opportunity(opp: Opportunity) -> dict:
 
                 # ── Share-mismatch correction ──────────────────────────────────────────────
                 # Poly FOK is sized in USD → actual shares depend on execution price.
-                # If Poly got fewer shares than Predict net (slippage), sell back the excess
-                # Predict shares so both legs carry equal exposure and P&L is symmetric.
-                _ba_mismatch_shares = _ba_net_sell_qty - _ba_poly_qty
+                # takingAmount is GROSS before Poly fee; actual wallet = takingAmount × (1 − fee_rate × (1 − price)).
+                # Compare pred net vs poly actual to determine excess predict shares to sell back.
+                _ba_mismatch_shares = _ba_net_sell_qty - _ba_poly_qty_actual
                 _BA_MISMATCH_MIN = float(os.environ.get("BA_MISMATCH_MIN_SHARES", "0.05") or "0.05")
                 _ba_mismatch_result: dict[str, Any] | None = None
                 if _ba_mismatch_shares > _BA_MISMATCH_MIN:
@@ -3502,7 +3512,7 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                     print(
                         f"[TRADER] BA_MISMATCH_CORRECT label={opp.label} "
-                        f"pred_net={_ba_net_sell_qty:.4f} poly_filled={_ba_poly_qty:.4f} "
+                        f"pred_net={_ba_net_sell_qty:.4f} poly_actual={_ba_poly_qty_actual:.4f} poly_gross={_ba_poly_qty:.4f} "
                         f"excess={_ba_mismatch_shares:.4f} sell_price={_ba_fix_price:.4f}"
                     )
                     try:
@@ -3523,7 +3533,8 @@ def opportunity(opp: Opportunity) -> dict:
                         print(f"[TRADER] BA_MISMATCH_CORRECT_ERROR label={opp.label} err={_ba_fix_err}")
                 row["mismatch_correction"] = {
                     "pred_net_qty": round(_ba_net_sell_qty, 6),
-                    "poly_filled_qty": round(_ba_poly_qty, 6),
+                    "poly_filled_qty_actual": round(_ba_poly_qty_actual, 6),
+                    "poly_filled_qty_gross": round(_ba_poly_qty, 6),
                     "mismatch_shares": round(_ba_mismatch_shares, 6),
                     "corrected": _ba_mismatch_shares > _BA_MISMATCH_MIN,
                     "result": _ba_mismatch_result,
