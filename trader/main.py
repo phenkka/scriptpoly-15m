@@ -3044,7 +3044,7 @@ def opportunity(opp: Opportunity) -> dict:
                 # window. Register the hash for background monitoring up to 10 minutes.
                 _ba_cancel_rsn = _ba_quote_meta.get("cancel_reason") or ""
                 if pred_hash_ba and _ba_cancel_rsn.startswith("poly_hedge_no_edge") and pred_leg.market_id is not None:
-                    _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), pred_leg.token_id, float(opp.shares))
+                    _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
                     print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}...")
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
