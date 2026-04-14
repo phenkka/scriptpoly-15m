@@ -279,10 +279,19 @@ _late_watch_file_lock = _threading.Lock()
 # ── BSC direct verification ──────────────────────────────────────────────────
 # CTF Exchange contract on BSC Mainnet (source: predict_sdk/constants.py)
 _BSC_CTF_EXCHANGE = "0x8BC070BEdAB741406F4B1Eb65A72bee27894B689"
-# Public BSC RPC — no API key required (source: predict_sdk/constants.py)
-_BSC_RPC = "https://bsc-dataseed.bnbchain.org/"
-# keccak256 topic for OrderFilled event — computed once on first use
-_ORDER_FILLED_TOPIC: str | None = None
+# Public BSC RPCs — tried in order on failure
+# NOTE: eth_getLogs is disabled on all public BSC RPCs (returns -32005).
+#       We use eth_call with getOrderStatus(bytes32) instead.
+_BSC_RPCS = [
+    "https://bsc-dataseed.bnbchain.org/",
+    "https://bsc-dataseed1.defibit.io/",
+    "https://bsc-dataseed2.defibit.io/",
+    "https://bsc-dataseed1.ninicoin.io/",
+]
+# Also check NegRisk exchange (some Predict markets route through it)
+_BSC_NEG_RISK_CTF_EXCHANGE = "0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A"
+# keccak256("getOrderStatus(bytes32)")[:4] — computed once on first use
+_ORDER_STATUS_SELECTOR: str | None = None
 # State for grouping repeated HEDGE FILLED notifications in the same market
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
@@ -465,75 +474,63 @@ def _auto_hedge_late_fill(token_id: str | None, shares: float, market_id: int) -
         return f"error:{_e}"
 
 
-def _bsc_get_order_filled_shares(order_hash_hex: str, order_ts: float) -> float:
-    """Query BSC CTF Exchange for OrderFilled events matching the given order hash.
+def _bsc_check_order_filled(order_hash_hex: str, entry_shares: float) -> float:
+    """Check if a Predict order was fully filled on BSC via eth_call to getOrderStatus.
 
-    Returns takerAmountFilled in shares (1e18 scale) if the order was filled on-chain,
-    0.0 if not found or on any error. Uses public BSC RPC — no API key needed.
+    Uses CTFExchange.getOrderStatus(bytes32) → (bool isFilledOrCancelled, uint256 remaining).
+    eth_getLogs is NOT used — public BSC RPCs reject it with -32005 (limit exceeded).
 
-    Event layout (CTFExchange.json ABI):
-        OrderFilled(bytes32 indexed orderHash, address indexed maker,
-                    address indexed taker, uint256 makerAssetId,
-                    uint256 takerAssetId, uint256 makerAmountFilled,
-                    uint256 takerAmountFilled, uint256 fee)
-    Non-indexed data: [makerAssetId(32), takerAssetId(32),
-                       makerAmountFilled(32), takerAmountFilled(32), fee(32)]
-    → takerAmountFilled is at bytes [96:128].
+    Predict uses OFF-CHAIN cancellations (no on-chain cancelOrder tx), so:
+      {isFilledOrCancelled=true, remaining=0} → order was FULLY FILLED on-chain.
+      {isFilledOrCancelled=false, remaining=0} → never touched on-chain (cancelled off-chain).
+      {isFilledOrCancelled=true, remaining>0} → cancelled on-chain after partial fill.
+      {isFilledOrCancelled=false, remaining>0} → partially filled, still open.
 
-    BSC block time ≈ 3 seconds. Search window covers order_ts → now + 200-block buffer.
+    Returns entry_shares if fully filled, 0.0 otherwise or on any error.
+    Checks both CTF Exchange and NegRisk CTF Exchange.
     """
-    global _ORDER_FILLED_TOPIC
+    global _ORDER_STATUS_SELECTOR
     try:
-        if _ORDER_FILLED_TOPIC is None:
+        if _ORDER_STATUS_SELECTOR is None:
             from eth_utils import keccak as eth_keccak
-            sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
-            _ORDER_FILLED_TOPIC = "0x" + eth_keccak(text=sig).hex()
+            _ORDER_STATUS_SELECTOR = "0x" + eth_keccak(text="getOrderStatus(bytes32)")[:4].hex()
 
-        # Current block number
-        block_resp = requests.post(
-            _BSC_RPC,
-            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
-            timeout=5,
-        )
-        current_block = int(block_resp.json()["result"], 16)
-
-        # from_block: approximate BSC block at order_ts (~3s/block, +200 safety buffer)
-        now = time.time()
-        blocks_elapsed = int((now - order_ts) / 3) + 200
-        from_block = max(0, current_block - blocks_elapsed)
-
-        # Format orderHash as 0x + 64 hex chars (bytes32 topic)
         if not order_hash_hex.startswith("0x"):
             order_hash_hex = "0x" + order_hash_hex
-        order_hash_padded = "0x" + order_hash_hex[2:].zfill(64)
+        call_data = _ORDER_STATUS_SELECTOR + order_hash_hex[2:].zfill(64)
 
-        logs_resp = requests.post(
-            _BSC_RPC,
-            json={
-                "jsonrpc": "2.0",
-                "method": "eth_getLogs",
-                "params": [{
-                    "address": _BSC_CTF_EXCHANGE,
-                    "topics": [_ORDER_FILLED_TOPIC, order_hash_padded],
-                    "fromBlock": hex(from_block),
-                    "toBlock": "latest",
-                }],
-                "id": 2,
-            },
-            timeout=8,
-        )
-        result = logs_resp.json()
-        if "error" in result:
-            print(f"[TRADER][BSC_CHECK] rpc_error={result['error']}")
-            return 0.0
-        logs = result.get("result", [])
-        if logs:
-            data_hex = logs[0]["data"]
-            if isinstance(data_hex, str) and data_hex.startswith("0x"):
-                data_hex = data_hex[2:]
-            data_bytes = bytes.fromhex(data_hex)
-            taker_amount_wei = int.from_bytes(data_bytes[96:128], "big")
-            return taker_amount_wei / 1e18
+        contracts = [_BSC_CTF_EXCHANGE, _BSC_NEG_RISK_CTF_EXCHANGE]
+        for _rpc in _BSC_RPCS:
+            for _contract in contracts:
+                try:
+                    resp = requests.post(
+                        _rpc,
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "eth_call",
+                            "params": [{"to": _contract, "data": call_data}, "latest"],
+                            "id": 1,
+                        },
+                        timeout=5,
+                    )
+                    result = resp.json()
+                    if "error" in result:
+                        continue
+                    raw = result.get("result", "")
+                    if len(raw) < 2 + 128:  # 0x + 2×32bytes
+                        continue
+                    raw_bytes = bytes.fromhex(raw[2:])
+                    is_fc = bool(int.from_bytes(raw_bytes[0:32], "big"))
+                    remaining = int.from_bytes(raw_bytes[32:64], "big")
+                    if is_fc and remaining == 0:
+                        # Fully filled on-chain
+                        cname = "CTF" if _contract == _BSC_CTF_EXCHANGE else "NEG_RISK"
+                        print(f"[TRADER][BSC_CHECK] FILLED hash={order_hash_hex[:18]}... contract={cname}")
+                        return entry_shares
+                except Exception:
+                    continue
+            # If we got a valid response from first RPC that wasn't filled, stop
+            break
     except Exception as _e:
         print(f"[TRADER][BSC_CHECK] err={_e}")
     return 0.0
@@ -578,9 +575,9 @@ def _late_fill_watcher() -> None:
                 if float(entry.get("ts", 0)) < cutoff:
                     # Entry expired after _MAX_WATCH_SEC — Predict API never showed a fill.
                     # Do a final BSC on-chain check to distinguish:
-                    #   - real fill (BSC logs exist) → strong alert, unhedged position
-                    #   - clean cancel (no BSC logs) → mild alert, position likely not open
-                    bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
+                    #   - real fill (is_fc=True, remaining=0) → strong alert, unhedged position
+                    #   - clean cancel (never seen on-chain) → mild alert, position likely not open
+                    bsc_shares = _bsc_check_order_filled(oh, float(entry.get("shares", 0)))
                     if bsc_shares > 0:
                         _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
@@ -639,7 +636,7 @@ def _late_fill_watcher() -> None:
                     else:
                         # Predict API still shows 0 — check BSC directly as fallback.
                         # The API indexer can lag on-chain confirms by several minutes.
-                        bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
+                        bsc_shares = _bsc_check_order_filled(oh, float(entry.get("shares", 0)))
                         if bsc_shares > 0:
                             _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                             print(
