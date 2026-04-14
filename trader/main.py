@@ -276,6 +276,13 @@ _inflight_orders_file_lock = _threading.Lock()
 # key: order_hash  value: {order_hash, market_id, token_id, shares, ts}
 _LATE_WATCH_FILE = Path("/data/predict_late_watch.json")
 _late_watch_file_lock = _threading.Lock()
+# ── BSC direct verification ──────────────────────────────────────────────────
+# CTF Exchange contract on BSC Mainnet (source: predict_sdk/constants.py)
+_BSC_CTF_EXCHANGE = "0x8BC070BEdAB741406F4B1Eb65A72bee27894B689"
+# Public BSC RPC — no API key required (source: predict_sdk/constants.py)
+_BSC_RPC = "https://bsc-dataseed.bnbchain.org/"
+# keccak256 topic for OrderFilled event — computed once on first use
+_ORDER_FILLED_TOPIC: str | None = None
 # State for grouping repeated HEDGE FILLED notifications in the same market
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
@@ -422,6 +429,80 @@ def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shar
         print(f"[TRADER] late_watch_save error={_e}")
 
 
+def _bsc_get_order_filled_shares(order_hash_hex: str, order_ts: float) -> float:
+    """Query BSC CTF Exchange for OrderFilled events matching the given order hash.
+
+    Returns takerAmountFilled in shares (1e18 scale) if the order was filled on-chain,
+    0.0 if not found or on any error. Uses public BSC RPC — no API key needed.
+
+    Event layout (CTFExchange.json ABI):
+        OrderFilled(bytes32 indexed orderHash, address indexed maker,
+                    address indexed taker, uint256 makerAssetId,
+                    uint256 takerAssetId, uint256 makerAmountFilled,
+                    uint256 takerAmountFilled, uint256 fee)
+    Non-indexed data: [makerAssetId(32), takerAssetId(32),
+                       makerAmountFilled(32), takerAmountFilled(32), fee(32)]
+    → takerAmountFilled is at bytes [96:128].
+
+    BSC block time ≈ 3 seconds. Search window covers order_ts → now + 200-block buffer.
+    """
+    global _ORDER_FILLED_TOPIC
+    try:
+        if _ORDER_FILLED_TOPIC is None:
+            from eth_utils import keccak as eth_keccak
+            sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+            _ORDER_FILLED_TOPIC = "0x" + eth_keccak(text=sig).hex()
+
+        # Current block number
+        block_resp = requests.post(
+            _BSC_RPC,
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=5,
+        )
+        current_block = int(block_resp.json()["result"], 16)
+
+        # from_block: approximate BSC block at order_ts (~3s/block, +200 safety buffer)
+        now = time.time()
+        blocks_elapsed = int((now - order_ts) / 3) + 200
+        from_block = max(0, current_block - blocks_elapsed)
+
+        # Format orderHash as 0x + 64 hex chars (bytes32 topic)
+        if not order_hash_hex.startswith("0x"):
+            order_hash_hex = "0x" + order_hash_hex
+        order_hash_padded = "0x" + order_hash_hex[2:].zfill(64)
+
+        logs_resp = requests.post(
+            _BSC_RPC,
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_getLogs",
+                "params": [{
+                    "address": _BSC_CTF_EXCHANGE,
+                    "topics": [_ORDER_FILLED_TOPIC, order_hash_padded],
+                    "fromBlock": hex(from_block),
+                    "toBlock": "latest",
+                }],
+                "id": 2,
+            },
+            timeout=8,
+        )
+        result = logs_resp.json()
+        if "error" in result:
+            print(f"[TRADER][BSC_CHECK] rpc_error={result['error']}")
+            return 0.0
+        logs = result.get("result", [])
+        if logs:
+            data_hex = logs[0]["data"]
+            if isinstance(data_hex, str) and data_hex.startswith("0x"):
+                data_hex = data_hex[2:]
+            data_bytes = bytes.fromhex(data_hex)
+            taker_amount_wei = int.from_bytes(data_bytes[96:128], "big")
+            return taker_amount_wei / 1e18
+    except Exception as _e:
+        print(f"[TRADER][BSC_CHECK] err={_e}")
+    return 0.0
+
+
 def _late_fill_watcher() -> None:
     """Background thread: checks cancelled Predict order hashes for late fills.
 
@@ -431,7 +512,7 @@ def _late_fill_watcher() -> None:
     the position on Predict is unhedged and requires manual intervention.
     """
     _POLL_INTERVAL = 15.0
-    _MAX_WATCH_SEC = 600  # 10 minutes
+    _MAX_WATCH_SEC = 1800  # 30 minutes — Predict API can lag BSC by several minutes
     while True:
         time.sleep(_POLL_INTERVAL)
         try:
@@ -457,7 +538,48 @@ def _late_fill_watcher() -> None:
 
             for oh, entry in list(data.items()):
                 age = now - float(entry.get("ts", 0))
+                mkt_id = entry.get("market_id", "?")
                 if float(entry.get("ts", 0)) < cutoff:
+                    # Entry expired after _MAX_WATCH_SEC — Predict API never showed a fill.
+                    # Do a final BSC on-chain check to distinguish:
+                    #   - real fill (BSC logs exist) → strong alert, unhedged position
+                    #   - clean cancel (no BSC logs) → mild alert, position likely not open
+                    bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
+                    if bsc_shares > 0:
+                        print(
+                            f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_CONFIRMED_ON_EXPIRY "
+                            f"hash={oh[:14]}... market_id={mkt_id} "
+                            f"bsc_shares={bsc_shares:.4f} age={age:.0f}s"
+                        )
+                        notify(
+                            f"🔴🔴🔴 <b>BSC ПОДТВЕРДИЛ FILL (watch истёк)!</b>\n"
+                            f"\n"
+                            f"Ордер заполнился на BSC, но Predict API 30 мин показывал 0.\n"
+                            f"Позиция на Predict <b>НЕ захеджирована</b>!\n"
+                            f"\n"
+                            f"hash: <code>{oh[:18]}...</code>\n"
+                            f"market_id: <code>{mkt_id}</code>\n"
+                            f"shares (BSC on-chain): <b>{bsc_shares:.3f}</b>\n"
+                            f"возраст: {age:.0f}s\n"
+                            f"\n"
+                            f"⚠️ Закрой позицию на Predict вручную!"
+                        )
+                    else:
+                        print(
+                            f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
+                            f"hash={oh[:14]}... market_id={mkt_id} "
+                            f"shares={entry.get('shares', '?')} age={age:.0f}s"
+                        )
+                        notify(
+                            f"⚠️ <b>Late watch истёк — BSC тоже пустой</b>\n"
+                            f"\n"
+                            f"Predict API и BSC оба возвращают 0 за всё время наблюдения.\n"
+                            f"Вероятно, отмена прошла чисто — позиция не открыта.\n"
+                            f"\n"
+                            f"hash: <code>{oh[:18]}...</code>\n"
+                            f"market_id: <code>{mkt_id}</code>\n"
+                            f"shares (ожидалось): <b>{entry.get('shares', '?')}</b>\n"
+                        )
                     to_remove.append(oh)
                     continue
                 try:
@@ -465,9 +587,8 @@ def _late_fill_watcher() -> None:
                     filled_wei = _parse_predict_filled_wei(resp)
                     if filled_wei > 0:
                         shares = filled_wei / 10 ** 18
-                        mkt_id = entry.get("market_id", "?")
                         print(
-                            f"[TRADER][LATE_WATCH] ⚠️ LATE GHOST FILL DETECTED "
+                            f"[TRADER][LATE_WATCH] ⚠️ LATE GHOST FILL DETECTED (API) "
                             f"hash={oh[:14]}... market_id={mkt_id} "
                             f"shares={shares:.4f} age={age:.0f}s"
                         )
@@ -483,6 +604,30 @@ def _late_fill_watcher() -> None:
                             f"Закрой позицию вручную."
                         )
                         to_remove.append(oh)
+                    else:
+                        # Predict API still shows 0 — check BSC directly as fallback.
+                        # The API indexer can lag on-chain confirms by several minutes.
+                        bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
+                        if bsc_shares > 0:
+                            print(
+                                f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_DETECTED (API lag!) "
+                                f"hash={oh[:14]}... market_id={mkt_id} "
+                                f"bsc_shares={bsc_shares:.4f} age={age:.0f}s"
+                            )
+                            notify(
+                                f"🔴🔴🔴 <b>BSC FILL — API ЛАГ!</b>\n"
+                                f"\n"
+                                f"BSC подтвердил fill, но Predict API возвращает amountFilled=0.\n"
+                                f"Позиция на Predict <b>НЕ захеджирована</b>!\n"
+                                f"\n"
+                                f"hash: <code>{oh[:18]}...</code>\n"
+                                f"market_id: <code>{mkt_id}</code>\n"
+                                f"shares (BSC on-chain): <b>{bsc_shares:.3f}</b>\n"
+                                f"возраст: {age:.0f}s\n"
+                                f"\n"
+                                f"⚠️ Закрой позицию на Predict вручную!"
+                            )
+                            to_remove.append(oh)
                 except Exception as _pe:
                     print(f"[TRADER][LATE_WATCH] check_error hash={oh[:14]} err={_pe}")
 
