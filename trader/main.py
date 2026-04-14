@@ -429,6 +429,42 @@ def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shar
         print(f"[TRADER] late_watch_save error={_e}")
 
 
+def _auto_hedge_late_fill(token_id: str | None, shares: float, market_id: int) -> str:
+    """Emergency Poly hedge after detecting a late BSC fill.
+
+    Fetches live Poly orderbook, computes VWAP, places FOK market buy (fak_fallback=True).
+    Returns a short status string for logging/notify.
+    """
+    if not token_id:
+        return "skip:no_token_id"
+    if shares <= 0:
+        return "skip:shares=0"
+    try:
+        book = _polymarket_book(token_id)
+        vwap = _vwap_from_poly_book(book, shares)
+        if vwap is None or vwap <= 0:
+            return "skip:no_liquidity"
+        stake_usd = shares * vwap * 1.02  # 2% slippage buffer
+        leg = OpportunityLeg(
+            source="late_fill_recovery",
+            side="BUY",
+            ts=datetime.utcnow().isoformat(),
+            ask=vwap,
+            ask_sz=shares,
+            pool_usd=0.0,
+            shares=shares,
+            stake_usd=stake_usd,
+            token_id=token_id,
+            market_id=market_id,
+        )
+        result = _place_polymarket_fok_market_buy(leg, fak_fallback=True)
+        resp = result.get("response") or {}
+        status = resp.get("status", "?")
+        return f"ok:{status} stake=${stake_usd:.2f} vwap={vwap:.4f}"
+    except Exception as _e:
+        return f"error:{_e}"
+
+
 def _bsc_get_order_filled_shares(order_hash_hex: str, order_ts: float) -> float:
     """Query BSC CTF Exchange for OrderFilled events matching the given order hash.
 
@@ -546,23 +582,20 @@ def _late_fill_watcher() -> None:
                     #   - clean cancel (no BSC logs) → mild alert, position likely not open
                     bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
                     if bsc_shares > 0:
+                        _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
                             f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_CONFIRMED_ON_EXPIRY "
                             f"hash={oh[:14]}... market_id={mkt_id} "
-                            f"bsc_shares={bsc_shares:.4f} age={age:.0f}s"
+                            f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
                         notify(
-                            f"🔴🔴🔴 <b>BSC ПОДТВЕРДИЛ FILL (watch истёк)!</b>\n"
+                            f"🔴 <b>BSC FILL подтверждён (watch истёк) — авто-хедж</b>\n"
                             f"\n"
-                            f"Ордер заполнился на BSC, но Predict API 30 мин показывал 0.\n"
-                            f"Позиция на Predict <b>НЕ захеджирована</b>!\n"
+                            f"BSC: fill {bsc_shares:.3f} шар, Predict API 30 мин показывал 0.\n"
                             f"\n"
                             f"hash: <code>{oh[:18]}...</code>\n"
                             f"market_id: <code>{mkt_id}</code>\n"
-                            f"shares (BSC on-chain): <b>{bsc_shares:.3f}</b>\n"
-                            f"возраст: {age:.0f}s\n"
-                            f"\n"
-                            f"⚠️ Закрой позицию на Predict вручную!"
+                            f"Poly хедж: <code>{_hedge_st}</code>\n"
                         )
                     else:
                         print(
@@ -587,21 +620,20 @@ def _late_fill_watcher() -> None:
                     filled_wei = _parse_predict_filled_wei(resp)
                     if filled_wei > 0:
                         shares = filled_wei / 10 ** 18
+                        _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
                             f"[TRADER][LATE_WATCH] ⚠️ LATE GHOST FILL DETECTED (API) "
                             f"hash={oh[:14]}... market_id={mkt_id} "
-                            f"shares={shares:.4f} age={age:.0f}s"
+                            f"shares={shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
                         notify(
-                            f"🔴🔴🔴 <b>LATE GHOST FILL — НЕ ЗАХЕДЖИРОВАНО!</b>\n"
+                            f"🟡 <b>Late ghost fill — авто-хедж запущен</b>\n"
                             f"\n"
-                            f"Ордер на Predict заполнился ПОСЛЕ отмены (+{age:.0f}s)\n"
+                            f"Predict API показал fill +{age:.0f}s после отмены.\n"
                             f"hash: <code>{oh[:18]}...</code>\n"
                             f"market_id: <code>{mkt_id}</code>\n"
                             f"shares: <b>{shares:.3f}</b>\n"
-                            f"\n"
-                            f"⚠️ Позиция на Predict <b>НЕ захеджирована</b>!\n"
-                            f"Закрой позицию вручную."
+                            f"Poly хедж: <code>{_hedge_st}</code>\n"
                         )
                         to_remove.append(oh)
                     else:
@@ -609,23 +641,19 @@ def _late_fill_watcher() -> None:
                         # The API indexer can lag on-chain confirms by several minutes.
                         bsc_shares = _bsc_get_order_filled_shares(oh, float(entry.get("ts", now)))
                         if bsc_shares > 0:
+                            _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                             print(
                                 f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_DETECTED (API lag!) "
                                 f"hash={oh[:14]}... market_id={mkt_id} "
-                                f"bsc_shares={bsc_shares:.4f} age={age:.0f}s"
+                                f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                             )
                             notify(
-                                f"🔴🔴🔴 <b>BSC FILL — API ЛАГ!</b>\n"
+                                f"🔴 <b>BSC fill (API лаг) — авто-хедж запущен</b>\n"
                                 f"\n"
-                                f"BSC подтвердил fill, но Predict API возвращает amountFilled=0.\n"
-                                f"Позиция на Predict <b>НЕ захеджирована</b>!\n"
-                                f"\n"
+                                f"BSC: fill {bsc_shares:.3f} шар, Predict API lag = {age:.0f}s.\n"
                                 f"hash: <code>{oh[:18]}...</code>\n"
                                 f"market_id: <code>{mkt_id}</code>\n"
-                                f"shares (BSC on-chain): <b>{bsc_shares:.3f}</b>\n"
-                                f"возраст: {age:.0f}s\n"
-                                f"\n"
-                                f"⚠️ Закрой позицию на Predict вручную!"
+                                f"Poly хедж: <code>{_hedge_st}</code>\n"
                             )
                             to_remove.append(oh)
                 except Exception as _pe:
