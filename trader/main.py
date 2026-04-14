@@ -143,7 +143,57 @@ class _PredictClient:
             self._market_cache.pop(market_id, None)
 
 
+class _PredictMonitorSession:
+    """Read-only сессия на PREDICT_API_KEY_2 для мониторинговых запросов.
+
+    Используется в ghost_fill_watch и _late_fill_watcher чтобы не расходовать
+    лимиты основного ключа (KEY_1: 500 req/min) на поллинг статуса ордеров.
+    KEY_2 имеет 1000 req/min. JWT получается через тот же приватный ключ.
+    Если KEY_2 не задан, автоматически деградирует на основную сессию KEY_1.
+    """
+
+    _JWT_TTL_SEC = 3 * 3600
+
+    def __init__(self) -> None:
+        self._lock = _threading.Lock()
+        self._session: requests.Session | None = None
+        self._jwt: str | None = None
+        self._jwt_ts: float = 0.0
+
+    def get(self) -> requests.Session:
+        with self._lock:
+            key2 = os.environ.get("PREDICT_API_KEY_2", "").strip()
+            if not key2:
+                # No KEY_2 — reuse main client session (already has JWT)
+                session, _ = _predict_client.get()
+                return session
+
+            if self._session is None:
+                s = requests.Session()
+                s.headers.update({"Accept": "application/json", "x-api-key": key2})
+                proxy = os.environ.get("PREDICT_PROXY_URL", "").strip()
+                if proxy:
+                    s.proxies.update({"http": proxy, "https": proxy})
+                self._session = s
+
+            now = time.time()
+            if self._jwt is None or (now - self._jwt_ts) > self._JWT_TTL_SEC:
+                private_key = _normalize_hex_key(os.environ.get("PREDICT_PRIVATE_KEY", ""))
+                predict_account = os.environ.get("PREDICT_ACCOUNT", "").strip() or None
+                _, builder = _predict_client.get()
+                self._jwt = _predict_get_jwt(
+                    self._session, private_key,
+                    predict_account=predict_account, builder=builder
+                )
+                self._session.headers.update({"Authorization": f"Bearer {self._jwt}"})
+                self._jwt_ts = now
+                print("[TRADER] predict_monitor_session: JWT refreshed using KEY_2")
+
+            return self._session
+
+
 _predict_client = _PredictClient()
+_predict_monitor = _PredictMonitorSession()
 
 
 class OpportunityLeg(BaseModel):
@@ -564,9 +614,9 @@ def _late_fill_watcher() -> None:
             cutoff = now - _MAX_WATCH_SEC
             to_remove: list[str] = []
             try:
-                session, _ = _predict_client.get()
+                session = _predict_monitor.get()
             except Exception as _se:
-                print(f"[TRADER][LATE_WATCH] predict_client error={_se}")
+                print(f"[TRADER][LATE_WATCH] predict_monitor error={_se}")
                 continue
 
             for oh, entry in list(data.items()):
@@ -1976,7 +2026,7 @@ def _place_predict_limit_buy(
             )
         for _attempt in range(_FINAL_GET_RETRIES):
             try:
-                last_get = _predict_get_order_by_hash(session, order_hash)
+                last_get = _predict_get_order_by_hash(_predict_monitor.get(), order_hash)
                 _final_filled_wei = _get_filled_wei(last_get)
                 if _final_filled_wei > prev_filled_wei:
                     delta_wei = _final_filled_wei - prev_filled_wei
