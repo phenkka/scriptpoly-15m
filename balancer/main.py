@@ -170,6 +170,20 @@ def _settings_float(name: str, default: float) -> float:
     return _env_float(name, default)
 
 
+def _settings_bool(name: str, default: bool) -> bool:
+    """Read bool from /data/settings.json, fall back to env, then default."""
+    try:
+        data = json.loads(_SETTINGS_FILE.read_text())
+        if name in data:
+            v = data[name]
+            if isinstance(v, bool):
+                return v
+            return str(v).lower() in ("true", "1", "yes")
+    except Exception:
+        pass
+    return _env_bool(name, default)
+
+
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     if v is None or not v.strip():
@@ -928,6 +942,9 @@ def main() -> None:
         # Re-read configurable thresholds each cycle so bot /settings changes take effect
         threshold_usd = _settings_float("BALANCER_THRESHOLD_USD", 10.0)
         target_usd = _settings_float("BALANCER_TARGET_USD", 25.0)
+        _transfers = _settings_bool("BALANCER_ENABLE_TRANSFERS", enable_transfers)
+        enable_bsc_to_poly = _settings_bool("BALANCER_ENABLE_BSC_TO_POLY", _transfers)
+        enable_poly_to_bsc = _settings_bool("BALANCER_ENABLE_POLY_TO_BSC", _transfers)
         try:
             w3_bsc, bsc_rpc_used = _get_web3(bsc_rpcs)
             w3_poly, poly_rpc_used = _get_web3(polygon_rpcs)

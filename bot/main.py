@@ -74,6 +74,8 @@ PAGE_GROUPS: list[tuple[str, list[tuple[str, str, str, Any]]]] = [
         ("POLY_RESERVE_USD",                   "Poly reserve $",       "float", 0.75),
         ("BALANCER_THRESHOLD_USD",             "Rebalance threshold $", "float", 10.0),
         ("BALANCER_TARGET_USD",                "Rebalance target $",   "float", 25.0),
+        ("BALANCER_ENABLE_TRANSFERS",          "Enable transfers",     "bool",  False),
+        ("BOT_STOP_TOTAL_USD",                 "Stop bot below $",     "float", 25.0),
     ]),
     ("🚦 Limits", [
         ("POLY_BANK_UTIL_MAX",                 "Poly util max",        "float", 0.85),
@@ -81,7 +83,6 @@ PAGE_GROUPS: list[tuple[str, list[tuple[str, str, str, Any]]]] = [
         ("MIN_STAKE_USD",                      "Min stake $",          "float", 1.0),
         ("POLY_MIN_ORDER_USD",                 "Poly min order $",     "float", 1.0),
         ("PREDICT_MIN_ORDER_USD",              "Pred min order $",     "float", 0.9),
-        ("BOT_STOP_TOTAL_USD",                 "Stop bot below $",     "float", 25.0),
     ]),
     ("⏱ Timers", [
         ("PREDICT_LIMIT_FILL_TIMEOUT_SEC",     "Limit fill timeout s", "float", 30.0),

@@ -3234,7 +3234,9 @@ def opportunity(opp: Opportunity) -> dict:
 
             # Step 3: FOK hedge on Polymarket — hedge actual filled quantity
             # Guard: partial fill may be below Poly's $1 min order.
-            _ba_hedge_cost_usd = _ba_hedge_qty * (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+            # Use net_sell_qty (gross minus predict fee) as the actual shares in wallet.
+            _ba_final_hedge_qty = _ba_net_sell_qty
+            _ba_hedge_cost_usd = _ba_net_sell_qty * (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
             # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
             _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
@@ -3242,12 +3244,12 @@ def opportunity(opp: Opportunity) -> dict:
                 if _ba_hedge_cost_usd >= _poly_over_hedge_threshold:
                     # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
                     # Add 2% buffer to ensure Poly's actual execution amount >= min after tick-rounding.
-                    _ba_hedge_qty_orig = _ba_hedge_qty
-                    _ba_hedge_qty = (_poly_min_hedge * 1.02) / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
+                    _ba_hedge_qty_orig = _ba_final_hedge_qty
+                    _ba_final_hedge_qty = (_poly_min_hedge * 1.02) / (_live_vwap_ba if _live_vwap_ba else float(poly_leg.ask))
                     _ba_hedge_cost_usd = _poly_min_hedge * 1.02
                     print(
                         f"[TRADER] BID_ASK_OVER_HEDGE label={opp.label} "
-                        f"pred_filled={_ba_hedge_qty_orig:.4f} → boosted={_ba_hedge_qty:.4f} "
+                        f"pred_filled={_ba_hedge_qty_orig:.4f} → boosted={_ba_final_hedge_qty:.4f} "
                         f"cost=${_ba_hedge_cost_usd:.2f}"
                     )
                     # fall through to Step 3 hedge below
@@ -3327,7 +3329,7 @@ def opportunity(opp: Opportunity) -> dict:
 
             _ba_hedge_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_hedge_leg = OpportunityLeg(
-                **{**poly_leg.model_dump(), "shares": _ba_hedge_qty, "stake_usd": _ba_hedge_qty * _ba_hedge_price}
+                **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
             )
             polymarket_result_ba: dict[str, Any] | None = None
             poly_exec_error_ba: Exception | None = None
