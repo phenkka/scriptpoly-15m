@@ -1082,10 +1082,18 @@ def _fetch_poly_fee_rate(token_id: str) -> float:
 def _vwap_from_poly_book(book: dict[str, Any], shares: float) -> float | None:
     """Calculate VWAP from live Polymarket asks book for a given number of shares.
     Returns None if insufficient liquidity."""
+    result = _vwap_and_worst_from_poly_book(book, shares)
+    return result[0] if result else None
+
+
+def _vwap_and_worst_from_poly_book(book: dict[str, Any], shares: float) -> tuple[float, float] | None:
+    """Calculate VWAP and worst (highest) ask price touched for a given number of shares.
+    Returns (vwap, worst_price) or None if insufficient liquidity (< 99% of requested shares).
+    worst_price is the highest ask level needed to fill the full quantity —
+    use it as the Poly limit price to guarantee a complete fill."""
     asks_raw = book.get("asks") or []
     if not asks_raw or shares <= 0:
         return None
-    # Sort asks by price ascending
     levels: list[tuple[float, float]] = []
     for a in asks_raw:
         try:
@@ -1099,6 +1107,7 @@ def _vwap_from_poly_book(book: dict[str, Any], shares: float) -> float | None:
     remaining = shares
     cost = 0.0
     got = 0.0
+    worst_price = 0.0
     for p, sz in levels:
         if remaining <= 0:
             break
@@ -1106,9 +1115,13 @@ def _vwap_from_poly_book(book: dict[str, Any], shares: float) -> float | None:
         cost += take * p
         got += take
         remaining -= take
+        worst_price = p
     if got <= 0:
         return None
-    return cost / got
+    # Reject if book depth covers less than 99% of requested qty — trade would be mismatched
+    if got < shares * 0.99:
+        return None
+    return cost / got, worst_price
 
 
 def _predict_token_id_for_side(market: dict[str, Any], side: str) -> str:
@@ -3144,7 +3157,22 @@ def opportunity(opp: Opportunity) -> dict:
         _pre_safety_bps = float(opp.safety_buffer_bps or 0)
         try:
             live_book = _polymarket_book(str(poly_leg.token_id))
-            _live_vwap_pre = _vwap_from_poly_book(live_book, float(opp.shares))
+            _vwap_worst_pre = _vwap_and_worst_from_poly_book(live_book, float(opp.shares))
+            if _vwap_worst_pre is None:
+                # Poly book doesn't have enough depth for the full qty — skip before Predict
+                _poly_min_pre2 = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+                row["skipped"] = True
+                row["skip_reason"] = {"code": "poly_insufficient_depth", "shares": float(opp.shares)}
+                row["summary"]["status"] = "skipped"
+                row["summary"]["reason_code"] = "poly_insufficient_depth"
+                row["summary"]["reason"] = row["skip_reason"]
+                print(f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_insufficient_depth shares={opp.shares:.4f}")
+                if _market_id_int is not None:
+                    with _predict_market_in_flight_lock:
+                        _predict_market_in_flight.discard(_market_id_int)
+                _append_jsonl(trades_file, row)
+                return {"status": "skipped", "reason": "poly_insufficient_depth"}
+            _live_vwap_pre = _vwap_worst_pre[0]
             if _live_vwap_pre is not None:
                 _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
                 _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
@@ -3363,11 +3391,14 @@ def opportunity(opp: Opportunity) -> dict:
             _ba_safety_bps = float(opp.safety_buffer_bps or 0)
             _live_net_edge_ba: float | None = None
             _live_vwap_ba: float | None = None
+            _live_worst_ba: float | None = None
             _live_poly_fee_ba: float | None = None
 
             try:
                 _live_book_ba = _polymarket_book(str(poly_leg.token_id))
-                _live_vwap_ba = _vwap_from_poly_book(_live_book_ba, _ba_hedge_qty)
+                _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
+                if _vwap_worst:
+                    _live_vwap_ba, _live_worst_ba = _vwap_worst
             except Exception as _e_ba_live:
                 print(f"[TRADER] bid_ask_hedge_live_check failed (non-fatal): {_e_ba_live}")
 
@@ -3565,9 +3596,12 @@ def opportunity(opp: Opportunity) -> dict:
                     return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
 
             _ba_hedge_price = _ba_hedge_vwap
-            # Limit price: 2% above VWAP, rounded UP to Poly's 0.001 tick to guarantee fill
+            # Limit price: worst (highest) ask level touched in the VWAP sweep, rounded UP
+            # to Poly's 0.001 tick. This guarantees all required price levels fill completely.
+            # Fallback to VWAP × 1.02 if worst_price is unavailable.
             import math as _math
-            _ba_limit_price = min(0.99, _math.ceil(_ba_hedge_vwap * 1.02 * 1000) / 1000)
+            _ba_worst_price = _live_worst_ba if _live_worst_ba else _ba_hedge_vwap * 1.02
+            _ba_limit_price = min(0.99, _math.ceil(_ba_worst_price * 1000) / 1000)
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
             )
@@ -3743,15 +3777,95 @@ def opportunity(opp: Opportunity) -> dict:
                         "poly_fee_rate": _ba_fee_rate,
                     }
 
-                # Log mismatch for diagnostics (no correction — extra Predict shares are a bonus,
-                # not a risk: both legs pay out on resolution, just slightly asymmetric amounts).
+                # Mismatch correction: if Poly partially filled fewer shares than Predict,
+                # sell the excess Predict shares back to close the unhedged exposure.
                 _ba_mismatch_shares = _ba_net_sell_qty - _ba_poly_qty_actual
+                _ba_mismatch_threshold = 0.01
+                _ba_mismatch_corrected = False
+                _ba_mismatch_sell_result: dict = {}
+                _ba_mismatch_sell_err: str | None = None
+
+                if _ba_mismatch_shares > _ba_mismatch_threshold:
+                    # First try: buy the missing shares on Poly at current market price.
+                    # Cheaper than selling excess on Predict (avoids bid-ask spread loss).
+                    _mm_poly_bought = False
+                    _mm_poly_price: float | None = None
+                    _mm_action = "sell_predict"
+                    try:
+                        _mm_book = _polymarket_book(str(poly_leg.token_id))
+                        _mm_vwap_worst = _vwap_and_worst_from_poly_book(_mm_book, _ba_mismatch_shares)
+                        if _mm_vwap_worst:
+                            _mm_vwap, _mm_worst = _mm_vwap_worst
+                            # Only buy if arb edge still holds at new Poly price
+                            _mm_edge = 1.0 - _ba_actual_pred_bid - _mm_vwap - _ba_fee_rate * _mm_vwap * (1.0 - _mm_vwap)
+                            if _mm_edge > 0:
+                                _mm_limit = min(0.99, _math.ceil(_mm_worst * 1000) / 1000)
+                                _mm_poly_result = _place_polymarket_limit_buy_exact_shares(
+                                    str(poly_leg.token_id),
+                                    shares=_ba_mismatch_shares,
+                                    price=_mm_limit,
+                                    private_key=_poly_pk,
+                                    funder=_poly_funder,
+                                    signature_type=_poly_sig_type,
+                                    poly_api_key=_poly_api_key,
+                                    poly_secret=_poly_secret,
+                                    poly_passphrase=_poly_passphrase,
+                                )
+                                _mm_poly_bought = _mm_poly_result.get("filled", False)
+                                _mm_poly_price = _mm_vwap
+                                _mm_action = "buy_poly"
+                    except Exception as _mm_poly_e:
+                        print(f"[TRADER][MISMATCH] poly_rebuy failed: {_mm_poly_e}")
+
+                    if _mm_poly_bought:
+                        _mm_status = f"✅ bought {_ba_mismatch_shares:.3f} shares @ {_mm_poly_price:.2f} on Poly"
+                        notify(
+                            f"⚠️ <b>POLY PARTIAL FILL — rebuying on Poly</b>\n"
+                            f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
+                            f"\n"
+                            f"- Excess: <b>{_ba_mismatch_shares:.3f} shares</b>\n"
+                            f"- {_mm_status}\n"
+                        )
+                        _ba_mismatch_corrected = True
+                    else:
+                        # Fallback: sell excess on Predict
+                        _mm_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                        _mm_unwind_price = max(0.01, _ba_actual_pred_bid - _mm_tick)
+                        try:
+                            _ba_mismatch_sell_result = _place_predict_limit_sell(
+                                pred_leg,
+                                sell_qty=_ba_mismatch_shares,
+                                sell_price=_mm_unwind_price,
+                                fill_timeout_sec=30.0,
+                                trace_id=trace_id,
+                            )
+                            _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
+                        except Exception as _mm_e:
+                            _ba_mismatch_sell_err = str(_mm_e)
+                        _mm_status = "✅ sold" if _ba_mismatch_corrected else f"❌ failed{(' — ' + _ba_mismatch_sell_err[:100]) if _ba_mismatch_sell_err else ''}"
+                        notify(
+                            f"⚠️ <b>POLY PARTIAL FILL — excess Predict sold</b>\n"
+                            f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
+                            f"\n"
+                            f"- Excess: <b>{_ba_mismatch_shares:.3f} shares</b>\n"
+                            f"- Predict sell @ {_mm_unwind_price:.2f}: {_mm_status}\n"
+                        )
+                    print(
+                        f"[TRADER][MISMATCH] label={opp.label} "
+                        f"pred={_ba_net_sell_qty:.4f} poly={_ba_poly_qty_actual:.4f} "
+                        f"excess={_ba_mismatch_shares:.4f} action={_mm_action} "
+                        f"corrected={_ba_mismatch_corrected} err={_ba_mismatch_sell_err}"
+                    )
+
                 row["mismatch_correction"] = {
                     "pred_net_qty": round(_ba_net_sell_qty, 6),
                     "poly_filled_qty_actual": round(_ba_poly_qty_actual, 6),
                     "poly_filled_qty_gross": round(_ba_poly_qty, 6),
                     "mismatch_shares": round(_ba_mismatch_shares, 6),
-                    "corrected": False,
+                    "corrected": _ba_mismatch_corrected,
+                    "action": locals().get("_mm_action", "none"),
+                    "sell_result": _ba_mismatch_sell_result,
+                    "sell_error": _ba_mismatch_sell_err,
                 }
 
                 _append_jsonl(trades_file, row)
