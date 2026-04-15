@@ -121,7 +121,7 @@ services:
       BSC_RPC_URL: ${BSC_RPC_URL:-https://bsc-dataseed.binance.org}
       POLYGON_RPC_URL: ${POLYGON_RPC_URL:-https://polygon-rpc.com}
       TRADER_TRADES_FILE: ${TRADER_TRADES_FILE:-/data/trades.jsonl}
-      CLAIMER_INTERVAL_SEC: ${CLAIMER_INTERVAL_SEC:-3600}
+      CLAIMER_INTERVAL_SEC: ${CLAIMER_INTERVAL_SEC:-60}
       CLAIMER_DRY_RUN: ${CLAIMER_DRY_RUN:-false}
       BOT_NOTIFY_URL: ${BOT_NOTIFY_URL:-http://bot:8080/notify}
     volumes:
