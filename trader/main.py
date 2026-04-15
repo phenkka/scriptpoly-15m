@@ -3107,6 +3107,36 @@ def opportunity(opp: Opportunity) -> dict:
                 _predict_market_in_flight.add(_market_id_int)
 
         # ────────────────────────────────────────────────────
+        # STATIC PRE-CHECK: hedge cost at stale poly ask.
+        # Runs unconditionally (no live book needed) so it
+        # always fires even when the live book fetch fails.
+        # ────────────────────────────────────────────────────
+        _poly_min_static = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+        _static_hedge_cost = float(opp.shares) * float(poly_leg.ask)
+        if _static_hedge_cost < _poly_min_static:
+            row["skipped"] = True
+            row["skip_reason"] = {
+                "code": "poly_min_order_usd_static",
+                "poly_ask": float(poly_leg.ask),
+                "shares": float(opp.shares),
+                "hedge_cost_usd": round(_static_hedge_cost, 4),
+                "poly_min_order_usd": _poly_min_static,
+            }
+            row["summary"]["status"] = "skipped"
+            row["summary"]["reason_code"] = "poly_min_order_usd_static"
+            row["summary"]["reason"] = row["skip_reason"]
+            print(
+                f"[TRADER]{_t}[SKIP] "
+                f"label={opp.label} reason=poly_min_order_usd_static "
+                f"static_hedge=${_static_hedge_cost:.2f} min=${_poly_min_static:.2f}"
+            )
+            if _market_id_int is not None:
+                with _predict_market_in_flight_lock:
+                    _predict_market_in_flight.discard(_market_id_int)
+            _append_jsonl(trades_file, row)
+            return {"status": "skipped", "reason": "poly_min_order_usd_static"}
+
+        # ────────────────────────────────────────────────────
         # LIVE POLY NET-EDGE CHECK — перед тем как коммитить
         # predict-капитал, проверяем что live net-edge > 0.
         # ────────────────────────────────────────────────────
