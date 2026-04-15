@@ -1512,7 +1512,11 @@ def _place_polymarket_limit_buy_exact_shares(
         return c
 
     import math as _math
-    # Poly CLOB enforces 0.001 tick size — round UP to nearest 0.001 to guarantee fill
+    # Poly CLOB enforces 0.001 tick size — round UP to nearest 0.001 to guarantee fill.
+    # NOTE: FOK/FAK ("market buy") orders require makerAmount at max 2-decimal USDC precision,
+    # i.e. size*price must be a multiple of $0.01. For arbitrary share counts this is nearly
+    # impossible to satisfy. GTC limit orders do NOT have this constraint, and since our price
+    # is set 2% above live VWAP the order fills immediately as a taker against resting asks.
     _price_ticked = _math.ceil(price * 1000) / 1000
     order_args = OrderArgs(
         token_id=token_id,
@@ -1520,36 +1524,75 @@ def _place_polymarket_limit_buy_exact_shares(
         size=round(shares, 4),
         side=BUY,
     )
-    for _attempt, _otype in enumerate([OrderType.FOK, OrderType.FAK] if fak_fallback else [OrderType.FOK]):
-        try:
-            client = _build_client()
-            signed = client.create_order(order_args)
-            resp = client.post_order(signed, _otype)
+    _GTC_FILL_POLL_INTERVAL = 0.5
+    _GTC_FILL_TIMEOUT = float(os.environ.get("POLY_GTC_FILL_TIMEOUT_SEC", "10"))
+    try:
+        client = _build_client()
+        signed = client.create_order(order_args)
+        resp = client.post_order(signed, OrderType.GTC)
+        resp_status = (resp.get("status") or "").lower()
+
+        if resp_status == "matched":
             return {
                 "token_id": token_id,
                 "shares_requested": shares,
                 "price": price,
                 "response": resp,
-                "order_type": _otype,
+                "order_type": "GTC",
             }
-        except Exception as _e:
-            _es = str(_e)
-            _is_fok_kill = "couldn't be fully filled" in _es or "FOK" in _es
-            if _attempt == 0 and fak_fallback and _is_fok_kill:
-                print(
-                    f"[TRADER][POLY][LIMIT_FAK_FALLBACK] FOK killed, retrying FAK "
-                    f"token_id={token_id} shares={shares:.4f} price={price:.4f}"
-                )
-                continue
-            proxy_url = os.environ.get("PROXY_URL", "").strip()
-            print(
-                "[TRADER][POLY][LIMIT_ERROR] "
-                f"token_id={token_id} shares={shares:.4f} price={price:.4f} "
-                f"proxy_set={bool(proxy_url)} err_type={type(_e).__name__} err={_e}"
+
+        if resp_status == "live":
+            # Resting order — price was below current ask despite 2% buffer (rare).
+            # Poll briefly; cancel and raise if unfilled so the incident handler can retry.
+            order_id = resp.get("orderID", "")
+            _deadline = time.time() + _GTC_FILL_TIMEOUT
+            while time.time() < _deadline:
+                time.sleep(_GTC_FILL_POLL_INTERVAL)
+                try:
+                    _r = _clob_helpers._http_client.get(
+                        f"https://clob.polymarket.com/order/{order_id}", timeout=5.0
+                    )
+                    _order_data = _r.json()
+                    _live_status = (_order_data.get("status") or "").lower()
+                    if _live_status in ("matched", "filled"):
+                        print(
+                            f"[TRADER][POLY][GTC_FILLED] order_id={order_id} "
+                            f"after_poll elapsed={(time.time() - (_deadline - _GTC_FILL_TIMEOUT)):.1f}s"
+                        )
+                        resp = _order_data
+                        return {
+                            "token_id": token_id,
+                            "shares_requested": shares,
+                            "price": price,
+                            "response": resp,
+                            "order_type": "GTC",
+                        }
+                except Exception:
+                    pass
+            # Timed out — cancel the resting order
+            if order_id:
+                try:
+                    client.cancel(order_id)
+                    print(f"[TRADER][POLY][GTC_CANCEL] cancelled live order order_id={order_id}")
+                except Exception as _ce:
+                    print(f"[TRADER][POLY][GTC_CANCEL_ERR] order_id={order_id} err={_ce}")
+            raise RuntimeError(
+                f"poly_gtc_not_filled: order went live and did not fill within "
+                f"{_GTC_FILL_TIMEOUT:.0f}s (order_id={order_id})"
             )
-            print("[TRADER][POLY][LIMIT_TRACE]\n" + traceback.format_exc())
-            raise
-    raise RuntimeError("unreachable")
+
+        # Unexpected status
+        raise RuntimeError(f"poly_gtc_unexpected_status: {resp_status} resp={resp}")
+
+    except Exception as _e:
+        proxy_url = os.environ.get("PROXY_URL", "").strip()
+        print(
+            "[TRADER][POLY][LIMIT_ERROR] "
+            f"token_id={token_id} shares={shares:.4f} price={price:.4f} "
+            f"proxy_set={bool(proxy_url)} err_type={type(_e).__name__} err={_e}"
+        )
+        print("[TRADER][POLY][LIMIT_TRACE]\n" + traceback.format_exc())
+        raise
 
 
 def _predict_get_jwt(
