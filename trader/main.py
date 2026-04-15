@@ -3796,9 +3796,11 @@ def opportunity(opp: Opportunity) -> dict:
                         _mm_vwap_worst = _vwap_and_worst_from_poly_book(_mm_book, _ba_mismatch_shares)
                         if _mm_vwap_worst:
                             _mm_vwap, _mm_worst = _mm_vwap_worst
-                            # Only buy if arb edge still holds at new Poly price
+                            # Only buy if arb edge still holds AND price hasn't drifted too far
                             _mm_edge = 1.0 - _ba_actual_pred_bid - _mm_vwap - _ba_fee_rate * _mm_vwap * (1.0 - _mm_vwap)
-                            if _mm_edge > 0:
+                            _mm_price_drift = _mm_vwap - _ba_poly_price
+                            _mm_max_drift = float(os.environ.get("MISMATCH_MAX_POLY_DRIFT", "0.1") or "0.1")
+                            if _mm_edge > 0 and _mm_price_drift <= _mm_max_drift:
                                 _mm_limit = min(0.99, _math.ceil(_mm_worst * 1000) / 1000)
                                 _mm_poly_result = _place_polymarket_limit_buy_exact_shares(
                                     str(poly_leg.token_id),
@@ -3854,6 +3856,7 @@ def opportunity(opp: Opportunity) -> dict:
                         f"[TRADER][MISMATCH] label={opp.label} "
                         f"pred={_ba_net_sell_qty:.4f} poly={_ba_poly_qty_actual:.4f} "
                         f"excess={_ba_mismatch_shares:.4f} action={_mm_action} "
+                        f"drift={locals().get('_mm_price_drift', 0):.4f} "
                         f"corrected={_ba_mismatch_corrected} err={_ba_mismatch_sell_err}"
                     )
 
