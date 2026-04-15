@@ -3309,18 +3309,10 @@ def opportunity(opp: Opportunity) -> dict:
             # Determine hedge quantity: use actual filled shares from predict, not requested
             _ba_hedge_qty = _ba_total_filled_shares if _ba_total_filled_shares > 0 else float(pred_leg.shares)
 
-            # Net sell quantity for unwind: Predict deducts feeRateBps from the shares credited
-            # to your wallet on a BUY (amountFilled reports gross shares, but balance = gross * (1-fee)).
-            # Using gross qty on a SELL causes "insufficient_shares_balance" 400 error.
+            # Net sell quantity for unwind: Predict SDK sets taker_amount=qty (full shares) on BUY,
+            # meaning fee is charged in USDC (maker_amount), not deducted from shares.
+            # The wallet receives exactly amountFilled shares, so sell the full amount.
             _ba_net_sell_qty = _ba_hedge_qty
-            if pred_leg.market_id is not None:
-                try:
-                    _pred_mkt_fee = _predict_client.get_market(int(pred_leg.market_id))
-                    _pred_fee_bps = int(_pred_mkt_fee.get("feeRateBps") or 0)
-                    if _pred_fee_bps > 0:
-                        _ba_net_sell_qty = _ba_hedge_qty * (1.0 - _pred_fee_bps / 10_000)
-                except Exception:
-                    pass
 
             # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
             # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
