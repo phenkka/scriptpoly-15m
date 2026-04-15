@@ -571,7 +571,7 @@ def _auto_hedge_late_fill(token_id: str | None, shares: float, market_id: int) -
         result = _place_polymarket_fok_market_buy(leg, fak_fallback=True)
         resp = result.get("response") or {}
         status = resp.get("status", "?")
-        return f"ok:{status} stake=${stake_usd:.2f} vwap={vwap:.4f}"
+        return f"ok:{status} stake=${stake_usd:.2f} vwap={vwap:.2f}"
     except Exception as _e:
         return f"error:{_e}"
 
@@ -688,13 +688,12 @@ def _late_fill_watcher() -> None:
                             f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
                         notify(
-                            f"🔴 <b>BSC FILL подтверждён (watch истёк) — авто-хедж</b>\n"
+                            f"🔴 <b>BSC fill confirmed (watcher expired) — auto-hedge</b>\n"
                             f"\n"
-                            f"BSC: fill {bsc_shares:.3f} шар, Predict API 30 мин показывал 0.\n"
-                            f"\n"
+                            f"BSC: {bsc_shares:.3f} shares filled, Predict API showed 0 for 30 min.\n"
                             f"hash: <code>{oh[:18]}...</code>\n"
                             f"market_id: <code>{mkt_id}</code>\n"
-                            f"Poly хедж: <code>{_hedge_st}</code>\n"
+                            f"Poly hedge: <code>{_hedge_st}</code>\n"
                         )
                     else:
                         print(
@@ -717,13 +716,13 @@ def _late_fill_watcher() -> None:
                             f"shares={shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
                         notify(
-                            f"🟡 <b>Late ghost fill — авто-хедж запущен</b>\n"
+                            f"🟡 <b>Late ghost fill — auto-hedge triggered</b>\n"
                             f"\n"
-                            f"Predict API показал fill +{age:.0f}s после отмены.\n"
+                            f"Predict API reported fill +{age:.0f}s after cancel.\n"
                             f"hash: <code>{oh[:18]}...</code>\n"
                             f"market_id: <code>{mkt_id}</code>\n"
                             f"shares: <b>{shares:.3f}</b>\n"
-                            f"Poly хедж: <code>{_hedge_st}</code>\n"
+                            f"Poly hedge: <code>{_hedge_st}</code>\n"
                         )
                         to_remove.append(oh)
                     else:
@@ -738,12 +737,12 @@ def _late_fill_watcher() -> None:
                                 f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                             )
                             notify(
-                                f"🔴 <b>BSC fill (API лаг) — авто-хедж запущен</b>\n"
+                                f"🔴 <b>BSC fill (API lag) — auto-hedge triggered</b>\n"
                                 f"\n"
-                                f"BSC: fill {bsc_shares:.3f} шар, Predict API lag = {age:.0f}s.\n"
+                                f"BSC: {bsc_shares:.3f} shares filled, Predict API lag = {age:.0f}s.\n"
                                 f"hash: <code>{oh[:18]}...</code>\n"
                                 f"market_id: <code>{mkt_id}</code>\n"
-                                f"Poly хедж: <code>{_hedge_st}</code>\n"
+                                f"Poly hedge: <code>{_hedge_st}</code>\n"
                             )
                             to_remove.append(oh)
                 except Exception as _pe:
