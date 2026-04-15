@@ -19,7 +19,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -681,15 +681,6 @@ def _claim_predict(
 _JWT_TTL = 3 * 3600  # обновляем JWT раз в 3 часа
 
 
-def _next_run_at() -> datetime:
-    """Следующий запуск в :02 текущего или следующего часа."""
-    now = datetime.now()
-    candidate = now.replace(minute=2, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(hours=1)
-    return candidate
-
-
 def main() -> None:
     dry_run = os.environ.get("CLAIMER_DRY_RUN", "false").lower() in ("1", "true", "yes")
 
@@ -741,9 +732,10 @@ def main() -> None:
         u for u in _bsc_rpc_fallbacks if u not in _parse_rpc_list(_bsc_user)
     ] or _bsc_rpc_fallbacks
 
+    _interval = int(os.environ.get("CLAIMER_INTERVAL_SEC", "60") or "60")
     log.info(
         f"claimer_start dry_run={dry_run} safe={safe_address} "
-        f"predict_account={predict_account} schedule=:01_each_hour"
+        f"predict_account={predict_account} interval={_interval}s"
     )
 
     # In-memory claimed set — idempotent (on-chain balance check предотвращает двойной клейм)
@@ -754,15 +746,6 @@ def main() -> None:
     jwt_ts: float = 0.0
 
     while True:
-        # ── Ждём :02 следующего часа ────────────────────────────────────────
-        target = _next_run_at()
-        wait = (target - datetime.now()).total_seconds()
-        # Всегда спим хотя бы 1 секунду — исключает двойной запуск при старте
-        if wait < 1:
-            wait = (target + timedelta(hours=1) - datetime.now()).total_seconds()
-        log.info(f"claimer_sleep until={target.strftime('%H:%M:%S')} ({wait:.0f}s)")
-        time.sleep(wait)
-
         try:
             log.info(f"=== claimer_cycle_start ts={datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
             _poly_pending_usd: float = 0.0
@@ -821,6 +804,8 @@ def main() -> None:
         except Exception as e:
             log.error(f"claimer_main_loop_error err={e}")
             traceback.print_exc()
+
+        time.sleep(_interval)
 
 
 if __name__ == "__main__":
