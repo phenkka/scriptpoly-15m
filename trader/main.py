@@ -292,19 +292,14 @@ def _startup_warmup() -> None:
                 _halt_vpn_path.write_text("vpn_down")
                 print("[TRADER][VPN_WATCHDOG] VPN DOWN — halt_vpn created")
                 notify(
-                    "🔴 <b>VPN УПАЛ — БОТ ОСТАНОВЛЕН</b>\n"
-                    "\n"
-                    f"Прокси недоступен: <code>{_proxy_url}</code>\n"
-                    f"Проверка каждые {_vpn_check_interval:.0f}s\n"
+                    "🔴 <b>VPN IS INACTIVE</b>\n"
                 )
             elif _ok and _was_down:
                 _was_down = False
                 _halt_vpn_path.unlink(missing_ok=True)
                 print("[TRADER][VPN_WATCHDOG] VPN RESTORED — halt_vpn removed")
                 notify(
-                    "🟢 <b>VPN ВОССТАНОВЛЕН — БОТ ВОЗОБНОВИЛ РАБОТУ</b>\n"
-                    "\n"
-                    f"Прокси снова доступен: <code>{_proxy_url}</code>\n"
+                    "🟢 <b>VPN IS ACTIVE</b>\n"
                 )
             time.sleep(_vpn_check_interval)
 
@@ -494,16 +489,15 @@ def _check_inflight_on_startup() -> None:
             age_s = int(time.time() - float(entry.get("ts", time.time())))
             lines.append(f"market_id={mkt} hash={oh}... shares={sh} age={age_s}s")
 
-        cancel_line = f"\n🗑 Отменено открытых ордеров на Predict: {n_cancelled}" if n_cancelled >= 0 else ""
+        cancel_line = f"\n🗑 Cancelled open Predict orders: {n_cancelled}" if n_cancelled >= 0 else ""
         notify(
-            "⚠️ <b>RESTART: ОТКРЫТЫЕ PREDICT ОРДЕРА ПРИ ПЕРЕЗАПУСКЕ</b>\n"
+            "⚠️ <b>RESTART: IN-FLIGHT PREDICT ORDERS</b>\n"
             "\n"
-            "Контейнер перезапустился пока Predict-ордер был в процессе.\n"
-            "Возможна <b>неезахеджированная позиция</b> на Predict!\n"
+            "Container restarted while a Predict order was in progress.\n"
+            "<b>Unhedged position possible</b> — check manually!\n"
             "\n"
             + "\n".join(lines)
             + cancel_line
-            + "\n\n⚠️ Проверь позиции вручную!"
         )
 
         # Clean up the file after alerting
