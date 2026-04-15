@@ -487,16 +487,17 @@ def _check_inflight_on_startup() -> None:
             oh = str(entry.get("order_hash") or "?")[:12]
             sh = entry.get("shares", "?")
             age_s = int(time.time() - float(entry.get("ts", time.time())))
-            lines.append(f"market_id={mkt} hash={oh}... shares={sh} age={age_s}s")
+            lines.append(
+                f"▸ Market: <code>{mkt}</code>  Hash: <code>{oh}...</code>\n"
+                f"  Shares: <b>{sh}</b>  Age: <i>{age_s}s</i>"
+            )
 
-        cancel_line = f"\n🗑 Cancelled open Predict orders: {n_cancelled}" if n_cancelled >= 0 else ""
+        cancel_line = f"\n🗑 Cancelled open orders: <b>{n_cancelled}</b>" if n_cancelled >= 0 else ""
         notify(
             "⚠️ <b>RESTART: IN-FLIGHT PREDICT ORDERS</b>\n"
+            "<i>Container restarted mid-order — unhedged position possible</i>\n"
             "\n"
-            "Container restarted while a Predict order was in progress.\n"
-            "<b>Unhedged position possible</b> — check manually!\n"
-            "\n"
-            + "\n".join(lines)
+            + "\n\n".join(lines)
             + cancel_line
         )
 
@@ -688,12 +689,14 @@ def _late_fill_watcher() -> None:
                             f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
                         notify(
-                            f"🔴 <b>BSC fill confirmed (watcher expired) — auto-hedge</b>\n"
+                            f"🔴 <b>BSC fill confirmed — auto-hedge</b>\n"
+                            f"<i>Watcher expired, Predict API showed 0 for 30 min</i>\n"
                             f"\n"
-                            f"BSC: {bsc_shares:.3f} shares filled, Predict API showed 0 for 30 min.\n"
-                            f"hash: <code>{oh[:18]}...</code>\n"
-                            f"market_id: <code>{mkt_id}</code>\n"
-                            f"Poly hedge: <code>{_hedge_st}</code>\n"
+                            f"▸ Shares: <b>{bsc_shares:.3f}</b>\n"
+                            f"▸ Hash: <code>{oh[:18]}...</code>\n"
+                            f"▸ Market: <code>{mkt_id}</code>\n"
+                            f"\n"
+                            f"Poly hedge: <code>{_hedge_st}</code>"
                         )
                     else:
                         print(
@@ -717,12 +720,13 @@ def _late_fill_watcher() -> None:
                         )
                         notify(
                             f"🟡 <b>Late ghost fill — auto-hedge triggered</b>\n"
+                            f"<i>Predict API reported fill +{age:.0f}s after cancel</i>\n"
                             f"\n"
-                            f"Predict API reported fill +{age:.0f}s after cancel.\n"
-                            f"hash: <code>{oh[:18]}...</code>\n"
-                            f"market_id: <code>{mkt_id}</code>\n"
-                            f"shares: <b>{shares:.3f}</b>\n"
-                            f"Poly hedge: <code>{_hedge_st}</code>\n"
+                            f"▸ Shares: <b>{shares:.3f}</b>\n"
+                            f"▸ Hash: <code>{oh[:18]}...</code>\n"
+                            f"▸ Market: <code>{mkt_id}</code>\n"
+                            f"\n"
+                            f"Poly hedge: <code>{_hedge_st}</code>"
                         )
                         to_remove.append(oh)
                     else:
@@ -738,11 +742,13 @@ def _late_fill_watcher() -> None:
                             )
                             notify(
                                 f"🔴 <b>BSC fill (API lag) — auto-hedge triggered</b>\n"
+                                f"<i>On-chain fill detected, Predict API lag = {age:.0f}s</i>\n"
                                 f"\n"
-                                f"BSC: {bsc_shares:.3f} shares filled, Predict API lag = {age:.0f}s.\n"
-                                f"hash: <code>{oh[:18]}...</code>\n"
-                                f"market_id: <code>{mkt_id}</code>\n"
-                                f"Poly hedge: <code>{_hedge_st}</code>\n"
+                                f"▸ Shares: <b>{bsc_shares:.3f}</b>\n"
+                                f"▸ Hash: <code>{oh[:18]}...</code>\n"
+                                f"▸ Market: <code>{mkt_id}</code>\n"
+                                f"\n"
+                                f"Poly hedge: <code>{_hedge_st}</code>"
                             )
                             to_remove.append(oh)
                 except Exception as _pe:
