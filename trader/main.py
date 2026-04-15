@@ -2221,7 +2221,33 @@ def _place_predict_limit_buy(
                     filled = True
                     break
             except Exception:
-                pass
+                # Predict API down — fall back to direct BSC check every 5 attempts
+                if _attempt % 5 == 0:
+                    try:
+                        _bsc_shares = _bsc_check_order_filled(order_hash, total_filled_shares if total_filled_shares else float(shares_requested or 0))
+                        if _bsc_shares > 0:
+                            now_ts = time.time()
+                            if first_fill_ts is None:
+                                first_fill_ts = now_ts
+                            _bsc_wei = int(_bsc_shares * 10**18)
+                            if _bsc_wei > prev_filled_wei:
+                                partial_fills.append({
+                                    "ts": now_ts,
+                                    "delta_wei": _bsc_wei - prev_filled_wei,
+                                    "cumulative_wei": _bsc_wei,
+                                    "delta_shares": _bsc_shares - prev_filled_wei / 10**18,
+                                    "cumulative_shares": _bsc_shares,
+                                    "source": "bsc_direct",
+                                })
+                                prev_filled_wei = _bsc_wei
+                            print(
+                                f"[PREDICT_LIMIT]{_trace} ghost_fill_watch_bsc_direct "
+                                f"hash={order_hash} bsc_shares={_bsc_shares:.4f} attempt={_attempt}"
+                            )
+                            filled = True
+                            break
+                    except Exception:
+                        pass
             if _attempt < _FINAL_GET_RETRIES - 1:
                 time.sleep(_FINAL_GET_SLEEP_SEC)
 
