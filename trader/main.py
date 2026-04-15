@@ -3874,6 +3874,20 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 _append_jsonl(success_trades_file, row)
 
+                # Effective quantities for notification: adjust for mismatch correction
+                _notif_poly_qty = _ba_poly_qty
+                _notif_pred_qty = _ba_hedge_qty
+                _notif_mismatch_line = ""
+                if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
+                    _mm_action_final = locals().get("_mm_action", "sell_predict")
+                    _mm_poly_bought_final = locals().get("_mm_poly_bought", False)
+                    if _mm_action_final == "buy_poly" and _mm_poly_bought_final:
+                        _notif_poly_qty = _ba_poly_qty + _ba_mismatch_shares
+                        _notif_mismatch_line = f"<i>📎 +{_ba_mismatch_shares:.3f} sh rebuyed on Poly</i>\n"
+                    else:
+                        _notif_pred_qty = _ba_hedge_qty - _ba_mismatch_shares
+                        _notif_mismatch_line = f"<i>📎 −{_ba_mismatch_shares:.3f} sh sold back on Predict</i>\n"
+
                 _tkey = str(poly_leg.token_id)
                 _prev = _ba_fill_state.get(_tkey)
                 _GROUP_TTL = 1800  # 30 min window to group fills for same market
@@ -3924,9 +3938,10 @@ def opportunity(opp: Opportunity) -> dict:
                     f"<b>{opp.label}</b>\n"
                     f"\n"
                     f"<b>Polymarket</b>  {poly_leg.side.upper()}\n"
-                    f"  {_ba_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_ba_poly_qty * _ba_poly_price:.2f}</b>\n"
+                    f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_notif_poly_qty * _ba_poly_price:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
-                    f"  {_ba_hedge_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_ba_hedge_qty * _ba_pred_price:.2f}</b>\n"
+                    f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_notif_pred_qty * _ba_pred_price:.2f}</b>\n"
+                    + _notif_mismatch_line
                     + _poly_pos_line
                     + f"\n"
                     f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
