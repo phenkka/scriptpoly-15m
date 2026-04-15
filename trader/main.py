@@ -488,7 +488,7 @@ def _check_inflight_on_startup() -> None:
             sh = entry.get("shares", "?")
             age_s = int(time.time() - float(entry.get("ts", time.time())))
             lines.append(
-                f"▸ Market: <code>{mkt}</code>  Hash: <code>{oh}...</code>\n"
+                f"- Market: <code>{mkt}</code>  Hash: <code>{oh}...</code>\n"
                 f"  Shares: <b>{sh}</b>  Age: <i>{age_s}s</i>"
             )
 
@@ -692,9 +692,9 @@ def _late_fill_watcher() -> None:
                             f"🔴 <b>BSC fill confirmed — auto-hedge</b>\n"
                             f"<i>Watcher expired, Predict API showed 0 for 30 min</i>\n"
                             f"\n"
-                            f"▸ Shares: <b>{bsc_shares:.3f}</b>\n"
-                            f"▸ Hash: <code>{oh[:18]}...</code>\n"
-                            f"▸ Market: <code>{mkt_id}</code>\n"
+                            f"- Shares: <b>{bsc_shares:.3f}</b>\n"
+                            f"- Hash: <code>{oh[:18]}...</code>\n"
+                            f"- Market: <code>{mkt_id}</code>\n"
                             f"\n"
                             f"Poly hedge: <code>{_hedge_st}</code>"
                         )
@@ -722,9 +722,9 @@ def _late_fill_watcher() -> None:
                             f"🟡 <b>Late ghost fill — auto-hedge triggered</b>\n"
                             f"<i>Predict API reported fill +{age:.0f}s after cancel</i>\n"
                             f"\n"
-                            f"▸ Shares: <b>{shares:.3f}</b>\n"
-                            f"▸ Hash: <code>{oh[:18]}...</code>\n"
-                            f"▸ Market: <code>{mkt_id}</code>\n"
+                            f"- Shares: <b>{shares:.3f}</b>\n"
+                            f"- Hash: <code>{oh[:18]}...</code>\n"
+                            f"- Market: <code>{mkt_id}</code>\n"
                             f"\n"
                             f"Poly hedge: <code>{_hedge_st}</code>"
                         )
@@ -744,9 +744,9 @@ def _late_fill_watcher() -> None:
                                 f"🔴 <b>BSC fill (API lag) — auto-hedge triggered</b>\n"
                                 f"<i>On-chain fill detected, Predict API lag = {age:.0f}s</i>\n"
                                 f"\n"
-                                f"▸ Shares: <b>{bsc_shares:.3f}</b>\n"
-                                f"▸ Hash: <code>{oh[:18]}...</code>\n"
-                                f"▸ Market: <code>{mkt_id}</code>\n"
+                                f"- Shares: <b>{bsc_shares:.3f}</b>\n"
+                                f"- Hash: <code>{oh[:18]}...</code>\n"
+                                f"- Market: <code>{mkt_id}</code>\n"
                                 f"\n"
                                 f"Poly hedge: <code>{_hedge_st}</code>"
                             )
