@@ -1511,9 +1511,12 @@ def _place_polymarket_limit_buy_exact_shares(
             c.set_api_creds(c.create_or_derive_api_creds())
         return c
 
+    import math as _math
+    # Poly CLOB enforces 0.001 tick size — round UP to nearest 0.001 to guarantee fill
+    _price_ticked = _math.ceil(price * 1000) / 1000
     order_args = OrderArgs(
         token_id=token_id,
-        price=round(price, 4),
+        price=min(0.99, _price_ticked),
         size=round(shares, 4),
         side=BUY,
     )
@@ -3472,8 +3475,9 @@ def opportunity(opp: Opportunity) -> dict:
                     return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
 
             _ba_hedge_price = _ba_hedge_vwap
-            # Limit price: 2% above VWAP to guarantee immediate fill
-            _ba_limit_price = min(0.99, round(_ba_hedge_vwap * 1.02, 4))
+            # Limit price: 2% above VWAP, rounded UP to Poly's 0.001 tick to guarantee fill
+            import math as _math
+            _ba_limit_price = min(0.99, _math.ceil(_ba_hedge_vwap * 1.02 * 1000) / 1000)
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
             )
