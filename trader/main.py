@@ -3503,6 +3503,62 @@ def opportunity(opp: Opportunity) -> dict:
             # Use limit order (OrderArgs) with size=net_sell_qty so credited shares == predict net.
             # Price set to live_vwap × 1.02 (2% above) to guarantee immediate fill.
             # Unlike USD market orders, limit orders credit exactly `size` shares (no LP-fee deduction).
+
+            # Pre-check: if Predict fill value < $1.00, unwind immediately — too small to hedge.
+            _pred_fill_usd = _ba_net_sell_qty * _ba_actual_pred_bid
+            _pred_min_fill_usd = float(os.environ.get("PREDICT_MIN_FILL_USD", "1.0") or "1.0")
+            if _pred_fill_usd < _pred_min_fill_usd:
+                _min_unwind_usd = 0.01
+                _unwind_tick_pre = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                _unwind_price_pre = max(_unwind_tick_pre, _ba_actual_pred_bid - _unwind_tick_pre)
+                _unwind_pre_filled = False
+                _unwind_pre_err: str | None = None
+                if _pred_fill_usd >= _min_unwind_usd:
+                    try:
+                        _unwind_pre_result = _place_predict_limit_sell(
+                            pred_leg,
+                            sell_qty=_ba_net_sell_qty,
+                            sell_price=_unwind_price_pre,
+                            fill_timeout_sec=30.0,
+                            trace_id=trace_id,
+                        )
+                        _unwind_pre_filled = _unwind_pre_result.get("filled", False)
+                    except Exception as _upre_e:
+                        _unwind_pre_err = str(_upre_e)
+                _unwind_pre_status = "✅ продано" if _unwind_pre_filled else f"❌ не удалось{(' — ' + _unwind_pre_err[:80]) if _unwind_pre_err else ''}"
+                _unwind_pre_loss = (_unwind_price_pre - _ba_actual_pred_bid) * _ba_net_sell_qty
+                notify(
+                    f"🟡🟡🟡 <b>INCIDENT: PREDICT FILL TOO SMALL → UNWIND</b>\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Predict заполнил: <b>{_ba_net_sell_qty:.2f} shares</b> (${_pred_fill_usd:.2f})\n"
+                    f"Слишком мало для хеджа (мин ${_pred_min_fill_usd:.2f})\n"
+                    f"\n"
+                    f"Продажа обратно на Predict по {_unwind_price_pre:.2f}: {_unwind_pre_status}\n"
+                    f"Убыток: ~${abs(_unwind_pre_loss):.3f}\n"
+                )
+                row["ok"] = False
+                row["incident"] = {
+                    "type": "predict_fill_too_small",
+                    "pred_fill_usd": round(_pred_fill_usd, 4),
+                    "pred_min_fill_usd": _pred_min_fill_usd,
+                    "unwind_filled": _unwind_pre_filled,
+                    "unwind_error": _unwind_pre_err,
+                }
+                row["summary"]["status"] = "incident"
+                row["summary"]["reason_code"] = "predict_fill_too_small"
+                print(
+                    f"[TRADER][INCIDENT] PREDICT_FILL_TOO_SMALL label={opp.label} "
+                    f"pred_filled={_ba_net_sell_qty:.4f} fill_usd=${_pred_fill_usd:.2f} "
+                    f"min=${_pred_min_fill_usd:.2f} unwind={_unwind_pre_filled}"
+                )
+                if _market_id_int is not None:
+                    with _predict_market_in_flight_lock:
+                        _predict_market_in_flight.discard(_market_id_int)
+                _append_jsonl(trades_file, row)
+                return {"status": "incident", "reason": "predict_fill_too_small"}
+
             _ba_hedge_vwap = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_final_hedge_qty = _ba_net_sell_qty
             _ba_hedge_cost_usd = _ba_net_sell_qty * _ba_hedge_vwap
