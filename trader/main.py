@@ -3740,17 +3740,34 @@ def opportunity(opp: Opportunity) -> dict:
                 _unwind_sell_price = max(_unwind_tick, _ba_actual_pred_bid - _unwind_tick)
                 _uw2_result: dict[str, Any] = {}
                 _uw2_err: str | None = None
-                try:
-                    _uw2_result = _place_predict_limit_sell(
-                        pred_leg,
-                        sell_qty=_ba_net_sell_qty,
-                        sell_price=_unwind_sell_price,
-                        fill_timeout_sec=30.0,
-                        trace_id=trace_id,
-                    )
-                except Exception as _uw2_e:
-                    _uw2_err = str(_uw2_e)
-                    print(f"[TRADER][UNWIND_ERROR] unhedged_predict unwind err={_uw2_e}")
+                # Predict API can lag balance indexing after a fill — retry unwind up to 3x
+                # with increasing delays so the balance has time to appear.
+                _UW2_RETRIES = 3
+                _UW2_DELAYS = [2.0, 5.0, 10.0]
+                for _uw2_attempt in range(_UW2_RETRIES):
+                    if _uw2_attempt > 0:
+                        time.sleep(_UW2_DELAYS[_uw2_attempt - 1])
+                    _uw2_result = {}
+                    _uw2_err = None
+                    try:
+                        _uw2_result = _place_predict_limit_sell(
+                            pred_leg,
+                            sell_qty=_ba_net_sell_qty,
+                            sell_price=_unwind_sell_price,
+                            fill_timeout_sec=30.0,
+                            trace_id=trace_id,
+                        )
+                        if _uw2_result.get("filled"):
+                            break
+                    except Exception as _uw2_e:
+                        _uw2_err = str(_uw2_e)
+                        print(
+                            f"[TRADER][UNWIND_ERROR] unhedged_predict unwind "
+                            f"attempt={_uw2_attempt+1}/{_UW2_RETRIES} err={_uw2_e}"
+                        )
+                        _is_balance_lag = "400" in _uw2_err or "insufficient" in _uw2_err.lower()
+                        if not _is_balance_lag or _uw2_attempt == _UW2_RETRIES - 1:
+                            break
 
                 _uw2_filled = _uw2_result.get("filled", False)
                 _uw2_qty = _uw2_result.get("filled_qty", 0.0)
@@ -3779,16 +3796,16 @@ def opportunity(opp: Opportunity) -> dict:
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
                     f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f}"
                 )
-                _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}" if _uw2_filled else f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:60]) if _uw2_err else ''}"
+                _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}" if _uw2_filled else f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
                 notify(
                     f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b>\n"
-                    f"/n"
+                    f"\n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
                     f"Predict ({pred_leg.side.upper()} BID)\n"
                     f"price: {_ba_actual_pred_bid:.2f} - stake: ${_ba_hedge_qty * _ba_actual_pred_bid:.2f} - shares: {_ba_hedge_qty:.2f}\n"
                     f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
-                    f"price: {(_live_vwap_ba if _live_vwap_ba is not None else float(poly_leg.ask)):.2f} (est.) - err: {str(poly_exec_error_ba)[:50] if poly_exec_error_ba else 'unknown'}\n"
+                    f"price: {(_live_vwap_ba if _live_vwap_ba is not None else float(poly_leg.ask)):.2f} (est.) - err: {str(poly_exec_error_ba)[:200] if poly_exec_error_ba else 'unknown'}\n"
                     f"\n"
                     f"Unwind на Predict: {_uw2_status}\n"
                 )
