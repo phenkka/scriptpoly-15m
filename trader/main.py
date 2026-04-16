@@ -3593,8 +3593,11 @@ def opportunity(opp: Opportunity) -> dict:
             # Polymarket charges fee IN SHARES (taker asset), not in USDC.
             # takingAmount in API response = gross shares before fee deduction.
             # To receive exactly pred_fill net shares on Poly, we must order gross = net / (1 - fee_factor).
-            # fee_factor = feeRate * max(price, 1-price)
-            _ba_taker_fee_factor = _ba_fee_rate * max(_ba_hedge_vwap, 1.0 - _ba_hedge_vwap)
+            # Actual Poly fee formula: feeRate * (1 - price) per share
+            # (verified: at p=0.345 → 4.71%, at p=0.90 → 0.72%).
+            # Note: p*(1-p) proxy used in edge-check is correct for USDC cost per net share;
+            # (1-p) is the correct formula for SHARE deduction rate.
+            _ba_taker_fee_factor = _ba_fee_rate * (1.0 - _ba_hedge_vwap)
             _ba_final_hedge_qty_gross = _ba_final_hedge_qty / max(1e-6, 1.0 - _ba_taker_fee_factor)
             _ba_hedge_cost_usd = _ba_final_hedge_qty_gross * _ba_hedge_vwap
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
@@ -3797,7 +3800,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_making_val = float(_ba_poly_resp.get("makingAmount") or 0)
                 if _ba_poly_making_val > 0 and _ba_poly_qty > 0:
                     _ba_poly_fill_price = _ba_poly_making_val / _ba_poly_qty
-                    _ba_poly_net_fee_factor = _ba_fee_rate * max(_ba_poly_fill_price, 1.0 - _ba_poly_fill_price)
+                    _ba_poly_net_fee_factor = _ba_fee_rate * (1.0 - _ba_poly_fill_price)
                     _ba_poly_qty_actual = _ba_poly_qty * (1.0 - _ba_poly_net_fee_factor)
             except Exception:
                 pass
@@ -3868,8 +3871,8 @@ def opportunity(opp: Opportunity) -> dict:
                 # Store authoritative net_pnl so downstream code doesn't need to recalculate
                 row["net_pnl"] = round(_ba_net_pnl, 6)
                 # Update live_hedge_recheck with actual executed prices so stored PnL is accurate
-                # Effective per-share fee cost = extra USDC paid due to gross>net inflation
-                _actual_poly_fee = _ba_fee_rate * _ba_poly_price * max(_ba_poly_price, 1.0 - _ba_poly_price)
+                # Fee rate as share deduction fraction: feeRate * (1-price)
+                _actual_poly_fee = _ba_fee_rate * (1.0 - _ba_poly_price)
                 _actual_net_edge = (_ba_net_pnl / _ba_hedge_qty) if _ba_hedge_qty > 0 else 0.0
                 if "live_hedge_recheck" in row:
                     row["live_hedge_recheck"]["live_poly_vwap"] = round(_ba_poly_price, 6)
@@ -3986,7 +3989,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(success_trades_file, row)
 
                 # Effective quantities for notification: adjust for mismatch correction
-                _notif_poly_qty = _ba_poly_qty_actual  # net shares after Poly fee deduction
+                _notif_poly_qty = _ba_poly_qty_actual  # net shares after Poly fee (≈gross at high prices)
                 _notif_pred_qty = _ba_hedge_qty
                 _notif_mismatch_line = ""
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
