@@ -255,6 +255,24 @@ def _startup_warmup() -> None:
     _load_ba_fill_state()
     print(f"[TRADER] ba_fill_state loaded entries={len(_ba_fill_state)}")
 
+    # Pre-populate _predict_market_in_flight SYNCHRONOUSLY from disk so new trade requests
+    # are blocked immediately — before the background inflight-check thread runs.
+    if _INFLIGHT_ORDERS_FILE.exists():
+        try:
+            _inflight_data = json.loads(_INFLIGHT_ORDERS_FILE.read_text())
+            _cutoff = time.time() - 600
+            _preload_ids = [
+                int(k)
+                for k, v in _inflight_data.items()
+                if isinstance(v, dict) and float(v.get("ts", 0)) > _cutoff
+            ]
+            if _preload_ids:
+                with _predict_market_in_flight_lock:
+                    _predict_market_in_flight.update(_preload_ids)
+                print(f"[TRADER] inflight markets pre-blocked={_preload_ids}")
+        except Exception as _pre_e:
+            print(f"[TRADER] inflight preload error={_pre_e}")
+
     # Check for Predict orders that were in-flight when the container last stopped.
     # Runs in a background thread so it doesn't block server startup.
     threading.Thread(target=_check_inflight_on_startup, daemon=True, name="inflight_startup_check").start()
@@ -503,6 +521,12 @@ def _check_inflight_on_startup() -> None:
 
         # Clean up the file after alerting
         _INFLIGHT_ORDERS_FILE.unlink(missing_ok=True)
+
+        # Release the pre-blocked market IDs so normal trading can resume
+        _preblocked = {int(k) for k in fresh}
+        with _predict_market_in_flight_lock:
+            _predict_market_in_flight.difference_update(_preblocked)
+        print(f"[TRADER][STARTUP] inflight markets unblocked={list(_preblocked)}")
 
     except Exception as _e:
         print(f"[TRADER][STARTUP] check_inflight error={_e}")
@@ -2498,14 +2522,19 @@ def _place_predict_limit_sell(
             except Exception:
                 pass
         current_price = max(_tick, round(current_price - _tick, 6))
+        # Compute remaining unfilled quantity — avoid re-placing for already-filled shares
+        _filled_so_far = filled_wei / 10**18 if filled_wei > 0 else 0.0
+        _rem_qty = max(0.01, sell_qty - _filled_so_far)
+        _rem_qty_wei = _wei_from_float(_rem_qty)
         print(
             f"[TRADER]{_trace} predict_limit_sell replace → new_price={current_price:.4f} "
+            f"filled_so_far={_filled_so_far:.4f} remaining={_rem_qty:.4f} "
             f"remaining_sec={(t_deadline - time.time()):.1f}"
         )
         try:
             _rep_price_wei = _wei_from_float(current_price)
             _rep_amounts = builder.get_limit_order_amounts(
-                LimitHelperInput(side=Side.SELL, price_per_share_wei=_rep_price_wei, quantity_wei=quantity_wei)
+                LimitHelperInput(side=Side.SELL, price_per_share_wei=_rep_price_wei, quantity_wei=_rem_qty_wei)
             )
             _rep_order = builder.build_order(
                 "LIMIT",
@@ -4022,22 +4051,28 @@ def opportunity(opp: Opportunity) -> dict:
                 _uw2_err: str | None = None
                 # Predict API can lag balance indexing after a fill — retry unwind up to 3x
                 # with increasing delays so the balance has time to appear.
+                # Track cumulative filled across attempts so each retry only sells the remainder.
                 _UW2_RETRIES = 3
                 _UW2_DELAYS = [2.0, 5.0, 10.0]
+                _uw2_total_sold = 0.0
                 for _uw2_attempt in range(_UW2_RETRIES):
                     if _uw2_attempt > 0:
                         time.sleep(_UW2_DELAYS[_uw2_attempt - 1])
+                    _uw2_remaining = max(0.01, _ba_net_sell_qty - _uw2_total_sold)
+                    if _uw2_remaining < 0.01:
+                        break
                     _uw2_result = {}
                     _uw2_err = None
                     try:
                         _uw2_result = _place_predict_limit_sell(
                             pred_leg,
-                            sell_qty=_ba_net_sell_qty,
+                            sell_qty=_uw2_remaining,
                             sell_price=_unwind_sell_price,
                             fill_timeout_sec=30.0,
                             trace_id=trace_id,
                         )
-                        if _uw2_result.get("filled"):
+                        _uw2_total_sold += _uw2_result.get("filled_qty", 0.0)
+                        if _uw2_result.get("filled") or _uw2_total_sold >= _ba_net_sell_qty * 0.99:
                             break
                     except Exception as _uw2_e:
                         _uw2_err = str(_uw2_e)
@@ -4049,8 +4084,8 @@ def opportunity(opp: Opportunity) -> dict:
                         if not _is_balance_lag or _uw2_attempt == _UW2_RETRIES - 1:
                             break
 
-                _uw2_filled = _uw2_result.get("filled", False)
-                _uw2_qty = _uw2_result.get("filled_qty", 0.0)
+                _uw2_filled = _uw2_total_sold >= _ba_net_sell_qty * 0.99
+                _uw2_qty = _uw2_total_sold
 
                 _ba_inc2 = {
                     "ts": datetime.utcnow().isoformat() + "Z",
