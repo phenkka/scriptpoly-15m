@@ -3590,15 +3590,23 @@ def opportunity(opp: Opportunity) -> dict:
 
             _ba_hedge_vwap = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_final_hedge_qty = _ba_net_sell_qty
-            _ba_hedge_cost_usd = _ba_net_sell_qty * _ba_hedge_vwap
+            # Polymarket charges fee IN SHARES (taker asset), not in USDC.
+            # takingAmount in API response = gross shares before fee deduction.
+            # To receive exactly pred_fill net shares on Poly, we must order gross = net / (1 - fee_factor).
+            # fee_factor = feeRate * max(price, 1-price)
+            _ba_taker_fee_factor = _ba_fee_rate * max(_ba_hedge_vwap, 1.0 - _ba_hedge_vwap)
+            _ba_final_hedge_qty_gross = _ba_final_hedge_qty / max(1e-6, 1.0 - _ba_taker_fee_factor)
+            _ba_hedge_cost_usd = _ba_final_hedge_qty_gross * _ba_hedge_vwap
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
             # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
             _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
             if _ba_hedge_cost_usd < _poly_min_hedge:
                 if _ba_hedge_cost_usd >= _poly_over_hedge_threshold:
                     # ── Over-hedge: buy slightly more shares to meet Poly $1 minimum ──
-                    _ba_hedge_qty_orig = _ba_final_hedge_qty
+                    _ba_hedge_qty_orig = _ba_final_hedge_qty_gross
                     _ba_final_hedge_qty = (_poly_min_hedge * 1.02) / _ba_hedge_vwap
+                    # _ba_final_hedge_qty is already the gross target (USD / price); update gross var.
+                    _ba_final_hedge_qty_gross = _ba_final_hedge_qty
                     _ba_hedge_cost_usd = _poly_min_hedge * 1.02
                     print(
                         f"[TRADER] BID_ASK_OVER_HEDGE label={opp.label} "
@@ -3688,7 +3696,7 @@ def opportunity(opp: Opportunity) -> dict:
             _ba_worst_price = _live_worst_ba if _live_worst_ba else _ba_hedge_vwap * 1.02
             _ba_limit_price = min(0.99, _math.ceil(_ba_worst_price * 1000) / 1000)
             _ba_hedge_leg = OpportunityLeg(
-                **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty, "stake_usd": _ba_final_hedge_qty * _ba_hedge_price}
+                **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty_gross, "stake_usd": _ba_final_hedge_qty_gross * _ba_hedge_price}
             )
             polymarket_result_ba: dict[str, Any] | None = None
             poly_exec_error_ba: Exception | None = None
@@ -3705,7 +3713,7 @@ def opportunity(opp: Opportunity) -> dict:
                 try:
                     polymarket_result_ba = _place_polymarket_limit_buy_exact_shares(
                         str(poly_leg.token_id),
-                        shares=_ba_final_hedge_qty,
+                        shares=_ba_final_hedge_qty_gross,
                         price=_ba_limit_price,
                         private_key=_poly_pk,
                         funder=_poly_funder,
@@ -3779,9 +3787,17 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
             except (ValueError, TypeError):
                 pass
-            # Limit orders credit exactly `size` shares — no LP-fee deduction from shares.
-            # takingAmount IS the actual credited amount for limit orders.
+            # takingAmount = gross shares BEFORE Poly fee deduction from shares.
+            # Net shares actually credited = gross * (1 - feeRate * max(fill_price, 1-fill_price)).
             _ba_poly_qty_actual = _ba_poly_qty
+            try:
+                _ba_poly_making_val = float(_ba_poly_resp.get("makingAmount") or 0)
+                if _ba_poly_making_val > 0 and _ba_poly_qty > 0:
+                    _ba_poly_fill_price = _ba_poly_making_val / _ba_poly_qty
+                    _ba_poly_net_fee_factor = _ba_fee_rate * max(_ba_poly_fill_price, 1.0 - _ba_poly_fill_price)
+                    _ba_poly_qty_actual = _ba_poly_qty * (1.0 - _ba_poly_net_fee_factor)
+            except Exception:
+                pass
             _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty_actual)
 
             row["fill_analysis"] = {
