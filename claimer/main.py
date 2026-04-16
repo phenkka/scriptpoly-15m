@@ -349,7 +349,12 @@ def _fetch_poly_positions(session: requests.Session, safe_address: str) -> list[
     data = r.json()
     if isinstance(data, dict):
         data = data.get("positions", data.get("data", []))
-    return [p for p in (data or []) if p.get("redeemable")]
+    # Include positions that are either flagged redeemable OR have curPrice > 0.95
+    # (Polymarket API sometimes lags updating redeemable=True after resolution)
+    return [
+        p for p in (data or [])
+        if p.get("redeemable") or float(p.get("curPrice") or 0) > 0.95
+    ]
 
 
 def _claim_polymarket(

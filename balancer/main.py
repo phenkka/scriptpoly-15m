@@ -685,14 +685,18 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
 
             market = pos.get("market") or {}
             outcome = pos.get("outcome") or {}
-            if market.get("status") == "RESOLVED":
-                continue  # claimed separately
             try:
                 amount_wei = int(pos.get("amount", 0))
             except Exception:
                 amount_wei = 0
             shares = amount_wei / 1e18
             if shares <= 0:
+                continue
+            # For resolved WON positions: worth full $1/share until claimed
+            if market.get("status") == "RESOLVED":
+                if (outcome.get("status") or "").upper() == "WON":
+                    total += shares
+                # LOST positions are worth $0 — skip
                 continue
             try:
                 cur_yes = float(market.get("curYesPrice", 0) or 0)
