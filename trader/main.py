@@ -1561,7 +1561,7 @@ def _place_polymarket_limit_buy_exact_shares(
         side=BUY,
     )
     _GTC_FILL_POLL_INTERVAL = 0.5
-    _GTC_FILL_TIMEOUT = float(os.environ.get("POLY_GTC_FILL_TIMEOUT_SEC", "30"))
+    _GTC_FILL_TIMEOUT = float(os.environ.get("POLY_GTC_FILL_TIMEOUT_SEC", "10"))
     try:
         client = _build_client()
         signed = client.create_order(order_args)
