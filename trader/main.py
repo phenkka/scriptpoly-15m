@@ -3692,12 +3692,14 @@ def opportunity(opp: Opportunity) -> dict:
                 except Exception as _e_ba_poly:
                     poly_exec_error_ba = _e_ba_poly
                     _err_s = str(_e_ba_poly)
-                    # Only retry on network/connection errors, not logical API rejections
+                    # Retry on network errors AND on Poly 500 ("could not run the execution")
+                    # 500 is often transient (matching engine hiccup), worth one retry
                     _is_network_err = (
                         "Request exception" in _err_s
                         or "ConnectionError" in _err_s
                         or "Timeout" in _err_s
                         or "status_code=None" in _err_s
+                        or "status_code=500" in _err_s
                     )
                     if _is_network_err and _poly_attempt < _POLY_HEDGE_RETRIES - 1:
                         print(
