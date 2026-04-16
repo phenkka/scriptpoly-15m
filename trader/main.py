@@ -1561,7 +1561,7 @@ def _place_polymarket_limit_buy_exact_shares(
         side=BUY,
     )
     _GTC_FILL_POLL_INTERVAL = 0.5
-    _GTC_FILL_TIMEOUT = float(os.environ.get("POLY_GTC_FILL_TIMEOUT_SEC", "10"))
+    _GTC_FILL_TIMEOUT = float(os.environ.get("POLY_GTC_FILL_TIMEOUT_SEC", "30"))
     try:
         client = _build_client()
         signed = client.create_order(order_args)
@@ -1605,13 +1605,71 @@ def _place_polymarket_limit_buy_exact_shares(
                         }
                 except Exception:
                     pass
-            # Timed out — cancel the resting order
+            # Timed out — cancel the resting order, then do a definitive fill check.
+            # Race condition: the order may fill concurrently with or just before cancel.
+            # We MUST verify before declaring failure to avoid phantom unwinds.
             if order_id:
                 try:
                     client.cancel(order_id)
                     print(f"[TRADER][POLY][GTC_CANCEL] cancelled live order order_id={order_id}")
                 except Exception as _ce:
                     print(f"[TRADER][POLY][GTC_CANCEL_ERR] order_id={order_id} err={_ce}")
+                # Wait for exchange to process cancel and any in-flight fill settlement
+                time.sleep(2.0)
+                # 1) Authenticated order status check (more reliable than public endpoint)
+                try:
+                    _auth_order = client.get_order(order_id)
+                    _auth_status = (_auth_order.get("status") or "").lower()
+                    print(
+                        f"[TRADER][POLY][GTC_CANCEL_VERIFY] order_id={order_id} "
+                        f"auth_status={_auth_status} "
+                        f"size_matched={_auth_order.get('size_matched')} "
+                        f"size_filled={_auth_order.get('size_filled')}"
+                    )
+                    _size_matched = float(_auth_order.get("size_matched") or 0)
+                    if _auth_status in ("matched", "filled") or _size_matched > 0:
+                        print(
+                            f"[TRADER][POLY][GTC_FILLED_AFTER_CANCEL] "
+                            f"order_id={order_id} matched={_size_matched:.4f} — treating as success"
+                        )
+                        return {
+                            "token_id": token_id,
+                            "shares_requested": shares,
+                            "price": price,
+                            "response": _auth_order,
+                            "order_type": "GTC",
+                        }
+                except Exception as _goe:
+                    print(f"[TRADER][POLY][GTC_GET_ORDER_ERR] order_id={order_id} err={_goe}")
+                # 2) Fallback: check trade history for any fill from this order
+                try:
+                    from py_clob_client.clob_types import TradeParams as _TradeParams
+                    _recent_trades = client.get_trades(
+                        _TradeParams(id=order_id, asset_id=token_id), next_cursor="MA=="
+                    )
+                    if _recent_trades:
+                        _fill_qty = sum(float(t.get("size") or 0) for t in _recent_trades)
+                        print(
+                            f"[TRADER][POLY][GTC_TRADE_HISTORY_FILL] order_id={order_id} "
+                            f"trades={len(_recent_trades)} fill_qty={_fill_qty:.4f} — treating as success"
+                        )
+                        # Reconstruct a minimal response for the caller
+                        _synth_resp = {
+                            "success": True,
+                            "status": "matched",
+                            "orderID": order_id,
+                            "takingAmount": str(int(_fill_qty * 1_000_000)),
+                            "transactionsHashes": [t.get("transaction_hash", "") for t in _recent_trades if t.get("transaction_hash")],
+                        }
+                        return {
+                            "token_id": token_id,
+                            "shares_requested": shares,
+                            "price": price,
+                            "response": _synth_resp,
+                            "order_type": "GTC",
+                        }
+                except Exception as _gte:
+                    print(f"[TRADER][POLY][GTC_TRADE_HISTORY_ERR] order_id={order_id} err={_gte}")
             raise RuntimeError(
                 f"poly_gtc_not_filled: order went live and did not fill within "
                 f"{_GTC_FILL_TIMEOUT:.0f}s (order_id={order_id})"
@@ -3787,7 +3845,15 @@ def opportunity(opp: Opportunity) -> dict:
 
             _ba_poly_resp = (polymarket_result_ba.get("response") or {}) if polymarket_result_ba else {}
             _ba_poly_txhashes = _ba_poly_resp.get("transactionsHashes") or []
-            poly_filled_ba = _ba_poly_resp.get("success") is True and bool(_ba_poly_txhashes)
+            _ba_poly_resp_status = (_ba_poly_resp.get("status") or "").lower()
+            _ba_poly_size_matched = float(_ba_poly_resp.get("size_matched") or 0)
+            # Success: normal matched response (success+txhashes) OR post-cancel auth check
+            # (status=matched/filled or size_matched>0 from get_order) OR synthetic trade-history response
+            poly_filled_ba = (
+                (_ba_poly_resp.get("success") is True and bool(_ba_poly_txhashes))
+                or _ba_poly_resp_status in ("matched", "filled")
+                or _ba_poly_size_matched > 0
+            )
             _ba_poly_qty: float = 0.0
             try:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
