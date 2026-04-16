@@ -3695,6 +3695,9 @@ def opportunity(opp: Opportunity) -> dict:
             import math as _math
             _ba_worst_price = _live_worst_ba if _live_worst_ba else _ba_hedge_vwap * 1.02
             _ba_limit_price = min(0.99, _math.ceil(_ba_worst_price * 1000) / 1000)
+            # Poly CLOB SDK internally does round_down(size, 2) before signing the order.
+            # Round gross qty UP to 2 decimal places so SDK preserves exactly our value.
+            _ba_final_hedge_qty_gross = _math.ceil(_ba_final_hedge_qty_gross * 100) / 100
             _ba_hedge_leg = OpportunityLeg(
                 **{**poly_leg.model_dump(), "shares": _ba_final_hedge_qty_gross, "stake_usd": _ba_final_hedge_qty_gross * _ba_hedge_price}
             )
