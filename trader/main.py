@@ -3849,6 +3849,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_price = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
                 # Override with actual fill price from Polymarket response (makingAmount/takingAmount)
                 # makingAmount = USDC spent, takingAmount = shares received → actual avg price
+                _ba_poly_making = 0.0  # actual USDC paid to Poly (set inside try below)
                 try:
                     _ba_poly_making = float(_ba_poly_resp.get("makingAmount") or 0)
                     _ba_poly_taking = float(_ba_poly_resp.get("takingAmount") or 0)
@@ -3856,15 +3857,19 @@ def opportunity(opp: Opportunity) -> dict:
                         _ba_poly_price = _ba_poly_making / _ba_poly_taking
                 except Exception:
                     pass
-                _ba_poly_fee_paid = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price) * _ba_hedge_qty
                 _ba_pred_fee_paid = _ba_pred_fee_bps / 10_000 * _ba_pred_price * _ba_hedge_qty
-                _ba_gross = _ba_hedge_qty * (1.0 - _ba_pred_price - _ba_poly_price)
-                _ba_net_pnl = _ba_gross - _ba_poly_fee_paid - _ba_pred_fee_paid
+                # P&L: actual cash flows.
+                # USDC paid to Poly = makingAmount (gross shares × price, includes share-fee overhead).
+                # USDC paid/received for Predict DOWN = hedge_qty × pred_price.
+                # At resolution: _ba_poly_qty_actual NET UP shares pay out $1 each.
+                _ba_poly_usdc = _ba_poly_making if _ba_poly_making > 0 else _ba_poly_qty_actual * _ba_poly_price
+                _ba_net_pnl = _ba_poly_qty_actual - _ba_poly_usdc - _ba_hedge_qty * _ba_pred_price - _ba_pred_fee_paid
                 _trade_pnl_log.append((time.time(), _ba_net_pnl))
                 # Store authoritative net_pnl so downstream code doesn't need to recalculate
                 row["net_pnl"] = round(_ba_net_pnl, 6)
                 # Update live_hedge_recheck with actual executed prices so stored PnL is accurate
-                _actual_poly_fee = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price)
+                # Effective per-share fee cost = extra USDC paid due to gross>net inflation
+                _actual_poly_fee = _ba_fee_rate * _ba_poly_price * max(_ba_poly_price, 1.0 - _ba_poly_price)
                 _actual_net_edge = (_ba_net_pnl / _ba_hedge_qty) if _ba_hedge_qty > 0 else 0.0
                 if "live_hedge_recheck" in row:
                     row["live_hedge_recheck"]["live_poly_vwap"] = round(_ba_poly_price, 6)
@@ -3981,14 +3986,14 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(success_trades_file, row)
 
                 # Effective quantities for notification: adjust for mismatch correction
-                _notif_poly_qty = _ba_poly_qty
+                _notif_poly_qty = _ba_poly_qty_actual  # net shares after Poly fee deduction
                 _notif_pred_qty = _ba_hedge_qty
                 _notif_mismatch_line = ""
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
                     _mm_action_final = locals().get("_mm_action", "sell_predict")
                     _mm_poly_bought_final = locals().get("_mm_poly_bought", False)
                     if _mm_action_final == "buy_poly" and _mm_poly_bought_final:
-                        _notif_poly_qty = _ba_poly_qty + _ba_mismatch_shares
+                        _notif_poly_qty = _ba_poly_qty_actual + _ba_mismatch_shares
                         _notif_mismatch_line = f"<i>📎 +{_ba_mismatch_shares:.3f} sh rebuyed on Poly</i>\n"
                     else:
                         _notif_pred_qty = _ba_hedge_qty - _ba_mismatch_shares
@@ -4003,7 +4008,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _fill_n = (_prev[2] + 1) if _is_grouped else 1
 
                 # ROI relative to total stake
-                _total_stake = _ba_poly_qty * _ba_poly_price + _ba_hedge_qty * _ba_pred_price
+                _total_stake = _ba_poly_usdc + _ba_hedge_qty * _ba_pred_price  # actual USDC invested
                 _roi_pct = (_ba_net_pnl / _total_stake * 100) if _total_stake > 0 else 0.0
 
                 # Market title from legs
