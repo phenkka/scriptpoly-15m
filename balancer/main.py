@@ -1141,16 +1141,17 @@ def main() -> None:
                     _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
 
                     def _bal_line(name: str, cash: float, with_pos: float) -> str:
-                        if with_pos > cash + 0.01:
-                            return f"{name}: <b>${cash:.2f}</b> (${with_pos:.2f})\n"
+                        pos = with_pos - cash
+                        if pos > 0.01:
+                            return f"{name}: <b>${with_pos:.2f}</b>  <i>(cash ${cash:.2f} + pos ${pos:.2f})</i>\n"
                         return f"{name}: <b>${cash:.2f}</b>\n"
 
                     _poly_line = _bal_line("Polymarket", poly_display, _poly_with_pos)
                     _pred_line = _bal_line("Predict", pred_trigger_bal, _pred_with_pos)
+                    _total_line = f"<b>TOTAL: ${_total_with_pos:.2f}</b>"
                     if _total_with_pos > _total_cash + 0.01:
-                        _total_line = f"<b>TOTAL: ${_total_cash:.2f}</b> (${_total_with_pos:.2f})\n"
-                    else:
-                        _total_line = f"<b>TOTAL: ${_total_cash:.2f}</b>\n"
+                        _total_line += f"  <i>(liquid ${_total_cash:.2f})</i>"
+                    _total_line += "\n"
                     _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
                     if _incidents:
                         _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
