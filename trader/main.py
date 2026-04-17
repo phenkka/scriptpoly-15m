@@ -3591,7 +3591,12 @@ def opportunity(opp: Opportunity) -> dict:
                     f"live_vwap={_live_vwap_ba:.4f} cap={_poly_max_hedge_price:.4f} "
                     f"unwind_filled={_pc_uw_filled} unwind_qty={_pc_uw_qty:.4f}"
                 )
-                _pc_uw_status = "✅ продано" if _pc_uw_filled else "❌ не продано — ручная проверка!"
+                if _pc_uw_filled:
+                    _pc_uw_status = f"✅ продано {_pc_uw_qty:.2f} шарес по {_pc_unwind_price:.2f}"
+                elif _pc_uw_qty > 0:
+                    _pc_uw_status = f"⚠️ ЧАСТИЧНО продано {_pc_uw_qty:.2f}/{_ba_hedge_qty:.2f} шарес — остаток {_ba_hedge_qty - _pc_uw_qty:.2f} — ручная проверка!"
+                else:
+                    _pc_uw_status = "❌ не продано — ручная проверка!" + (f" err: {_pc_unwind_err}" if _pc_unwind_err else "")
                 notify(
                     f"🟡🟡🟡 <b>INCIDENT: HEDGE PRICE CAP → UNWIND</b>\n"
                     f"\n"
@@ -3601,7 +3606,7 @@ def opportunity(opp: Opportunity) -> dict:
                     f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
                     f"\n"
                     f"Продажа обратно на Predict по {_pc_unwind_price:.2f}: {_pc_uw_status}\n"
-                    + (f"Ошибка: {_pc_unwind_err}\n" if _pc_unwind_err else "")
+                    + (f"Ошибка: {_pc_unwind_err}\n" if _pc_unwind_err and _pc_uw_qty == 0 else "")
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
@@ -3630,9 +3635,18 @@ def opportunity(opp: Opportunity) -> dict:
                             trace_id=trace_id,
                         )
                         _unwind_pre_filled = _unwind_pre_result.get("filled", False)
+                        _unwind_pre_qty = _unwind_pre_result.get("filled_qty", 0.0)
                     except Exception as _upre_e:
                         _unwind_pre_err = str(_upre_e)
-                _unwind_pre_status = "✅ продано" if _unwind_pre_filled else f"❌ не удалось{(' — ' + _unwind_pre_err[:80]) if _unwind_pre_err else ''}"
+                        _unwind_pre_qty = 0.0
+                else:
+                    _unwind_pre_qty = 0.0
+                if _unwind_pre_filled:
+                    _unwind_pre_status = f"✅ продано {_unwind_pre_qty:.2f} шарес"
+                elif _unwind_pre_qty > 0:
+                    _unwind_pre_status = f"⚠️ ЧАСТИЧНО продано {_unwind_pre_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ba_net_sell_qty - _unwind_pre_qty:.2f} — ручная проверка!"
+                else:
+                    _unwind_pre_status = f"❌ не удалось{(' — ' + _unwind_pre_err[:80]) if _unwind_pre_err else ''}"
                 _unwind_pre_loss = (_unwind_price_pre - _ba_actual_pred_bid) * _ba_net_sell_qty
                 notify(
                     f"🟡🟡🟡 <b>INCIDENT: PREDICT FILL TOO SMALL → UNWIND</b>\n"
@@ -3753,7 +3767,12 @@ def opportunity(opp: Opportunity) -> dict:
                         f"pred_filled={_ba_hedge_qty:.4f} cost=${_ba_hedge_cost_usd:.2f} "
                         f"unwind_filled={_uw_filled} unwind_qty={_uw_qty:.4f}"
                     )
-                    _uw_status = "✅ продано" if _uw_filled else "❌ не продано — ручная проверка!"
+                    if _uw_filled:
+                        _uw_status = f"✅ продано {_uw_qty:.2f} шарес по {_unwind_price:.2f}"
+                    elif _uw_qty > 0:
+                        _uw_status = f"⚠️ ЧАСТИЧНО продано {_uw_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ba_net_sell_qty - _uw_qty:.2f} — ручная проверка!"
+                    else:
+                        _uw_status = "❌ не продано — ручная проверка!" + (f" err: {_unwind_err}" if _unwind_err else "")
                     notify(
                         f"🟡🟡🟡 <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
                         f"\n"
@@ -4224,7 +4243,17 @@ def opportunity(opp: Opportunity) -> dict:
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
                     f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f}"
                 )
-                _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}" if _uw2_filled else f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
+                if _uw2_filled:
+                    _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}"
+                elif _uw2_qty > 0:
+                    _uw2_remaining_qty = _ba_net_sell_qty - _uw2_qty
+                    _uw2_status = (
+                        f"⚠️ ЧАСТИЧНО продано {_uw2_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — "
+                        f"остаток {_uw2_remaining_qty:.2f} шарес — ручная проверка!"
+                        + (f" err: {_uw2_err[:200]}" if _uw2_err else "")
+                    )
+                else:
+                    _uw2_status = f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
                 notify(
                     f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b>\n"
                     f"\n"
