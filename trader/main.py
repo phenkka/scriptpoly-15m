@@ -1896,7 +1896,7 @@ def _place_predict_limit_buy(
     # ── Queue-aware bid pricing ──
     tick_size = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
     queue_threshold_usd = float(os.environ.get("PREDICT_QUEUE_THRESHOLD_USD", "20.0") or "20.0")
-    hard_max_queue_usd = float(os.environ.get("PREDICT_HARD_MAX_QUEUE_USD", "100.0") or "100.0")
+    hard_max_queue_usd = float(os.environ.get("PREDICT_HARD_MAX_QUEUE_USD", "30.0") or "30.0")
 
     # max_bid: highest bid price where net_edge > 0 after all fees
     # poly fee = feeRate * p * (1-p); using analyzer's poly_hedge_ask as p
@@ -2124,6 +2124,26 @@ def _place_predict_limit_buy(
                 cancel_reason = f"terminal_status:{status}"
                 need_final_get_check = True
                 break
+
+            # ── Max quote age: if no fill at all within N seconds → cancel and skip ──
+            # Prevents holding a stale bid for 60–80s while Poly moves against us.
+            # Only applies before any fill — once partially filled we must continue or unwind.
+            _max_quote_age_sec = float(os.environ.get("PREDICT_MAX_QUOTE_AGE_SEC", "0") or "0")
+            if _max_quote_age_sec > 0 and first_fill_ts is None and current_filled_wei <= 0:
+                _quote_age = time.time() - quote_post_ts
+                if _quote_age >= _max_quote_age_sec:
+                    cancel_reason = f"max_quote_age:{_quote_age:.1f}s"
+                    print(
+                        f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age hash={order_hash} "
+                        f"age={_quote_age:.1f}s limit={_max_quote_age_sec:.0f}s"
+                    )
+                    try:
+                        if order_id:
+                            _predict_remove_orders(session, [order_id])
+                    except Exception as _mqa_e:
+                        print(f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age_err err={_mqa_e}")
+                    need_final_get_check = True
+                    break
 
             # ── Live Poly hedge-viability check: cancel if hedge became unprofitable ──
             if poly_token_id and current_filled_wei <= 0:
