@@ -2451,7 +2451,7 @@ def _place_predict_limit_sell(
     sell_qty: float,
     sell_price: float,
     fill_timeout_sec: float = 30.0,
-    replace_interval_sec: float = 10.0,
+    replace_interval_sec: float = 3.0,
     trace_id: int | None = None,
 ) -> dict[str, Any]:
     """Place a LIMIT SELL on Predict to unwind a partial position.
@@ -3541,7 +3541,7 @@ def opportunity(opp: Opportunity) -> dict:
                         pred_leg,
                         sell_qty=_ba_net_sell_qty,
                         sell_price=_pc_unwind_price,
-                        fill_timeout_sec=30.0,
+                        fill_timeout_sec=60.0,
                         trace_id=trace_id,
                     )
                 except Exception as _pc_uw_e:
@@ -3606,7 +3606,7 @@ def opportunity(opp: Opportunity) -> dict:
                             pred_leg,
                             sell_qty=_ba_net_sell_qty,
                             sell_price=_unwind_price_pre,
-                            fill_timeout_sec=30.0,
+                            fill_timeout_sec=60.0,
                             trace_id=trace_id,
                         )
                         _unwind_pre_filled = _unwind_pre_result.get("filled", False)
@@ -3701,7 +3701,7 @@ def opportunity(opp: Opportunity) -> dict:
                             pred_leg,
                             sell_qty=_ba_net_sell_qty,
                             sell_price=_unwind_price,
-                            fill_timeout_sec=30.0,
+                            fill_timeout_sec=60.0,
                             trace_id=trace_id,
                         )
                     except Exception as _uw_e:
@@ -4018,7 +4018,7 @@ def opportunity(opp: Opportunity) -> dict:
                                 pred_leg,
                                 sell_qty=_ba_mismatch_shares,
                                 sell_price=_mm_unwind_price,
-                                fill_timeout_sec=30.0,
+                                fill_timeout_sec=60.0,
                                 trace_id=trace_id,
                             )
                             _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
@@ -4161,7 +4161,7 @@ def opportunity(opp: Opportunity) -> dict:
                             pred_leg,
                             sell_qty=_uw2_remaining,
                             sell_price=_unwind_sell_price,
-                            fill_timeout_sec=30.0,
+                            fill_timeout_sec=60.0,
                             trace_id=trace_id,
                         )
                         _uw2_total_sold += _uw2_result.get("filled_qty", 0.0)
