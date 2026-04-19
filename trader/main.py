@@ -4090,6 +4090,34 @@ def opportunity(opp: Opportunity) -> dict:
                     "sell_error": _ba_mismatch_sell_err,
                 }
 
+                # Recompute PnL to reflect actual cash flows after mismatch correction.
+                # The initial _ba_net_pnl was calculated before correction and used the full
+                # Predict qty (_ba_hedge_qty) without subtracting sell-back proceeds.
+                if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
+                    _mm_action_used = locals().get("_mm_action", "none")
+                    if _mm_action_used == "sell_predict":
+                        # Proceeds from selling excess Predict shares back
+                        _mm_sell_price_used = locals().get("_mm_unwind_price", 0.0)
+                        _mm_proceeds = _ba_mismatch_shares * _mm_sell_price_used
+                        _ba_net_pnl = (
+                            _ba_poly_qty_actual
+                            - _ba_poly_usdc
+                            - _ba_hedge_qty * _ba_pred_price
+                            + _mm_proceeds
+                            - _ba_pred_fee_paid
+                        )
+                    elif _mm_action_used == "buy_poly":
+                        # Additional cost from rebuying missing Poly shares
+                        _mm_rebuy_price = locals().get("_mm_poly_price", 0.0)
+                        _ba_net_pnl = (
+                            _ba_hedge_qty
+                            - _ba_poly_usdc
+                            - _ba_mismatch_shares * _mm_rebuy_price
+                            - _ba_hedge_qty * _ba_pred_price
+                            - _ba_pred_fee_paid
+                        )
+                    row["net_pnl"] = round(_ba_net_pnl, 6)
+
                 _append_jsonl(trades_file, row)
                 _append_jsonl(success_trades_file, row)
 
@@ -4146,9 +4174,17 @@ def opportunity(opp: Opportunity) -> dict:
                 else:
                     _pnl_suffix = " — GG PROEBALI"
                 _pnl_emoji = "📈" if _ba_net_pnl >= 0 else "📉"
+                # Recalculate ROI based on corrected PnL and actual net stake
+                _net_pred_cost = _notif_pred_qty * _ba_pred_price
+                _net_poly_cost = _notif_poly_qty * _ba_poly_price
+                _total_stake_corrected = _net_poly_cost + _net_pred_cost
+                _roi_pct = (_ba_net_pnl / _total_stake_corrected * 100) if _total_stake_corrected > 0 else 0.0
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
                 _h1_pnl, _h1_n = _pnl_last_hour()
+
+                # Final hedge qty (balanced side) for the "invested / payout" summary line
+                _final_hedge_qty = min(_notif_poly_qty, _notif_pred_qty)
 
                 _msg_id = notify(
                     f"{_title}\n"
@@ -4157,10 +4193,11 @@ def opportunity(opp: Opportunity) -> dict:
                     f"<b>{opp.label}</b>\n"
                     f"\n"
                     f"<b>Polymarket</b>  {poly_leg.side.upper()}\n"
-                    f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_notif_poly_qty * _ba_poly_price:.2f}</b>\n"
+                    f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_net_poly_cost:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
-                    f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_notif_pred_qty * _ba_pred_price:.2f}</b>\n"
+                    f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_net_pred_cost:.2f}</b>\n"
                     + _notif_mismatch_line
+                    + f"<i>💰 вложено ${_total_stake_corrected:.2f} → при разрешении получишь ${_final_hedge_qty:.2f}</i>\n"
                     + _poly_pos_line
                     + f"\n"
                     f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
