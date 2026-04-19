@@ -2075,6 +2075,7 @@ def _place_predict_limit_buy(
     partial_fills: list[dict[str, Any]] = []
     prev_filled_wei: int = 0
     replace_count: int = 0
+    replaced_order_hashes: list[str] = []  # hashes that were replaced (not just cancelled)
     cancel_reason: str | None = None
     last_get: dict[str, Any] | None = None
     all_creates: list[dict[str, Any]] = [out]
@@ -2279,6 +2280,9 @@ def _place_predict_limit_buy(
                         out_new, payload = _build_and_post(current_bid_price)
                         create_data_new = out_new.get("data") if isinstance(out_new.get("data"), dict) else {}
                         order_id = str(create_data_new.get("orderId") or "").strip() or None
+                        # Track old hash BEFORE overwriting — it may have filled on BSC
+                        if order_hash:
+                            replaced_order_hashes.append(order_hash)
                         order_hash = str(create_data_new.get("orderHash") or "").strip() or None
                         quote_post_ts = time.time()
                         replace_count += 1
@@ -2434,6 +2438,7 @@ def _place_predict_limit_buy(
         "filled": filled,
         "orderId": order_id,
         "orderHash": order_hash,
+        "replaced_order_hashes": replaced_order_hashes,
         "partial_fills": partial_fills,
         "total_filled_wei": total_filled_wei,
         "total_filled_shares": total_filled_wei / 10**18 if total_filled_wei > 0 else 0.0,
@@ -3496,6 +3501,14 @@ def opportunity(opp: Opportunity) -> dict:
                 if pred_hash_ba and _ba_cancel_rsn and pred_leg.market_id is not None:
                     _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
                     print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}... cancel_reason={_ba_cancel_rsn}")
+                    # Also register every hash that was replaced during the order lifetime.
+                    # When a replace happens, the OLD hash is broadcast to BSC before replacement
+                    # and may fill on-chain even after the API consider it cancelled.
+                    _ba_replaced_hashes = _ba_pred_resp.get("replaced_order_hashes") or []
+                    for _old_h in _ba_replaced_hashes:
+                        if _old_h and _old_h != str(pred_hash_ba):
+                            _late_watch_save(str(_old_h), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
+                            print(f"[TRADER]{_t} late_watch_registered_replaced hash={str(_old_h)[:14]}... (was replaced by {str(pred_hash_ba)[:14]}...)")
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
 
