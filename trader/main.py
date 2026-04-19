@@ -4049,13 +4049,19 @@ def opportunity(opp: Opportunity) -> dict:
                         )
                         _ba_mismatch_corrected = True
                     else:
-                        # Fallback: sell excess on Predict
+                        # Fallback: sell excess on Predict.
+                        # If the remaining Predict position after selling the excess would be
+                        # below the minimum viable size, sell ALL shares and also unwind Poly.
                         _mm_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                         _mm_unwind_price = max(0.01, _ba_actual_pred_bid - _mm_tick)
+                        _mm_min_usd = float(os.environ.get("PREDICT_MIN_FILL_USD", "1.0") or "1.0")
+                        _mm_remaining_usd = (_ba_hedge_qty - _ba_mismatch_shares) * _ba_pred_price
+                        _mm_sell_all = _mm_remaining_usd < _mm_min_usd
+                        _mm_sell_qty = _ba_hedge_qty if _mm_sell_all else _ba_mismatch_shares
                         try:
                             _ba_mismatch_sell_result = _place_predict_limit_sell(
                                 pred_leg,
-                                sell_qty=_ba_mismatch_shares,
+                                sell_qty=_mm_sell_qty,
                                 sell_price=_mm_unwind_price,
                                 fill_timeout_sec=60.0,
                                 trace_id=trace_id,
@@ -4063,14 +4069,77 @@ def opportunity(opp: Opportunity) -> dict:
                             _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
                         except Exception as _mm_e:
                             _ba_mismatch_sell_err = str(_mm_e)
+
+                        # If we sold ALL Predict shares, also sell the Poly position
+                        _mm_poly_sell_qty = 0.0
+                        _mm_poly_sell_err: str | None = None
+                        _mm_poly_sell_status = ""
+                        if _mm_sell_all and _ba_poly_qty_actual >= 0.01:
+                            try:
+                                _mm_pb = _polymarket_book(str(poly_leg.token_id))
+                                _mm_pb_bids = _mm_pb.get("bids") or []
+                                _mm_pb_bid = float(_mm_pb_bids[0]["price"]) if _mm_pb_bids else 0.0
+                                if _mm_pb_bid > 0.01:
+                                    import math as _mm_math
+                                    _mm_poly_sell_price = max(0.01, _mm_math.floor(_mm_pb_bid * 1000) / 1000)
+                                    _mm_gp_pk = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
+                                    _mm_gp_funder = os.environ.get("POLY_FUNDER", "").strip()
+                                    _mm_gp_sig = int(os.environ.get("POLY_SIGNATURE_TYPE", "0").strip() or "0")
+                                    _mm_gp_ak = os.environ.get("POLY_API_KEY", "").strip()
+                                    _mm_gp_sec = os.environ.get("POLY_SECRET", "").strip()
+                                    _mm_gp_pp = os.environ.get("POLY_PASSPHRASE", "").strip()
+                                    from py_clob_client.order_builder.constants import SELL as _MM_SELL
+                                    _mm_gp_cli = ClobClient("https://clob.polymarket.com", chain_id=137,
+                                                             key=_mm_gp_pk, signature_type=_mm_gp_sig, funder=_mm_gp_funder)
+                                    if _mm_gp_ak and _mm_gp_sec and _mm_gp_pp:
+                                        _mm_gp_cli.set_api_creds(ApiCreds(api_key=_mm_gp_ak, api_secret=_mm_gp_sec, api_passphrase=_mm_gp_pp))
+                                    else:
+                                        _mm_gp_cli.set_api_creds(_mm_gp_cli.create_or_derive_api_creds())
+                                    _mm_gp_ord = _mm_gp_cli.create_order(OrderArgs(
+                                        token_id=str(poly_leg.token_id),
+                                        price=_mm_poly_sell_price,
+                                        size=round(_ba_poly_qty_actual, 4),
+                                        side=_MM_SELL,
+                                    ))
+                                    _mm_gp_resp = _mm_gp_cli.post_order(_mm_gp_ord, OrderType.GTC)
+                                    _mm_gp_status = (_mm_gp_resp.get("status") or "").lower()
+                                    if _mm_gp_status in ("matched", "filled") or _mm_gp_resp.get("transactionsHashes"):
+                                        _mm_poly_sell_qty = _ba_poly_qty_actual
+                                    _mm_poly_sell_status = (
+                                        f"✅ sold {_mm_poly_sell_qty:.3f} @ {_mm_poly_sell_price:.2f}"
+                                        if _mm_poly_sell_qty > 0
+                                        else f"❌ status={_mm_gp_status}"
+                                    )
+                                    print(
+                                        f"[TRADER][MISMATCH_FULL_UNWIND] poly sell "
+                                        f"qty={_ba_poly_qty_actual:.4f} price={_mm_poly_sell_price:.4f} "
+                                        f"status={_mm_gp_status}"
+                                    )
+                            except Exception as _mm_gp_e:
+                                _mm_poly_sell_err = str(_mm_gp_e)
+                                _mm_poly_sell_status = f"❌ err: {str(_mm_gp_e)[:100]}"
+                                print(f"[TRADER][MISMATCH_FULL_UNWIND] poly sell error: {_mm_gp_e}")
+
+                        _mm_pred_sold_qty = _ba_mismatch_sell_result.get("filled_qty", 0.0) if _ba_mismatch_corrected else 0.0
                         _mm_status = "✅ sold" if _ba_mismatch_corrected else f"❌ failed{(' — ' + _ba_mismatch_sell_err[:100]) if _ba_mismatch_sell_err else ''}"
-                        notify(
-                            f"⚠️ <b>POLY PARTIAL FILL — excess Predict sold</b>\n"
-                            f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
-                            f"\n"
-                            f"- Excess: <b>{_ba_mismatch_shares:.3f} shares</b>\n"
-                            f"- Predict sell @ {_mm_unwind_price:.2f}: {_mm_status}\n"
-                        )
+                        if _mm_sell_all:
+                            _mm_poly_line = f"\n- Poly sell {_ba_poly_qty_actual:.3f} sh: {_mm_poly_sell_status}" if _mm_poly_sell_status else ""
+                            notify(
+                                f"⚠️ <b>POLY PARTIAL FILL — full unwind</b>\n"
+                                f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
+                                f"<i>Remainder ${_mm_remaining_usd:.2f} &lt; min ${_mm_min_usd:.2f} → selling all</i>\n"
+                                f"\n"
+                                f"- Predict sell {_mm_sell_qty:.3f} sh @ {_mm_unwind_price:.2f}: {_mm_status}"
+                                f"{_mm_poly_line}\n"
+                            )
+                        else:
+                            notify(
+                                f"⚠️ <b>POLY PARTIAL FILL — excess Predict sold</b>\n"
+                                f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
+                                f"\n"
+                                f"- Excess: <b>{_ba_mismatch_shares:.3f} shares</b>\n"
+                                f"- Predict sell @ {_mm_unwind_price:.2f}: {_mm_status}\n"
+                            )
                     print(
                         f"[TRADER][MISMATCH] label={opp.label} "
                         f"pred={_ba_net_sell_qty:.4f} poly={_ba_poly_qty_actual:.4f} "
@@ -4086,8 +4155,12 @@ def opportunity(opp: Opportunity) -> dict:
                     "mismatch_shares": round(_ba_mismatch_shares, 6),
                     "corrected": _ba_mismatch_corrected,
                     "action": locals().get("_mm_action", "none"),
+                    "sell_all": locals().get("_mm_sell_all", False),
+                    "sell_qty": locals().get("_mm_sell_qty", _ba_mismatch_shares),
                     "sell_result": _ba_mismatch_sell_result,
                     "sell_error": _ba_mismatch_sell_err,
+                    "poly_sell_qty": locals().get("_mm_poly_sell_qty", 0.0),
+                    "poly_sell_err": locals().get("_mm_poly_sell_err", None),
                 }
 
                 # Recompute PnL to reflect actual cash flows after mismatch correction.
@@ -4095,17 +4168,34 @@ def opportunity(opp: Opportunity) -> dict:
                 # Predict qty (_ba_hedge_qty) without subtracting sell-back proceeds.
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
                     _mm_action_used = locals().get("_mm_action", "none")
+                    _mm_sell_all_used = locals().get("_mm_sell_all", False)
                     if _mm_action_used == "sell_predict":
-                        # Proceeds from selling excess Predict shares back
                         _mm_sell_price_used = locals().get("_mm_unwind_price", 0.0)
-                        _mm_proceeds = _ba_mismatch_shares * _mm_sell_price_used
-                        _ba_net_pnl = (
-                            _ba_poly_qty_actual
-                            - _ba_poly_usdc
-                            - _ba_hedge_qty * _ba_pred_price
-                            + _mm_proceeds
-                            - _ba_pred_fee_paid
-                        )
+                        _mm_sell_qty_used = locals().get("_mm_sell_qty", _ba_mismatch_shares)
+                        _mm_proceeds = _mm_sell_qty_used * _mm_sell_price_used
+                        _mm_poly_sold_back = locals().get("_mm_poly_sell_qty", 0.0)
+                        _mm_poly_sell_p = locals().get("_mm_poly_sell_price", 0.0)
+                        _mm_poly_proceeds = _mm_poly_sold_back * _mm_poly_sell_p
+                        if _mm_sell_all_used:
+                            # Sold all Predict + Poly: net PnL is purely the cash flows
+                            # (no remaining position to resolve)
+                            _ba_net_pnl = (
+                                _mm_proceeds
+                                + _mm_poly_proceeds
+                                - _ba_poly_usdc
+                                - _ba_hedge_qty * _ba_pred_price
+                                - _ba_pred_fee_paid
+                            )
+                        else:
+                            # Sold only excess Predict shares
+                            _ba_net_pnl = (
+                                _ba_poly_qty_actual
+                                - _ba_poly_usdc
+                                - _ba_hedge_qty * _ba_pred_price
+                                + _mm_proceeds
+                                - _ba_pred_fee_paid
+                            )
+                        row["net_pnl"] = round(_ba_net_pnl, 6)
                     elif _mm_action_used == "buy_poly":
                         # Additional cost from rebuying missing Poly shares
                         _mm_rebuy_price = locals().get("_mm_poly_price", 0.0)
@@ -4128,9 +4218,20 @@ def opportunity(opp: Opportunity) -> dict:
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
                     _mm_action_final = locals().get("_mm_action", "sell_predict")
                     _mm_poly_bought_final = locals().get("_mm_poly_bought", False)
+                    _mm_sell_all_final = locals().get("_mm_sell_all", False)
                     if _mm_action_final == "buy_poly" and _mm_poly_bought_final:
                         _notif_poly_qty = _ba_poly_qty_actual + _ba_mismatch_shares
                         _notif_mismatch_line = f"<i>📎 +{_ba_mismatch_shares:.3f} sh rebuyed on Poly</i>\n"
+                    elif _mm_sell_all_final:
+                        # Sold ALL shares on both sides — position fully closed
+                        _notif_pred_qty = 0.0
+                        _notif_poly_qty = 0.0
+                        _mm_poly_sold_f = locals().get("_mm_poly_sell_qty", 0.0)
+                        _notif_mismatch_line = (
+                            f"<i>📎 продано ВСЁ: {_ba_hedge_qty:.3f} sh Predict"
+                            + (f" + {_mm_poly_sold_f:.3f} sh Poly" if _mm_poly_sold_f > 0 else "")
+                            + f"</i>\n"
+                        )
                     else:
                         _notif_pred_qty = _ba_hedge_qty - _ba_mismatch_shares
                         _notif_mismatch_line = f"<i>📎 −{_ba_mismatch_shares:.3f} sh sold back on Predict</i>\n"
