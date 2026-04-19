@@ -3529,6 +3529,11 @@ def opportunity(opp: Opportunity) -> dict:
             _ba_fee_rate = float(opp.poly_fee_rate or 0.072)
             _ba_pred_fee_bps = float(opp.predict_fee_bps or 0)
             _ba_safety_bps = float(opp.safety_buffer_bps or 0)
+            # For the live recheck AFTER Predict fill, safety buffer must be 0:
+            # we already own the position, the only question is whether hedging is
+            # better than unwinding. Applying the pre-trade safety margin here causes
+            # profitable hedges (sum < 1.0) to be mistakenly treated as no_edge.
+            _ba_live_recheck_safety_bps = float(os.environ.get("BA_LIVE_RECHECK_SAFETY_BPS", "0") or "0")
             _live_net_edge_ba: float | None = None
             _live_vwap_ba: float | None = None
             _live_worst_ba: float | None = None
@@ -3546,7 +3551,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _live_poly_fee_ba = _ba_fee_rate * _live_vwap_ba * (1.0 - _live_vwap_ba)
                 _pred_eff_ba = _ba_actual_pred_bid * (1.0 + _ba_pred_fee_bps / 10_000)
                 _poly_eff_ba = _live_vwap_ba + _live_poly_fee_ba
-                _live_net_edge_ba = 1.0 - _pred_eff_ba - _poly_eff_ba - _ba_safety_bps / 10_000
+                _live_net_edge_ba = 1.0 - _pred_eff_ba - _poly_eff_ba - _ba_live_recheck_safety_bps / 10_000
 
                 row["live_hedge_recheck"] = {
                     "pred_bid": _ba_actual_pred_bid,
@@ -3554,6 +3559,7 @@ def opportunity(opp: Opportunity) -> dict:
                     "live_poly_fee": round(_live_poly_fee_ba, 6),
                     "live_net_edge": round(_live_net_edge_ba, 6),
                     "live_net_edge_bps": round(_live_net_edge_ba * 10_000, 1),
+                    "live_recheck_safety_bps": _ba_live_recheck_safety_bps,
                     "hedge_qty": round(_ba_hedge_qty, 4),
                     "poly_fee_rate": _ba_fee_rate,
                 }
