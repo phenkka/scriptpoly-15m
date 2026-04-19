@@ -3556,19 +3556,36 @@ def opportunity(opp: Opportunity) -> dict:
                 _pc_unwind_price = max(_pc_unwind_tick, _ba_actual_pred_bid - _pc_unwind_tick)
                 _pc_unwind_result: dict[str, Any] = {}
                 _pc_unwind_err: str | None = None
-                try:
-                    _pc_unwind_result = _place_predict_limit_sell(
-                        pred_leg,
-                        sell_qty=_ba_net_sell_qty,
-                        sell_price=_pc_unwind_price,
-                        fill_timeout_sec=60.0,
-                        trace_id=trace_id,
-                    )
-                except Exception as _pc_uw_e:
-                    _pc_unwind_err = str(_pc_uw_e)
-                    print(f"[TRADER][UNWIND_ERROR] price_cap label={opp.label} err={_pc_uw_e}")
-                _pc_uw_filled = _pc_unwind_result.get("filled", False)
-                _pc_uw_qty = _pc_unwind_result.get("filled_qty", 0.0)
+                _PC_UW_RETRIES = 3
+                _PC_UW_DELAYS = [2.0, 5.0, 10.0]
+                _pc_uw_total_sold = 0.0
+                for _pc_attempt in range(_PC_UW_RETRIES):
+                    if _pc_attempt > 0:
+                        time.sleep(_PC_UW_DELAYS[_pc_attempt - 1])
+                    _pc_uw_remaining = max(0.01, _ba_net_sell_qty - _pc_uw_total_sold)
+                    if _pc_uw_remaining < 0.01:
+                        break
+                    _pc_unwind_result = {}
+                    _pc_unwind_err = None
+                    try:
+                        _pc_unwind_result = _place_predict_limit_sell(
+                            pred_leg,
+                            sell_qty=_pc_uw_remaining,
+                            sell_price=_pc_unwind_price,
+                            fill_timeout_sec=60.0,
+                            trace_id=trace_id,
+                        )
+                        _pc_uw_total_sold += _pc_unwind_result.get("filled_qty", 0.0)
+                        if _pc_unwind_result.get("filled") or _pc_uw_total_sold >= _ba_net_sell_qty * 0.99:
+                            break
+                    except Exception as _pc_uw_e:
+                        _pc_unwind_err = str(_pc_uw_e)
+                        print(f"[TRADER][UNWIND_ERROR] price_cap attempt={_pc_attempt+1}/{_PC_UW_RETRIES} label={opp.label} err={_pc_uw_e}")
+                        _pc_is_lag = "400" in _pc_unwind_err or "insufficient" in _pc_unwind_err.lower()
+                        if not _pc_is_lag or _pc_attempt == _PC_UW_RETRIES - 1:
+                            break
+                _pc_uw_filled = _pc_uw_total_sold >= _ba_net_sell_qty * 0.99
+                _pc_uw_qty = _pc_uw_total_sold
 
                 _ba_inc_hp = {
                     "ts": datetime.utcnow().isoformat() + "Z",
@@ -3625,22 +3642,35 @@ def opportunity(opp: Opportunity) -> dict:
                 _unwind_price_pre = max(_unwind_tick_pre, _ba_actual_pred_bid - _unwind_tick_pre)
                 _unwind_pre_filled = False
                 _unwind_pre_err: str | None = None
+                _unwind_pre_qty = 0.0
                 if _pred_fill_usd >= _min_unwind_usd:
-                    try:
-                        _unwind_pre_result = _place_predict_limit_sell(
-                            pred_leg,
-                            sell_qty=_ba_net_sell_qty,
-                            sell_price=_unwind_price_pre,
-                            fill_timeout_sec=60.0,
-                            trace_id=trace_id,
-                        )
-                        _unwind_pre_filled = _unwind_pre_result.get("filled", False)
-                        _unwind_pre_qty = _unwind_pre_result.get("filled_qty", 0.0)
-                    except Exception as _upre_e:
-                        _unwind_pre_err = str(_upre_e)
-                        _unwind_pre_qty = 0.0
-                else:
-                    _unwind_pre_qty = 0.0
+                    _PRE_UW_RETRIES = 3
+                    _PRE_UW_DELAYS = [2.0, 5.0, 10.0]
+                    for _pre_attempt in range(_PRE_UW_RETRIES):
+                        if _pre_attempt > 0:
+                            time.sleep(_PRE_UW_DELAYS[_pre_attempt - 1])
+                        _pre_uw_remaining = max(0.01, _ba_net_sell_qty - _unwind_pre_qty)
+                        if _pre_uw_remaining < 0.01:
+                            break
+                        _unwind_pre_err = None
+                        try:
+                            _unwind_pre_result = _place_predict_limit_sell(
+                                pred_leg,
+                                sell_qty=_pre_uw_remaining,
+                                sell_price=_unwind_price_pre,
+                                fill_timeout_sec=60.0,
+                                trace_id=trace_id,
+                            )
+                            _unwind_pre_qty += _unwind_pre_result.get("filled_qty", 0.0)
+                            if _unwind_pre_result.get("filled") or _unwind_pre_qty >= _ba_net_sell_qty * 0.99:
+                                break
+                        except Exception as _upre_e:
+                            _unwind_pre_err = str(_upre_e)
+                            print(f"[TRADER][UNWIND_ERROR] fill_too_small attempt={_pre_attempt+1}/{_PRE_UW_RETRIES} label={opp.label} err={_upre_e}")
+                            _pre_is_lag = "400" in _unwind_pre_err or "insufficient" in _unwind_pre_err.lower()
+                            if not _pre_is_lag or _pre_attempt == _PRE_UW_RETRIES - 1:
+                                break
+                    _unwind_pre_filled = _unwind_pre_qty >= _ba_net_sell_qty * 0.99
                 if _unwind_pre_filled:
                     _unwind_pre_status = f"✅ продано {_unwind_pre_qty:.2f} шарес"
                 elif _unwind_pre_qty > 0:
@@ -3730,20 +3760,37 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                     _unwind_result: dict[str, Any] = {}
                     _unwind_err: str | None = None
-                    try:
-                        _unwind_result = _place_predict_limit_sell(
-                            pred_leg,
-                            sell_qty=_ba_net_sell_qty,
-                            sell_price=_unwind_price,
-                            fill_timeout_sec=60.0,
-                            trace_id=trace_id,
-                        )
-                    except Exception as _uw_e:
-                        _unwind_err = str(_uw_e)
-                        print(f"[TRADER][UNWIND_ERROR] label={opp.label} err={_uw_e}")
+                    _UW_RETRIES = 3
+                    _UW_DELAYS = [2.0, 5.0, 10.0]
+                    _uw_total_sold = 0.0
+                    for _uw_attempt in range(_UW_RETRIES):
+                        if _uw_attempt > 0:
+                            time.sleep(_UW_DELAYS[_uw_attempt - 1])
+                        _uw_remaining = max(0.01, _ba_net_sell_qty - _uw_total_sold)
+                        if _uw_remaining < 0.01:
+                            break
+                        _unwind_result = {}
+                        _unwind_err = None
+                        try:
+                            _unwind_result = _place_predict_limit_sell(
+                                pred_leg,
+                                sell_qty=_uw_remaining,
+                                sell_price=_unwind_price,
+                                fill_timeout_sec=60.0,
+                                trace_id=trace_id,
+                            )
+                            _uw_total_sold += _unwind_result.get("filled_qty", 0.0)
+                            if _unwind_result.get("filled") or _uw_total_sold >= _ba_net_sell_qty * 0.99:
+                                break
+                        except Exception as _uw_e:
+                            _unwind_err = str(_uw_e)
+                            print(f"[TRADER][UNWIND_ERROR] below_min attempt={_uw_attempt+1}/{_UW_RETRIES} label={opp.label} err={_uw_e}")
+                            _uw_is_lag = "400" in _unwind_err or "insufficient" in _unwind_err.lower()
+                            if not _uw_is_lag or _uw_attempt == _UW_RETRIES - 1:
+                                break
 
-                    _uw_filled = _unwind_result.get("filled", False)
-                    _uw_qty = _unwind_result.get("filled_qty", 0.0)
+                    _uw_filled = _uw_total_sold >= _ba_net_sell_qty * 0.99
+                    _uw_qty = _uw_total_sold
                     _uw_loss = (_ba_actual_pred_bid - _unwind_price) * _ba_hedge_qty  # approximate loss
 
                     _ba_inc_min = {
