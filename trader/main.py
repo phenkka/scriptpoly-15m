@@ -3379,6 +3379,39 @@ def opportunity(opp: Opportunity) -> dict:
             _book_freshness["pred_book_age_at_submit_ms"] = (_submit_wall - pred_dt.replace(tzinfo=None).timestamp()) * 1000.0
         row["book_freshness"] = _book_freshness
 
+        # ── Book freshness guard: skip if Poly data is too stale ──────────
+        # Stale Poly quotes mean we're pricing the arb off old information.
+        # By the time we get a Predict fill, Poly may have moved far away.
+        # Default 0 = disabled (set via BA_MAX_POLY_BOOK_AGE_MS env var).
+        _max_poly_book_age_ms = float(os.environ.get("BA_MAX_POLY_BOOK_AGE_MS", "0") or "0")
+        _max_pred_book_age_ms = float(os.environ.get("BA_MAX_PRED_BOOK_AGE_MS", "0") or "0")
+        if _max_poly_book_age_ms > 0 and _book_freshness.get("poly_book_age_at_submit_ms", 0) > _max_poly_book_age_ms:
+            _poly_age_ms = _book_freshness["poly_book_age_at_submit_ms"]
+            print(
+                f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_book_stale "
+                f"age={_poly_age_ms:.0f}ms limit={_max_poly_book_age_ms:.0f}ms"
+            )
+            row["ok"] = False
+            row["skipped"] = True
+            row["summary"]["status"] = "skipped"
+            row["summary"]["reason_code"] = "poly_book_stale"
+            row["summary"]["reason"] = {"code": "poly_book_stale", "poly_book_age_ms": _poly_age_ms, "limit_ms": _max_poly_book_age_ms}
+            _append_jsonl(trades_file, row)
+            return {"status": "skipped", "reason": "poly_book_stale"}
+        if _max_pred_book_age_ms > 0 and _book_freshness.get("pred_book_age_at_submit_ms", 0) > _max_pred_book_age_ms:
+            _pred_age_ms = _book_freshness["pred_book_age_at_submit_ms"]
+            print(
+                f"[TRADER]{_t}[SKIP] label={opp.label} reason=pred_book_stale "
+                f"age={_pred_age_ms:.0f}ms limit={_max_pred_book_age_ms:.0f}ms"
+            )
+            row["ok"] = False
+            row["skipped"] = True
+            row["summary"]["status"] = "skipped"
+            row["summary"]["reason_code"] = "pred_book_stale"
+            row["summary"]["reason"] = {"code": "pred_book_stale", "pred_book_age_ms": _pred_age_ms, "limit_ms": _max_pred_book_age_ms}
+            _append_jsonl(trades_file, row)
+            return {"status": "skipped", "reason": "pred_book_stale"}
+
         # ════════════════════════════════════════════════════════════════
         # BID+ASK: Predict LIMIT BID (maker) → Poly FOK hedge (sequential).
         # Predict ставит пассивный лимит-бид; после фила хеджируем на Poly.
@@ -3546,8 +3579,98 @@ def opportunity(opp: Opportunity) -> dict:
                     print(
                         f"[TRADER][INCIDENT] BID_ASK_HEDGE_NO_EDGE label={opp.label} "
                         f"net_edge={_live_net_edge_ba:.4f} pred_filled={_ba_hedge_qty:.4f} "
-                        f"— forcing hedge to close unhedged predict position"
+                        f"— trying unwind on Predict instead of locking in loss"
                     )
+                    # Try to unwind on Predict: selling at bid-1tick recovers most value.
+                    # Forcing the hedge at terrible poly price locks in a guaranteed large loss.
+                    # Only fall through to forced hedge if unwind completely fails.
+                    _ne_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                    _ne_unwind_price = max(_ne_unwind_tick, _ba_actual_pred_bid - _ne_unwind_tick)
+                    _ne_unwind_result: dict[str, Any] = {}
+                    _ne_unwind_err: str | None = None
+                    _NE_UW_RETRIES = 3
+                    _NE_UW_DELAYS = [2.0, 5.0, 10.0]
+                    _ne_uw_sold = 0.0
+                    for _ne_attempt in range(_NE_UW_RETRIES):
+                        if _ne_attempt > 0:
+                            time.sleep(_NE_UW_DELAYS[_ne_attempt - 1])
+                        _ne_remaining = max(0.01, _ba_net_sell_qty - _ne_uw_sold)
+                        if _ne_remaining < 0.01:
+                            break
+                        _ne_unwind_result = {}
+                        _ne_unwind_err = None
+                        try:
+                            _ne_unwind_result = _place_predict_limit_sell(
+                                pred_leg,
+                                sell_qty=_ne_remaining,
+                                sell_price=_ne_unwind_price,
+                                fill_timeout_sec=60.0,
+                                trace_id=trace_id,
+                            )
+                            _ne_uw_sold += _ne_unwind_result.get("filled_qty", 0.0)
+                            if _ne_unwind_result.get("filled") or _ne_uw_sold >= _ba_net_sell_qty * 0.99:
+                                break
+                        except Exception as _ne_uw_e:
+                            _ne_unwind_err = str(_ne_uw_e)
+                            print(
+                                f"[TRADER][UNWIND_ERROR] no_edge attempt={_ne_attempt+1}/{_NE_UW_RETRIES} "
+                                f"label={opp.label} err={_ne_uw_e}"
+                            )
+                            _ne_is_lag = "400" in _ne_unwind_err or "insufficient" in _ne_unwind_err.lower()
+                            if not _ne_is_lag or _ne_attempt == _NE_UW_RETRIES - 1:
+                                break
+                    _ne_uw_filled = _ne_uw_sold >= _ba_net_sell_qty * 0.99
+                    _ne_uw_qty = _ne_uw_sold
+                    if _ne_uw_filled or _ne_uw_qty > 0:
+                        # Unwind succeeded (fully or partially) → declare incident, do NOT hedge
+                        row["ok"] = False
+                        row["summary"]["status"] = "incident"
+                        row["summary"]["reason_code"] = "bid_ask_hedge_no_edge"
+                        row["no_edge_unwind"] = {
+                            "unwind_price": _ne_unwind_price,
+                            "unwind_qty": _ne_uw_qty,
+                            "unwind_filled": _ne_uw_filled,
+                            "unwind_error": _ne_unwind_err,
+                        }
+                        print(
+                            f"[TRADER][INCIDENT] BID_ASK_HEDGE_NO_EDGE unwind_ok label={opp.label} "
+                            f"sold={_ne_uw_qty:.4f}/{_ba_net_sell_qty:.4f} price={_ne_unwind_price:.4f}"
+                        )
+                        if _ne_uw_filled:
+                            _ne_uw_status = f"✅ продано {_ne_uw_qty:.2f} шарес по {_ne_unwind_price:.2f}"
+                        else:
+                            _ne_uw_rem = _ba_net_sell_qty - _ne_uw_qty
+                            _ne_uw_status = f"⚠️ ЧАСТИЧНО {_ne_uw_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ne_uw_rem:.2f} — ручная проверка!"
+                        notify(
+                            f"🟡🟡🟡 <b>INCIDENT: HEDGE NO EDGE → UNWIND</b>\n"
+                            f"\n"
+                            f"<b>{opp.label}</b>\n"
+                            f"\n"
+                            f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
+                            f"Poly цена ухудшилась: {_live_vwap_ba:.2f} → edge {_live_net_edge_ba * 10_000:.0f}bps\n"
+                            f"\n"
+                            f"Продажа обратно на Predict по {_ne_unwind_price:.2f}: {_ne_uw_status}\n"
+                        )
+                        _append_jsonl(trades_file, row)
+                        return {"status": "incident", "reason": "bid_ask_hedge_no_edge"}
+                    else:
+                        # Unwind completely failed → fall through to forced hedge
+                        # Hedging is still better than directional exposure with no exit
+                        print(
+                            f"[TRADER] no_edge_unwind_failed label={opp.label} "
+                            f"err={_ne_unwind_err} — falling through to forced hedge"
+                        )
+                        notify(
+                            f"🔴🔴🔴 <b>INCIDENT: HEDGE NO EDGE — UNWIND FAILED → FORCED HEDGE</b>\n"
+                            f"\n"
+                            f"<b>{opp.label}</b>\n"
+                            f"\n"
+                            f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
+                            f"Poly цена ухудшилась: {_live_vwap_ba:.2f} → edge {_live_net_edge_ba * 10_000:.0f}bps\n"
+                            f"Unwind не удался: {(_ne_unwind_err or 'нет ответа')[:200]}\n"
+                            f"\n"
+                            f"Вынужден хеджировать чтобы закрыть позицию!\n"
+                        )
             # Hard cap: live poly VWAP exceeds POLY_MAX_HEDGE_PRICE
             _poly_max_hedge_price = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
             if _live_vwap_ba is not None and _live_vwap_ba >= _poly_max_hedge_price:
