@@ -4181,11 +4181,11 @@ def opportunity(opp: Opportunity) -> dict:
                 _unwind_sell_price = max(_unwind_tick, _ba_actual_pred_bid - _unwind_tick)
                 _uw2_result: dict[str, Any] = {}
                 _uw2_err: str | None = None
-                # Predict API can lag balance indexing after a fill — retry unwind up to 3x
+                # Predict API can lag balance indexing after a fill — retry unwind up to 5x
                 # with increasing delays so the balance has time to appear.
                 # Track cumulative filled across attempts so each retry only sells the remainder.
-                _UW2_RETRIES = 3
-                _UW2_DELAYS = [2.0, 5.0, 10.0]
+                _UW2_RETRIES = 5
+                _UW2_DELAYS = [2.0, 5.0, 10.0, 20.0, 30.0]
                 _uw2_total_sold = 0.0
                 for _uw2_attempt in range(_UW2_RETRIES):
                     if _uw2_attempt > 0:
@@ -4219,6 +4219,69 @@ def opportunity(opp: Opportunity) -> dict:
                 _uw2_filled = _uw2_total_sold >= _ba_net_sell_qty * 0.99
                 _uw2_qty = _uw2_total_sold
 
+                # ── Ghost Poly fill check ──
+                # Even though polymarket_result_ba showed 0 shares, a GTC order may have
+                # matched on-chain after we declared failure (race between cancel and fill).
+                # Check actual Poly position: if we own shares we didn't account for → sell them.
+                _ghost_poly_sold = 0.0
+                _ghost_poly_sell_err: str | None = None
+                _ghost_poly_price: float | None = None
+                try:
+                    _gp_pos = _fetch_poly_position(str(poly_leg.token_id), timeout=4.0)
+                    _gp_shares = float(_gp_pos[0]) if _gp_pos else 0.0
+                    # Only act if we see meaningful shares that weren't reported filled
+                    _gp_threshold = 0.5
+                    if _gp_shares >= _gp_threshold:
+                        print(
+                            f"[TRADER][GHOST_POLY] detected position on Poly "
+                            f"token={str(poly_leg.token_id)[:16]} shares={_gp_shares:.4f} "
+                            f"— selling back"
+                        )
+                        # Sell on Poly: place GTC SELL limit at bid (taker, fills immediately)
+                        _gp_book = _polymarket_book(str(poly_leg.token_id))
+                        _gp_bids = _gp_book.get("bids") or []
+                        _gp_best_bid = float(_gp_bids[0]["price"]) if _gp_bids else 0.0
+                        if _gp_best_bid > 0.01:
+                            import math as _gp_math
+                            _gp_sell_price = max(0.01, _gp_math.floor(_gp_best_bid * 1000) / 1000)
+                            _ghost_poly_price = _gp_sell_price
+                            _gp_pk = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
+                            _gp_funder = os.environ.get("POLY_FUNDER", "").strip()
+                            _gp_sig_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "0").strip() or "0")
+                            _gp_api_key = os.environ.get("POLY_API_KEY", "").strip()
+                            _gp_secret = os.environ.get("POLY_SECRET", "").strip()
+                            _gp_pass = os.environ.get("POLY_PASSPHRASE", "").strip()
+                            from py_clob_client.order_builder.constants import SELL as _POLY_SELL
+                            _gp_client = ClobClient(
+                                "https://clob.polymarket.com",
+                                chain_id=137,
+                                key=_gp_pk,
+                                signature_type=_gp_sig_type,
+                                funder=_gp_funder,
+                            )
+                            if _gp_api_key and _gp_secret and _gp_pass:
+                                _gp_client.set_api_creds(ApiCreds(api_key=_gp_api_key, api_secret=_gp_secret, api_passphrase=_gp_pass))
+                            else:
+                                _gp_client.set_api_creds(_gp_client.create_or_derive_api_creds())
+                            _gp_order = _gp_client.create_order(OrderArgs(
+                                token_id=str(poly_leg.token_id),
+                                price=_gp_sell_price,
+                                size=round(_gp_shares, 4),
+                                side=_POLY_SELL,
+                            ))
+                            _gp_resp = _gp_client.post_order(_gp_order, OrderType.GTC)
+                            _gp_status = (_gp_resp.get("status") or "").lower()
+                            if _gp_status in ("matched", "filled") or _gp_resp.get("transactionsHashes"):
+                                _ghost_poly_sold = _gp_shares
+                            print(
+                                f"[TRADER][GHOST_POLY] sell result status={_gp_status} "
+                                f"shares={_gp_shares:.4f} price={_gp_sell_price:.4f} "
+                                f"sold={_ghost_poly_sold:.4f}"
+                            )
+                except Exception as _gp_e:
+                    _ghost_poly_sell_err = str(_gp_e)
+                    print(f"[TRADER][GHOST_POLY] check/sell error: {_gp_e}")
+
                 _ba_inc2 = {
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "bid_ask_unhedged_predict",
@@ -4232,6 +4295,9 @@ def opportunity(opp: Opportunity) -> dict:
                     "poly_error": str(poly_exec_error_ba) if poly_exec_error_ba else None,
                     "unwind": _uw2_result,
                     "unwind_error": _uw2_err,
+                    "ghost_poly_sold": _ghost_poly_sold,
+                    "ghost_poly_sell_err": _ghost_poly_sell_err,
+                    "ghost_poly_price": _ghost_poly_price,
                     "quote_meta": _ba_quote_meta,
                 }
                 _append_jsonl(incidents_file, _ba_inc2)
@@ -4241,7 +4307,8 @@ def opportunity(opp: Opportunity) -> dict:
                 print(
                     f"[TRADER][INCIDENT] BID_ASK_UNHEDGED_PREDICT label={opp.label} "
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
-                    f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f}"
+                    f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f} "
+                    f"ghost_poly_sold={_ghost_poly_sold:.4f}"
                 )
                 if _uw2_filled:
                     _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}"
@@ -4254,6 +4321,11 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                 else:
                     _uw2_status = f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
+                _gp_tg = ""
+                if _ghost_poly_sold > 0:
+                    _gp_tg = f"\nGhost Poly: ✅ продано {_ghost_poly_sold:.2f} шарес по {(_ghost_poly_price or 0):.2f}"
+                elif _ghost_poly_sell_err:
+                    _gp_tg = f"\nGhost Poly: ❌ err: {_ghost_poly_sell_err[:200]}"
                 notify(
                     f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b>\n"
                     f"\n"
@@ -4264,7 +4336,8 @@ def opportunity(opp: Opportunity) -> dict:
                     f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
                     f"price: {(_live_vwap_ba if _live_vwap_ba is not None else float(poly_leg.ask)):.2f} (est.) - err: {str(poly_exec_error_ba)[:200] if poly_exec_error_ba else 'unknown'}\n"
                     f"\n"
-                    f"Unwind на Predict: {_uw2_status}\n"
+                    f"Unwind на Predict: {_uw2_status}"
+                    f"{_gp_tg}\n"
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_unhedged_predict"}
