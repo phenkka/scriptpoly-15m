@@ -281,6 +281,9 @@ def _startup_warmup() -> None:
     # ghost_fill_watch window has expired (real BSC confirmation lag edge case).
     threading.Thread(target=_late_fill_watcher, daemon=True, name="late_fill_watcher").start()
 
+    # BSC WebSocket newHeads — wakes Predict poll / ghost_fill_watch on each block (~3s)
+    _start_bsc_ws_thread()
+
     # VPN watchdog: проверяем доступность прокси каждые 60 секунд.
     # Если прокси недоступен — создаём /data/halt_vpn и уведомляем.
     # Как только восстановился — удаляем файл и уведомляем.
@@ -413,6 +416,158 @@ _BSC_RPCS = [
 _BSC_NEG_RISK_CTF_EXCHANGE = "0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A"
 # keccak256("getOrderStatus(bytes32)")[:4] — computed once on first use
 _ORDER_STATUS_SELECTOR: str | None = None
+
+# ── BSC WebSocket (newHeads) — wake poll loops + optional early getOrderStatus ──
+# Public HTTP RPCs often disable eth_getLogs; we still use eth_call for fills.
+# WS gives a proactive ~block-time signal instead of relying only on late_fill + fixed sleeps.
+_bsc_head_cv = _threading.Condition()
+_bsc_head_gen: int = 0
+_bsc_ws_stop = _threading.Event()
+_bsc_ws_thread: _threading.Thread | None = None
+
+
+def _bsc_head_gen_snapshot() -> int:
+    with _bsc_head_cv:
+        return _bsc_head_gen
+
+
+def _bsc_signal_new_head() -> None:
+    global _bsc_head_gen
+    with _bsc_head_cv:
+        _bsc_head_gen += 1
+        _bsc_head_cv.notify_all()
+
+
+def _bsc_wait_new_head_or_timeout(prev_gen: int, timeout: float) -> int:
+    """Block up to timeout, or return sooner when a BSC newHead arrives (if WS active)."""
+    if timeout <= 0:
+        return _bsc_head_gen_snapshot()
+    with _bsc_head_cv:
+        end = time.monotonic() + timeout
+        while _bsc_head_gen == prev_gen:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            _bsc_head_cv.wait(timeout=remaining)
+        return _bsc_head_gen
+
+
+def _bsc_ws_urls_resolved() -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in (os.environ.get("BSC_WS_URL", "").strip(),):
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    for part in os.environ.get("BSC_WS_URLS", "").split(","):
+        p = part.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    if out:
+        return out
+    for h in _BSC_RPCS:
+        h = (h or "").strip()
+        if h.startswith("https://"):
+            cand = "wss://" + h[8:].rstrip("/")
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+        elif h.startswith("http://"):
+            cand = "ws://" + h[7:].rstrip("/")
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+    return out
+
+
+def _bsc_ws_should_run() -> bool:
+    if os.environ.get("BSC_WS_ENABLE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        import websocket  # noqa: F401
+    except ImportError:
+        print("[TRADER][BSC_WS] websocket-client not installed — pip install websocket-client")
+        return False
+    return True
+
+
+def _bsc_ws_newheads_loop() -> None:
+    import json
+
+    try:
+        import websocket
+    except ImportError:
+        return
+    backoff = 1.0
+    while not _bsc_ws_stop.is_set():
+        urls = _bsc_ws_urls_resolved()
+        if not urls:
+            time.sleep(30.0)
+            continue
+        connected = False
+        for wurl in urls:
+            if _bsc_ws_stop.is_set():
+                break
+            ws = None
+            try:
+                ws = websocket.create_connection(wurl, timeout=20, enable_multithread=True)
+                ws.settimeout(120)
+                ws.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_subscribe",
+                            "params": ["newHeads"],
+                        }
+                    )
+                )
+                sub_raw = ws.recv()
+                sub_msg = json.loads(sub_raw)
+                if sub_msg.get("error") or not sub_msg.get("result"):
+                    raise RuntimeError(sub_msg.get("error") or "no subscription id")
+                print(f"[TRADER][BSC_WS] subscribed newHeads url={wurl[:56]}...")
+                backoff = 1.0
+                connected = True
+                while not _bsc_ws_stop.is_set():
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if msg.get("method") == "eth_subscription":
+                        _bsc_signal_new_head()
+            except Exception as _wse:
+                print(f"[TRADER][BSC_WS] session_error url={wurl[:40]}... err={_wse}")
+            finally:
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        if not connected:
+            time.sleep(min(backoff, 45.0))
+            backoff = min(backoff * 1.4, 60.0)
+
+
+def _start_bsc_ws_thread() -> None:
+    global _bsc_ws_thread
+    if not _bsc_ws_should_run():
+        print("[TRADER][BSC_WS] disabled or unavailable")
+        return
+    if _bsc_ws_thread is not None and _bsc_ws_thread.is_alive():
+        return
+    _bsc_ws_thread = _threading.Thread(
+        target=_bsc_ws_newheads_loop,
+        daemon=True,
+        name="bsc_ws_newheads",
+    )
+    _bsc_ws_thread.start()
+    print("[TRADER][BSC_WS] background thread started")
 # State for grouping repeated HEDGE FILLED notifications in the same market
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
@@ -1033,6 +1188,73 @@ def _predict_remove_orders(session: requests.Session, ids: list[str]) -> dict[st
     if not isinstance(j, dict):
         raise RuntimeError("predict_remove_order_bad_response")
     return j
+
+
+def _predict_position_row_token_id(pos: dict[str, Any]) -> str | None:
+    """Best-effort outcome token id from a GET /v1/positions row (schema may vary)."""
+    o = pos.get("outcome") if isinstance(pos.get("outcome"), dict) else {}
+    for src in (pos, o):
+        for key in ("tokenId", "token_id", "id"):
+            v = src.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return None
+
+
+def _predict_wait_for_balance(
+    session: requests.Session,
+    market_id: int,
+    min_shares: float,
+    timeout_sec: float = 90.0,
+    poll_sec: float = 1.5,
+    token_id: str | None = None,
+) -> float:
+    """Poll GET /v1/positions until sellable balance >= min_shares appears in the API.
+
+    Predict indexes BSC settlement into REST with lag.  SELL uses that balance;
+    without waiting, create_order_insufficient_shares_balance is common right
+    after a BUY fill.  BSC confirms the hedge leg faster; this waits only for
+    the Predict leg that must go through their API.
+
+    If token_id is set, only the matching outcome row counts (same market can have
+    YES/NO rows).
+
+    Returns shares found (>= min_shares * 0.95), or 0.0 on timeout.
+    """
+    deadline = time.time() + timeout_sec
+    _threshold = min_shares * 0.95
+    _want_tid = (token_id or "").strip() or None
+    while time.time() < deadline:
+        try:
+            r = session.get(
+                "https://api.predict.fun/v1/positions",
+                params={"limit": 500},
+                timeout=8,
+            )
+            if r.ok:
+                for pos in (r.json().get("data") or []):
+                    if not isinstance(pos, dict):
+                        continue
+                    mkt = pos.get("market") or {}
+                    if str(mkt.get("id")) != str(market_id):
+                        continue
+                    if _want_tid:
+                        row_tid = _predict_position_row_token_id(pos)
+                        if row_tid and row_tid.lower() != _want_tid.lower():
+                            continue
+                    try:
+                        shares = int(pos.get("amount") or 0) / 1e18
+                    except Exception:
+                        shares = 0.0
+                    if shares >= _threshold:
+                        return shares
+        except Exception:
+            pass
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_sec, remaining))
+    return 0.0
 
 
 def _predict_cancel_all_open_orders(session: requests.Session) -> int:
@@ -2090,7 +2312,8 @@ def _place_predict_limit_buy(
             try:
                 last_get = _predict_get_order_by_hash(session, order_hash)
             except Exception:
-                time.sleep(poll_interval_sec)
+                _e_prev = _bsc_head_gen_snapshot()
+                _bsc_wait_new_head_or_timeout(_e_prev, poll_interval_sec)
                 continue
 
             status = _get_status(last_get)
@@ -2297,7 +2520,35 @@ def _place_predict_limit_buy(
                         break
                     continue  # skip sleep, immediately poll new order
 
-            time.sleep(max(0.05, poll_interval_sec))
+            _poll_prev = _bsc_head_gen_snapshot()
+            _poll_new = _bsc_wait_new_head_or_timeout(_poll_prev, max(0.05, poll_interval_sec))
+            if order_hash and not filled and _poll_new > _poll_prev:
+                try:
+                    _poll_bsc = _bsc_check_order_filled(order_hash, float(leg.shares or 0))
+                    if _poll_bsc > 0:
+                        filled = True
+                        _pb_wei = int(_poll_bsc * 10**18)
+                        if _pb_wei > prev_filled_wei:
+                            _pb_delta = _pb_wei - prev_filled_wei
+                            _pb_now = time.time()
+                            if first_fill_ts is None:
+                                first_fill_ts = _pb_now
+                            partial_fills.append({
+                                "ts": _pb_now,
+                                "delta_wei": _pb_delta,
+                                "cumulative_wei": _pb_wei,
+                                "delta_shares": _pb_delta / 10**18,
+                                "cumulative_shares": _poll_bsc,
+                                "source": "bsc_ws_head",
+                            })
+                            prev_filled_wei = _pb_wei
+                        print(
+                            f"[PREDICT_LIMIT]{_trace} bsc_fill_on_new_head hash={order_hash} "
+                            f"shares={_poll_bsc:.4f}"
+                        )
+                        break
+                except Exception:
+                    pass
 
     # If the poll loop exited via deadline (fill_timeout) without an explicit cancel,
     # treat it as a cancel so ghost_fill_watch + late_watch cover the BSC race window.
@@ -2315,8 +2566,10 @@ def _place_predict_limit_buy(
             f"cancel_reason={cancel_reason} polling up to {_FINAL_GET_RETRIES}s"
         )
         for _attempt in range(_FINAL_GET_RETRIES):
+            _api_ok = False
             try:
                 last_get = _predict_get_order_by_hash(_predict_monitor.get(), order_hash)
+                _api_ok = True
                 _final_filled_wei = _get_filled_wei(last_get)
                 if _final_filled_wei > prev_filled_wei:
                     delta_wei = _final_filled_wei - prev_filled_wei
@@ -2339,35 +2592,72 @@ def _place_predict_limit_buy(
                     filled = True
                     break
             except Exception:
-                # Predict API down — fall back to direct BSC check every 5 attempts
-                if _attempt % 5 == 0:
+                pass  # API down — fall through to BSC check below
+
+            # BSC is the ground truth for hedging: check every 3 attempts regardless of
+            # whether the API is up or just lagging (returning 0 for a real on-chain fill).
+            # Previously this only ran inside `except` (API down); now it also fires when
+            # the API responds OK but hasn't indexed the fill yet.
+            if not filled and _attempt % 3 == 0:
+                try:
+                    _bsc_shares = _bsc_check_order_filled(
+                        order_hash,
+                        float(leg.shares or 0),
+                    )
+                    if _bsc_shares > 0:
+                        now_ts = time.time()
+                        if first_fill_ts is None:
+                            first_fill_ts = now_ts
+                        _bsc_wei = int(_bsc_shares * 10**18)
+                        if _bsc_wei > prev_filled_wei:
+                            partial_fills.append({
+                                "ts": now_ts,
+                                "delta_wei": _bsc_wei - prev_filled_wei,
+                                "cumulative_wei": _bsc_wei,
+                                "delta_shares": _bsc_shares - prev_filled_wei / 10**18,
+                                "cumulative_shares": _bsc_shares,
+                                "source": "bsc_direct",
+                            })
+                            prev_filled_wei = _bsc_wei
+                        print(
+                            f"[PREDICT_LIMIT]{_trace} ghost_fill_watch_bsc "
+                            f"api_ok={_api_ok} hash={order_hash} "
+                            f"bsc_shares={_bsc_shares:.4f} attempt={_attempt}"
+                        )
+                        filled = True
+                        break
+                except Exception:
+                    pass
+
+            if _attempt < _FINAL_GET_RETRIES - 1:
+                _gf_prev = _bsc_head_gen_snapshot()
+                _gf_new = _bsc_wait_new_head_or_timeout(_gf_prev, _FINAL_GET_SLEEP_SEC)
+                if not filled and order_hash and _gf_new > _gf_prev and (_attempt % 3 != 0):
                     try:
-                        _bsc_shares = _bsc_check_order_filled(order_hash, total_filled_shares if total_filled_shares else float(shares_requested or 0))
-                        if _bsc_shares > 0:
+                        _gf_bsc = _bsc_check_order_filled(order_hash, float(leg.shares or 0))
+                        if _gf_bsc > 0:
                             now_ts = time.time()
                             if first_fill_ts is None:
                                 first_fill_ts = now_ts
-                            _bsc_wei = int(_bsc_shares * 10**18)
-                            if _bsc_wei > prev_filled_wei:
+                            _gf_wei = int(_gf_bsc * 10**18)
+                            if _gf_wei > prev_filled_wei:
                                 partial_fills.append({
                                     "ts": now_ts,
-                                    "delta_wei": _bsc_wei - prev_filled_wei,
-                                    "cumulative_wei": _bsc_wei,
-                                    "delta_shares": _bsc_shares - prev_filled_wei / 10**18,
-                                    "cumulative_shares": _bsc_shares,
+                                    "delta_wei": _gf_wei - prev_filled_wei,
+                                    "cumulative_wei": _gf_wei,
+                                    "delta_shares": _gf_bsc - prev_filled_wei / 10**18,
+                                    "cumulative_shares": _gf_bsc,
                                     "source": "bsc_direct",
                                 })
-                                prev_filled_wei = _bsc_wei
+                                prev_filled_wei = _gf_wei
                             print(
-                                f"[PREDICT_LIMIT]{_trace} ghost_fill_watch_bsc_direct "
-                                f"hash={order_hash} bsc_shares={_bsc_shares:.4f} attempt={_attempt}"
+                                f"[PREDICT_LIMIT]{_trace} ghost_fill_watch_bsc_on_head "
+                                f"hash={order_hash} bsc_shares={_gf_bsc:.4f}"
                             )
                             filled = True
                             break
                     except Exception:
                         pass
-            if _attempt < _FINAL_GET_RETRIES - 1:
-                time.sleep(_FINAL_GET_SLEEP_SEC)
 
     # ── Final fill check (partial fills count as filled) ──
     if not filled and prev_filled_wei > 0:
@@ -2495,6 +2785,25 @@ def _place_predict_limit_sell(
     is_neg_risk = bool(market.get("isNegRisk"))
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
+
+    # Wait for Predict REST to index post-buy balance before SELL (all call sites).
+    _idx_raw = os.environ.get("PREDICT_SELL_INDEX_WAIT_SEC", "").strip()
+    if not _idx_raw:
+        _idx_raw = os.environ.get("PREDICT_UNWIND_BAL_TIMEOUT_SEC", "").strip()
+    _idx_wait = float(_idx_raw or "90")
+    if _idx_wait > 0 and sell_qty >= 0.01:
+        _bal = _predict_wait_for_balance(
+            session,
+            int(leg.market_id),
+            sell_qty,
+            timeout_sec=_idx_wait,
+            token_id=str(token_id) if token_id else None,
+        )
+        print(
+            f"[TRADER]{_trace} predict_sell_index_wait market_id={leg.market_id} "
+            f"token={str(token_id)[:18]}... need={sell_qty:.4f} found={_bal:.4f} "
+            f"timeout={_idx_wait:.0f}s"
+        )
 
     _tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
     sell_price = round(int(sell_price / _tick) * _tick, 6)
@@ -4508,15 +4817,16 @@ def opportunity(opp: Opportunity) -> dict:
                 _unwind_sell_price = max(_unwind_tick, _ba_actual_pred_bid - _unwind_tick)
                 _uw2_result: dict[str, Any] = {}
                 _uw2_err: str | None = None
-                # Predict API can lag balance indexing after a fill — retry unwind up to 5x
-                # with increasing delays so the balance has time to appear.
-                # Track cumulative filled across attempts so each retry only sells the remainder.
-                _UW2_RETRIES = 5
-                _UW2_DELAYS = [2.0, 5.0, 10.0, 20.0, 30.0]
                 _uw2_total_sold = 0.0
+
+                # Balance index wait is inside _place_predict_limit_sell (all Predict sells).
+
+                # Now attempt the sell — up to 3 retries in case of transient errors
+                # (not balance lag, since we already waited for it above).
+                _UW2_RETRIES = 3
                 for _uw2_attempt in range(_UW2_RETRIES):
                     if _uw2_attempt > 0:
-                        time.sleep(_UW2_DELAYS[_uw2_attempt - 1])
+                        time.sleep(3.0)
                     _uw2_remaining = max(0.01, _ba_net_sell_qty - _uw2_total_sold)
                     if _uw2_remaining < 0.01:
                         break
@@ -4539,8 +4849,9 @@ def opportunity(opp: Opportunity) -> dict:
                             f"[TRADER][UNWIND_ERROR] unhedged_predict unwind "
                             f"attempt={_uw2_attempt+1}/{_UW2_RETRIES} err={_uw2_e}"
                         )
+                        # On balance lag (still not indexed) keep retrying; other errors → stop
                         _is_balance_lag = "400" in _uw2_err or "insufficient" in _uw2_err.lower()
-                        if not _is_balance_lag or _uw2_attempt == _UW2_RETRIES - 1:
+                        if not _is_balance_lag:
                             break
 
                 _uw2_filled = _uw2_total_sold >= _ba_net_sell_qty * 0.99
