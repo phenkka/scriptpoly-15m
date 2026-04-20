@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import itertools
 import json
+import math
 import os
 import time
 import traceback
@@ -1203,12 +1204,65 @@ def _predict_remove_orders(session: requests.Session, ids: list[str]) -> dict[st
 def _predict_position_row_token_id(pos: dict[str, Any]) -> str | None:
     """Best-effort outcome token id from a GET /v1/positions row (schema may vary)."""
     o = pos.get("outcome") if isinstance(pos.get("outcome"), dict) else {}
+    tok = pos.get("token")
+    if isinstance(tok, dict):
+        for key in ("tokenId", "token_id", "id", "address"):
+            v = tok.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
     for src in (pos, o):
-        for key in ("tokenId", "token_id", "id"):
+        for key in ("tokenId", "token_id", "erc1155TokenId", "id"):
             v = src.get(key)
             if v is not None and str(v).strip():
                 return str(v).strip()
     return None
+
+
+def _parse_predict_position_amount_shares(pos: dict[str, Any]) -> float:
+    """Parse position `amount` to human shares (Predict uses wei in amount)."""
+    raw = pos.get("amount")
+    if raw is None:
+        return 0.0
+    try:
+        if isinstance(raw, bool):
+            return 0.0
+        if isinstance(raw, int):
+            return raw / 1e18
+        if isinstance(raw, float):
+            return int(raw) / 1e18
+        s = str(raw).strip()
+        if not s:
+            return 0.0
+        if "." in s or "e" in s.lower():
+            return float(s)
+        return int(s, 10) / 1e18
+    except Exception:
+        return 0.0
+
+
+def _predict_max_shares_for_market(session: requests.Session, market_id: int) -> float:
+    """Largest position size on this market (any outcome) — fallback when token match fails."""
+    best = 0.0
+    try:
+        r = session.get(
+            "https://api.predict.fun/v1/positions",
+            params={"limit": 500},
+            timeout=8,
+        )
+        if not r.ok:
+            return 0.0
+        for pos in (r.json().get("data") or []):
+            if not isinstance(pos, dict):
+                continue
+            mkt = pos.get("market") or {}
+            if str(mkt.get("id")) != str(market_id):
+                continue
+            sh = _parse_predict_position_amount_shares(pos)
+            if sh > best:
+                best = sh
+    except Exception:
+        return 0.0
+    return best
 
 
 def _predict_wait_for_balance(
@@ -1229,10 +1283,14 @@ def _predict_wait_for_balance(
     If token_id is set, only the matching outcome row counts (same market can have
     YES/NO rows).
 
-    Returns shares found (>= min_shares * 0.95), or 0.0 on timeout.
+    Returns shares found (>= threshold), or 0.0 on timeout.
     """
     deadline = time.time() + timeout_sec
-    _threshold = min_shares * 0.95
+    # Tiny fills: 95% of 2.32 leaves little slack vs on-chain rounding / API dust.
+    if min_shares < 10.0:
+        _threshold = max(0.0, min_shares * 0.99 - 1e-6)
+    else:
+        _threshold = min_shares * 0.95
     _want_tid = (token_id or "").strip() or None
     while time.time() < deadline:
         try:
@@ -1252,10 +1310,7 @@ def _predict_wait_for_balance(
                         row_tid = _predict_position_row_token_id(pos)
                         if row_tid and row_tid.lower() != _want_tid.lower():
                             continue
-                    try:
-                        shares = int(pos.get("amount") or 0) / 1e18
-                    except Exception:
-                        shares = 0.0
+                    shares = _parse_predict_position_amount_shares(pos)
                     if shares >= _threshold:
                         return shares
         except Exception:
@@ -2809,11 +2864,25 @@ def _place_predict_limit_sell(
             timeout_sec=_idx_wait,
             token_id=str(token_id) if token_id else None,
         )
+        if _bal <= 0 and token_id:
+            # Token id in /positions may not match SDK string; use largest row on this market.
+            # Tight band vs requested size avoids picking the wrong outcome when user holds both.
+            _bal_fb = _predict_max_shares_for_market(session, int(leg.market_id))
+            if sell_qty * 0.85 <= _bal_fb <= sell_qty * 1.02:
+                _bal = _bal_fb
+                print(
+                    f"[TRADER]{_trace} predict_sell_index_wait_fallback market_id={leg.market_id} "
+                    f"max_market_shares={_bal_fb:.6f}"
+                )
         print(
             f"[TRADER]{_trace} predict_sell_index_wait market_id={leg.market_id} "
             f"token={str(token_id)[:18]}... need={sell_qty:.4f} found={_bal:.4f} "
             f"timeout={_idx_wait:.0f}s"
         )
+        if _bal > 0:
+            # Never ask to sell more than REST reports (fixes insufficient_shares from wei rounding).
+            _cap = min(sell_qty, _bal * (1.0 - 1e-9))
+            sell_qty = max(0.01, math.floor(_cap * 1_000_000) / 1_000_000)
 
     _tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
     sell_price = round(int(sell_price / _tick) * _tick, 6)
