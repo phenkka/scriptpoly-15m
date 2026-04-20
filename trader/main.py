@@ -2986,7 +2986,29 @@ def _place_predict_limit_sell(
         if time.time() >= t_deadline:
             break
 
-        # Cancel current order and re-place one tick lower
+        # Cancel current order and re-place one tick lower.
+        # ── BSC pre-replace guard: if the order already filled on-chain (API lag), do NOT replace. ──
+        # BSC block = 3s; replace_interval_sec = 3s → fills happen before API indexes them.
+        # Without this check, the cancelled (ignored) filled order + new replacement BOTH execute,
+        # causing a double-sell from the shared position balance.
+        if _active_order_hash:
+            try:
+                _bsc_pre = _bsc_check_order_filled(
+                    _active_order_hash,
+                    max(0.01, sell_qty - (filled_wei / 10**18 if filled_wei > 0 else 0.0)),
+                )
+                if _bsc_pre > 0:
+                    filled = True
+                    _bsc_wei = int(_bsc_pre * 10**18)
+                    if _bsc_wei > filled_wei:
+                        filled_wei = _bsc_wei
+                    print(
+                        f"[TRADER]{_trace} sell_bsc_pre_replace_fill hash={_active_order_hash} "
+                        f"qty={_bsc_pre:.4f} — skipping replace"
+                    )
+                    break
+            except Exception:
+                pass
         if _active_order_id:
             try:
                 _predict_remove_orders(session, [_active_order_id])
@@ -4023,7 +4045,10 @@ def opportunity(opp: Opportunity) -> dict:
                                 f"[TRADER][UNWIND_ERROR] no_edge attempt={_ne_attempt+1}/{_NE_UW_RETRIES} "
                                 f"label={opp.label} err={_ne_uw_e}"
                             )
-                            _ne_is_lag = "400" in _ne_unwind_err or "insufficient" in _ne_unwind_err.lower()
+                            # insufficient_shares_balance = shares already gone → terminal, don't retry
+                            if "insufficient" in _ne_unwind_err.lower():
+                                break
+                            _ne_is_lag = "400" in _ne_unwind_err
                             if not _ne_is_lag or _ne_attempt == _NE_UW_RETRIES - 1:
                                 break
                     _ne_uw_filled = _ne_uw_sold >= _ba_net_sell_qty * 0.99
@@ -4111,7 +4136,10 @@ def opportunity(opp: Opportunity) -> dict:
                     except Exception as _pc_uw_e:
                         _pc_unwind_err = str(_pc_uw_e)
                         print(f"[TRADER][UNWIND_ERROR] price_cap attempt={_pc_attempt+1}/{_PC_UW_RETRIES} label={opp.label} err={_pc_uw_e}")
-                        _pc_is_lag = "400" in _pc_unwind_err or "insufficient" in _pc_unwind_err.lower()
+                        # insufficient_shares_balance = shares already gone → terminal, don't retry
+                        if "insufficient" in _pc_unwind_err.lower():
+                            break
+                        _pc_is_lag = "400" in _pc_unwind_err
                         if not _pc_is_lag or _pc_attempt == _PC_UW_RETRIES - 1:
                             break
                 _pc_uw_filled = _pc_uw_total_sold >= _ba_net_sell_qty * 0.99
@@ -4197,7 +4225,10 @@ def opportunity(opp: Opportunity) -> dict:
                         except Exception as _upre_e:
                             _unwind_pre_err = str(_upre_e)
                             print(f"[TRADER][UNWIND_ERROR] fill_too_small attempt={_pre_attempt+1}/{_PRE_UW_RETRIES} label={opp.label} err={_upre_e}")
-                            _pre_is_lag = "400" in _unwind_pre_err or "insufficient" in _unwind_pre_err.lower()
+                            # insufficient_shares_balance = shares already gone → terminal, don't retry
+                            if "insufficient" in _unwind_pre_err.lower():
+                                break
+                            _pre_is_lag = "400" in _unwind_pre_err
                             if not _pre_is_lag or _pre_attempt == _PRE_UW_RETRIES - 1:
                                 break
                     _unwind_pre_filled = _unwind_pre_qty >= _ba_net_sell_qty * 0.99
@@ -4315,7 +4346,10 @@ def opportunity(opp: Opportunity) -> dict:
                         except Exception as _uw_e:
                             _unwind_err = str(_uw_e)
                             print(f"[TRADER][UNWIND_ERROR] below_min attempt={_uw_attempt+1}/{_UW_RETRIES} label={opp.label} err={_uw_e}")
-                            _uw_is_lag = "400" in _unwind_err or "insufficient" in _unwind_err.lower()
+                            # insufficient_shares_balance = shares already gone → terminal, don't retry
+                            if "insufficient" in _unwind_err.lower():
+                                break
+                            _uw_is_lag = "400" in _unwind_err
                             if not _uw_is_lag or _uw_attempt == _UW_RETRIES - 1:
                                 break
 
@@ -4929,7 +4963,10 @@ def opportunity(opp: Opportunity) -> dict:
                             f"attempt={_uw2_attempt+1}/{_UW2_RETRIES} err={_uw2_e}"
                         )
                         # On balance lag (still not indexed) keep retrying; other errors → stop
-                        _is_balance_lag = "400" in _uw2_err or "insufficient" in _uw2_err.lower()
+                        # insufficient_shares_balance = shares already gone → terminal, don't retry
+                        if "insufficient" in _uw2_err.lower():
+                            break
+                        _is_balance_lag = "400" in _uw2_err
                         if not _is_balance_lag:
                             break
 
