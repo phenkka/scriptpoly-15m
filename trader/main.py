@@ -466,6 +466,16 @@ def _bsc_ws_urls_resolved() -> list[str]:
             out.append(p)
     if out:
         return out
+    # Public HTTP seeds (_BSC_RPCS) usually do not serve eth_subscribe on wss://same-host → 404.
+    # Try dedicated WSS endpoints first; keep https→wss as last resort.
+    for w in (
+        "wss://bsc.publicnode.com",
+        "wss://bsc-rpc.publicnode.com",
+        "wss://bsc.drpc.org",
+    ):
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
     for h in _BSC_RPCS:
         h = (h or "").strip()
         if h.startswith("https://"):
