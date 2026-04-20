@@ -4037,7 +4037,7 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _ne_uw_sold += _ne_unwind_result.get("filled_qty", 0.0)
-                            if _ne_unwind_result.get("filled") or _ne_uw_sold >= _ba_net_sell_qty * 0.99:
+                            if _ne_uw_sold >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _ne_uw_e:
                             _ne_unwind_err = str(_ne_uw_e)
@@ -4131,7 +4131,7 @@ def opportunity(opp: Opportunity) -> dict:
                             trace_id=trace_id,
                         )
                         _pc_uw_total_sold += _pc_unwind_result.get("filled_qty", 0.0)
-                        if _pc_unwind_result.get("filled") or _pc_uw_total_sold >= _ba_net_sell_qty * 0.99:
+                        if _pc_uw_total_sold >= _ba_net_sell_qty * 0.99:
                             break
                     except Exception as _pc_uw_e:
                         _pc_unwind_err = str(_pc_uw_e)
@@ -4220,7 +4220,7 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _unwind_pre_qty += _unwind_pre_result.get("filled_qty", 0.0)
-                            if _unwind_pre_result.get("filled") or _unwind_pre_qty >= _ba_net_sell_qty * 0.99:
+                            if _unwind_pre_qty >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _upre_e:
                             _unwind_pre_err = str(_upre_e)
@@ -4341,7 +4341,7 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _uw_total_sold += _unwind_result.get("filled_qty", 0.0)
-                            if _unwind_result.get("filled") or _uw_total_sold >= _ba_net_sell_qty * 0.99:
+                            if _uw_total_sold >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _uw_e:
                             _unwind_err = str(_uw_e)
@@ -4954,7 +4954,7 @@ def opportunity(opp: Opportunity) -> dict:
                             trace_id=trace_id,
                         )
                         _uw2_total_sold += _uw2_result.get("filled_qty", 0.0)
-                        if _uw2_result.get("filled") or _uw2_total_sold >= _ba_net_sell_qty * 0.99:
+                        if _uw2_total_sold >= _ba_net_sell_qty * 0.99:
                             break
                     except Exception as _uw2_e:
                         _uw2_err = str(_uw2_e)
