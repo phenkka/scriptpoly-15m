@@ -2176,6 +2176,7 @@ def _place_polymarket_limit_buy_exact_shares(
                 "price": price,
                 "response": resp,
                 "order_type": "GTC",
+                "filled": True,
             }
 
         if resp_status == "live":
@@ -2203,6 +2204,7 @@ def _place_polymarket_limit_buy_exact_shares(
                             "price": price,
                             "response": resp,
                             "order_type": "GTC",
+                            "filled": True,
                         }
                 except Exception:
                     pass
@@ -2239,6 +2241,7 @@ def _place_polymarket_limit_buy_exact_shares(
                             "price": price,
                             "response": _auth_order,
                             "order_type": "GTC",
+                            "filled": True,
                         }
                 except Exception as _goe:
                     print(f"[TRADER][POLY][GTC_GET_ORDER_ERR] order_id={order_id} err={_goe}")
@@ -2268,6 +2271,7 @@ def _place_polymarket_limit_buy_exact_shares(
                             "price": price,
                             "response": _synth_resp,
                             "order_type": "GTC",
+                            "filled": True,
                         }
                 except Exception as _gte:
                     print(f"[TRADER][POLY][GTC_TRADE_HISTORY_ERR] order_id={order_id} err={_gte}")
