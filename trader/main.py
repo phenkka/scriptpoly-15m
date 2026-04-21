@@ -3330,6 +3330,28 @@ def _place_predict_limit_sell(
                 _predict_remove_orders(session, [_active_order_id])
             except Exception:
                 pass
+        # ── BSC post-cancel guard ──
+        # A fill can land on-chain in the window between the pre-cancel BSC check and
+        # the actual cancel execution (BSC block = ~3s, replace_interval = 3s).
+        # Re-check BSC after cancel; if the old order now shows filled, skip replacement.
+        if _active_order_hash:
+            try:
+                _bsc_post = _bsc_check_order_filled(
+                    _active_order_hash,
+                    max(0.01, sell_qty - (filled_wei / 10**18 if filled_wei > 0 else 0.0)),
+                )
+                if _bsc_post > 0:
+                    filled = True
+                    _bsc_post_wei = int(_bsc_post * 10**18)
+                    if _bsc_post_wei > filled_wei:
+                        filled_wei = _bsc_post_wei
+                    print(
+                        f"[TRADER]{_trace} sell_bsc_post_cancel_fill hash={_active_order_hash} "
+                        f"qty={_bsc_post:.4f} — skipping replacement"
+                    )
+                    break
+            except Exception:
+                pass
         current_price = max(_tick, round(current_price - _tick, 6))
         # Compute remaining unfilled quantity — avoid re-placing for already-filled shares
         _filled_so_far = filled_wei / 10**18 if filled_wei > 0 else 0.0
@@ -4765,6 +4787,10 @@ def opportunity(opp: Opportunity) -> dict:
                 if _market_id_int is not None:
                     with _predict_market_in_flight_lock:
                         _predict_market_in_flight.discard(_market_id_int)
+                # Refresh cooldown from NOW (end of unwind), not from the fill detection time.
+                # Without this, the 30s cooldown expires before unwind finishes → 2nd ghost fill.
+                if pred_leg.market_id is not None:
+                    _predict_market_last_buy_ts[int(pred_leg.market_id)] = time.time()
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "predict_fill_too_small"}
 
