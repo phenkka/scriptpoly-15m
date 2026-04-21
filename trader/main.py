@@ -1183,7 +1183,9 @@ def _predict_market(session: requests.Session, market_id: int) -> dict[str, Any]
     return data
 
 
-def _predict_orderbook(session: requests.Session, market_id: int) -> dict[str, Any]:
+def _predict_orderbook(session: requests.Session | None, market_id: int) -> dict[str, Any]:
+    if session is None:
+        session = _predict_monitor.get()
     r = session.get(f"https://api.predict.fun/v1/markets/{market_id}/orderbook", timeout=5)
     r.raise_for_status()
     j = r.json()
@@ -1196,7 +1198,7 @@ def _predict_orderbook(session: requests.Session, market_id: int) -> dict[str, A
 
 
 def _predict_live_sell_price(
-    session: requests.Session,
+    session: requests.Session | None,
     market_id: int,
     side: str,
     fallback: float,
@@ -1301,8 +1303,10 @@ def _parse_predict_position_amount_shares(pos: dict[str, Any]) -> float:
         return 0.0
 
 
-def _predict_max_shares_for_market(session: requests.Session, market_id: int) -> float:
+def _predict_max_shares_for_market(session: requests.Session | None, market_id: int) -> float:
     """Largest position size on this market (any outcome) — fallback when token match fails."""
+    if session is None:
+        session = _predict_monitor.get()
     best = 0.0
     try:
         r = session.get(
@@ -4340,7 +4344,7 @@ def opportunity(opp: Opportunity) -> dict:
                     # Only fall through to forced hedge if unwind completely fails.
                     _ne_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                     _ne_unwind_price = _predict_live_sell_price(
-                        session, int(pred_leg.market_id), pred_leg.side,
+                        None, int(pred_leg.market_id), pred_leg.side,
                         fallback=_ba_actual_pred_bid, tick=_ne_unwind_tick,
                     )
 
@@ -4359,7 +4363,7 @@ def opportunity(opp: Opportunity) -> dict:
                     )
                     if _ne_use_temp_hedge:
                         # Quick balance check (no blocking wait) — 0 means positions not indexed
-                        _ne_quick_bal = _predict_max_shares_for_market(session, int(pred_leg.market_id))
+                        _ne_quick_bal = _predict_max_shares_for_market(None, int(pred_leg.market_id))
                         if _ne_quick_bal < _ba_net_sell_qty * 0.5:
                             print(
                                 f"[TRADER][EMERGENCY_HEDGE] positions_not_indexed label={opp.label} "
@@ -4592,7 +4596,7 @@ def opportunity(opp: Opportunity) -> dict:
                 # Unwind Predict position before declaring price_cap incident
                 _pc_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                 _pc_unwind_price = _predict_live_sell_price(
-                    session, int(pred_leg.market_id), pred_leg.side,
+                    None, int(pred_leg.market_id), pred_leg.side,
                     fallback=_ba_actual_pred_bid, tick=_pc_unwind_tick,
                 )
                 _pc_unwind_result: dict[str, Any] = {}
@@ -4686,7 +4690,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _min_unwind_usd = 0.01
                 _unwind_tick_pre = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                 _unwind_price_pre = _predict_live_sell_price(
-                    session, int(pred_leg.market_id), pred_leg.side,
+                    None, int(pred_leg.market_id), pred_leg.side,
                     fallback=_ba_actual_pred_bid, tick=_unwind_tick_pre,
                 )
                 _unwind_pre_filled = False
@@ -4809,7 +4813,7 @@ def opportunity(opp: Opportunity) -> dict:
                         _append_jsonl(trades_file, row)
                         return {"status": "skipped", "reason": "below_min_dust"}
                     _unwind_price = _predict_live_sell_price(
-                        session, int(pred_leg.market_id), pred_leg.side,
+                        None, int(pred_leg.market_id), pred_leg.side,
                         fallback=_ba_actual_pred_bid,
                         tick=float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
                     )
@@ -5161,7 +5165,7 @@ def opportunity(opp: Opportunity) -> dict:
                         # below the minimum viable size, sell ALL shares and also unwind Poly.
                         _mm_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                         _mm_unwind_price = _predict_live_sell_price(
-                            session, int(pred_leg.market_id), pred_leg.side,
+                            None, int(pred_leg.market_id), pred_leg.side,
                             fallback=_ba_actual_pred_bid, tick=_mm_tick,
                         )
                         _mm_min_usd = float(os.environ.get("PREDICT_MIN_FILL_USD", "1.0") or "1.0")
@@ -5429,7 +5433,7 @@ def opportunity(opp: Opportunity) -> dict:
                 # Predict filled, poly failed → try to unwind on Predict before declaring incident
                 _unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
                 _unwind_sell_price = _predict_live_sell_price(
-                    session, int(pred_leg.market_id), pred_leg.side,
+                    None, int(pred_leg.market_id), pred_leg.side,
                     fallback=_ba_actual_pred_bid, tick=_unwind_tick,
                 )
                 _uw2_result: dict[str, Any] = {}
