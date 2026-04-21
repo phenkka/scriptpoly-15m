@@ -36,7 +36,7 @@ from predict_sdk import (
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL as POLY_SELL
 
 from trader.config import CONFIG as CFG
 
@@ -583,6 +583,31 @@ def _start_bsc_ws_thread() -> None:
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
 _ba_fill_state: dict[str, tuple[int, float, int, float]] = {}
+
+# ── Rolling positions-indexer latency store ───────────────────────────────────
+# Tracks observed chain_fill → positions_visible lag (seconds) for the last N samples.
+# Used to compute a dynamic expiry safety buffer: p99 + unwind_time_budget.
+import collections as _collections
+_POSITIONS_LAG_STORE: _collections.deque[float] = _collections.deque(maxlen=200)
+_positions_lag_store_lock = _threading.Lock()
+
+
+def _record_positions_lag(wait_sec: float) -> None:
+    """Record one observed positions-indexer latency sample (only successful finds)."""
+    if wait_sec > 0:
+        with _positions_lag_store_lock:
+            _POSITIONS_LAG_STORE.append(wait_sec)
+
+
+def _positions_lag_p99() -> float | None:
+    """Return p99 of observed positions-visible latency, or None if < 10 samples."""
+    with _positions_lag_store_lock:
+        data = list(_POSITIONS_LAG_STORE)
+    if len(data) < 10:
+        return None
+    data.sort()
+    idx = int(len(data) * 0.99)
+    return data[min(idx, len(data) - 1)]
 
 
 def _save_inflight_order(market_id: int, order_hash: str, order_id: str | None, token_id: str | None, shares: float) -> None:
@@ -1170,6 +1195,42 @@ def _predict_orderbook(session: requests.Session, market_id: int) -> dict[str, A
     return data
 
 
+def _predict_live_sell_price(
+    session: requests.Session,
+    market_id: int,
+    side: str,
+    fallback: float,
+    tick: float = 0.01,
+) -> float:
+    """Return the best live bid price on Predict for the token we want to sell.
+
+    For UP side: best bid from bids[] (highest bid = most willing buyer).
+    For DOWN side: complement of the lowest ask from asks[] (DOWN bid = 1 - UP ask).
+
+    Starting the unwind sell at the live bid means it matches immediately instead of
+    sitting at a stale/floor price. Falls back to fallback-tick if book is empty or
+    the API call fails.
+    """
+    try:
+        ob = _predict_orderbook(session, market_id)
+        bids_flat = ob.get("bids") or []
+        asks_flat = ob.get("asks") or []
+        live_bid: float | None = None
+        if side == "up":
+            best = max(bids_flat, key=lambda b: float(b[0])) if bids_flat else None
+            live_bid = float(best[0]) if best else None
+        else:
+            # DOWN bid = 1 - lowest UP ask
+            best_ask = min(asks_flat, key=lambda a: float(a[0])) if asks_flat else None
+            live_bid = round(1.0 - float(best_ask[0]), 6) if best_ask else None
+        if live_bid is not None and live_bid > 0:
+            # Snap down to tick grid so the SDK doesn't reject the price
+            return max(tick, round(int(live_bid / tick) * tick, 6))
+    except Exception:
+        pass
+    return max(tick, round(int((fallback - tick) / tick) * tick, 6))
+
+
 def _predict_get_order_by_hash(session: requests.Session, order_hash: str) -> dict[str, Any]:
     order_hash = (order_hash or "").strip()
     if not order_hash:
@@ -1272,7 +1333,7 @@ def _predict_wait_for_balance(
     timeout_sec: float = 90.0,
     poll_sec: float = 1.5,
     token_id: str | None = None,
-) -> float:
+) -> tuple[float, float]:
     """Poll GET /v1/positions until sellable balance >= min_shares appears in the API.
 
     Predict indexes BSC settlement into REST with lag.  SELL uses that balance;
@@ -1283,9 +1344,11 @@ def _predict_wait_for_balance(
     If token_id is set, only the matching outcome row counts (same market can have
     YES/NO rows).
 
-    Returns shares found (>= threshold), or 0.0 on timeout.
+    Returns (shares_found, wait_sec). shares_found=0.0 on timeout.
+    The wait_sec is recorded into the rolling p99 latency store on success.
     """
-    deadline = time.time() + timeout_sec
+    t_start = time.time()
+    deadline = t_start + timeout_sec
     # Tiny fills: 95% of 2.32 leaves little slack vs on-chain rounding / API dust.
     if min_shares < 10.0:
         _threshold = max(0.0, min_shares * 0.99 - 1e-6)
@@ -1312,14 +1375,16 @@ def _predict_wait_for_balance(
                             continue
                     shares = _parse_predict_position_amount_shares(pos)
                     if shares >= _threshold:
-                        return shares
+                        wait_sec = time.time() - t_start
+                        _record_positions_lag(wait_sec)
+                        return shares, wait_sec
         except Exception:
             pass
         remaining = deadline - time.time()
         if remaining <= 0:
             break
         time.sleep(min(poll_sec, remaining))
-    return 0.0
+    return 0.0, time.time() - t_start
 
 
 def _predict_cancel_all_open_orders(session: requests.Session) -> int:
@@ -1797,6 +1862,251 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg, fak_fallback: bool = F
         )
         print("[TRADER][POLY][TRACE]\n" + traceback.format_exc())
         raise
+
+
+def _place_poly_limit_sell(token_id: str, qty: float, price: float) -> dict[str, Any]:
+    """Place a GTC limit SELL on Polymarket at the given price.
+
+    Returns {"filled_qty": float, "price": float, "order_id": str, "status": str}.
+    Does not poll for fill — caller decides whether to wait.
+    """
+    import math as _m
+
+    private_key = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
+    funder = os.environ.get("POLY_FUNDER", "").strip()
+    poly_api_key = os.environ.get("POLY_API_KEY", "").strip()
+    poly_secret = os.environ.get("POLY_SECRET", "").strip()
+    poly_passphrase = os.environ.get("POLY_PASSPHRASE", "").strip()
+    try:
+        signature_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "0").strip() or "0")
+    except ValueError:
+        signature_type = 0
+
+    if not private_key or not funder:
+        return {"filled_qty": 0.0, "price": price, "order_id": "", "status": "skip:no_creds"}
+
+    price_ticked = max(0.01, _m.floor(price * 1000) / 1000)  # snap to Poly 0.001 tick grid
+
+    cli = ClobClient("https://clob.polymarket.com", chain_id=137,
+                     key=private_key, signature_type=signature_type, funder=funder)
+    if poly_api_key and poly_secret and poly_passphrase:
+        cli.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
+    else:
+        cli.set_api_creds(cli.create_or_derive_api_creds())
+
+    signed = cli.create_order(OrderArgs(
+        token_id=token_id,
+        price=price_ticked,
+        size=round(qty, 4),
+        side=POLY_SELL,
+    ))
+    resp = cli.post_order(signed, OrderType.GTC)
+    status = (resp.get("status") or "").lower()
+    filled_qty = qty if (status in ("matched", "filled") or resp.get("transactionsHashes")) else 0.0
+    return {
+        "filled_qty": filled_qty,
+        "price": price_ticked,
+        "order_id": resp.get("orderID", ""),
+        "status": status,
+    }
+
+
+def _place_poly_temp_hedge(poly_token_id: str, shares: float) -> dict[str, Any]:
+    """Emergency: open a temporary FAK market BUY on Poly to neutralize Predict long exposure.
+
+    State: CHAIN_FILLED_UNINDEXED → TEMP_POLY_HEDGED.
+    Fetches live orderbook VWAP, then calls _place_polymarket_fok_market_buy with fak_fallback.
+
+    Returns {"filled_qty": float, "cost_usd": float, "vwap": float, "status": str}.
+    """
+    if not poly_token_id or shares < 0.01:
+        return {"filled_qty": 0.0, "cost_usd": 0.0, "vwap": 0.0, "status": "skip:invalid_input"}
+    try:
+        book = _polymarket_book(poly_token_id)
+        vwap = _vwap_from_poly_book(book, shares)
+        if vwap is None or vwap <= 0.0:
+            return {"filled_qty": 0.0, "cost_usd": 0.0, "vwap": 0.0, "status": "skip:no_liquidity"}
+        stake_usd = shares * vwap * 1.02  # 2% slippage buffer
+        leg = OpportunityLeg(
+            source="emergency_temp_hedge",
+            side="BUY",
+            ts=datetime.utcnow().isoformat(),
+            ask=vwap,
+            ask_sz=shares,
+            pool_usd=0.0,
+            shares=shares,
+            stake_usd=stake_usd,
+            token_id=poly_token_id,
+            market_id=None,
+        )
+        result = _place_polymarket_fok_market_buy(leg, fak_fallback=True)
+        resp = result.get("response") or {}
+        resp_status = (resp.get("status") or "").lower()
+        filled_qty: float = 0.0
+        if resp_status in ("matched", "filled") or resp.get("transactionsHashes"):
+            try:
+                _taking = int(resp.get("takingAmount") or 0)
+                filled_qty = _taking / 1_000_000 if _taking > 0 else shares
+            except (ValueError, TypeError):
+                filled_qty = shares
+        return {
+            "filled_qty": filled_qty,
+            "cost_usd": stake_usd,
+            "vwap": vwap,
+            "status": resp_status or "placed",
+            "response": resp,
+        }
+    except Exception as _e:
+        return {"filled_qty": 0.0, "cost_usd": 0.0, "vwap": 0.0, "status": f"error:{_e}"}
+
+
+def _close_poly_temp_hedge(poly_token_id: str, qty: float) -> dict[str, Any]:
+    """Close a temporary Poly hedge by selling qty.
+
+    Strategy (aggressive — must close, not optional):
+    1. GTC at floor(best_bid * 1000)/1000  → immediate taker fill
+    2. If order goes live (resting), poll 5s then cancel
+    3. Retry at bid - 0.01 tick (one level below best bid)
+    4. Last resort: FAK market sell at any available price
+    Returns {"filled_qty": float, "price": float, "status": str, "attempts": int}.
+    """
+    import math as _cm
+
+    if not poly_token_id or qty < 0.01:
+        return {"filled_qty": 0.0, "price": 0.0, "status": "skip:invalid_input", "attempts": 0}
+
+    private_key = _normalize_hex_key(os.environ.get("POLY_PRIVATE_KEY", ""))
+    funder = os.environ.get("POLY_FUNDER", "").strip()
+    poly_api_key = os.environ.get("POLY_API_KEY", "").strip()
+    poly_secret = os.environ.get("POLY_SECRET", "").strip()
+    poly_passphrase = os.environ.get("POLY_PASSPHRASE", "").strip()
+    try:
+        sig_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "0").strip() or "0")
+    except ValueError:
+        sig_type = 0
+
+    if not private_key or not funder:
+        return {"filled_qty": 0.0, "price": 0.0, "status": "skip:no_creds", "attempts": 0}
+
+    def _build_cli() -> ClobClient:
+        c = ClobClient("https://clob.polymarket.com", chain_id=137,
+                       key=private_key, signature_type=sig_type, funder=funder)
+        if poly_api_key and poly_secret and poly_passphrase:
+            c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret,
+                                     api_passphrase=poly_passphrase))
+        else:
+            c.set_api_creds(c.create_or_derive_api_creds())
+        return c
+
+    def _fetch_best_bid() -> float:
+        try:
+            book = _polymarket_book(poly_token_id)
+            bids = book.get("bids") or []
+            return float(bids[0]["price"]) if bids else 0.0
+        except Exception:
+            return 0.0
+
+    total_filled = 0.0
+    last_price = 0.0
+
+    # ── Attempts 1 & 2: GTC at bid, then bid-0.01 ─────────────────────────
+    for _attempt in range(2):
+        best_bid = _fetch_best_bid()
+        if best_bid < 0.02:
+            break
+        # Attempt 0: floor to tick; attempt 1: one tick lower to cross the spread
+        tick_offset = 0.001 * _attempt
+        sell_price = max(0.01, _cm.floor((best_bid - tick_offset) * 1000) / 1000)
+        remaining = max(0.01, qty - total_filled)
+
+        try:
+            cli = _build_cli()
+            signed = cli.create_order(OrderArgs(
+                token_id=poly_token_id,
+                price=sell_price,
+                size=round(remaining, 4),
+                side=POLY_SELL,
+            ))
+            resp = cli.post_order(signed, OrderType.GTC)
+            resp_status = (resp.get("status") or "").lower()
+            order_id = resp.get("orderID", "")
+
+            if resp_status in ("matched", "filled") or resp.get("transactionsHashes"):
+                total_filled += remaining
+                last_price = sell_price
+                return {
+                    "filled_qty": total_filled, "price": last_price,
+                    "status": "matched", "attempts": _attempt + 1,
+                }
+
+            if resp_status == "live" and order_id:
+                # Poll up to 5s for fill
+                _poll_deadline = time.time() + 5.0
+                _filled_on_poll = False
+                while time.time() < _poll_deadline:
+                    time.sleep(1.0)
+                    try:
+                        _ord = cli.get_order(order_id)
+                        _s = (_ord.get("status") or "").lower()
+                        _sm = float(_ord.get("size_matched") or 0)
+                        if _s in ("matched", "filled") or _sm > 0:
+                            total_filled += _sm if _sm > 0 else remaining
+                            last_price = sell_price
+                            _filled_on_poll = True
+                            break
+                    except Exception:
+                        pass
+                if _filled_on_poll:
+                    return {
+                        "filled_qty": total_filled, "price": last_price,
+                        "status": "matched_via_poll", "attempts": _attempt + 1,
+                    }
+                # Still not filled — cancel and try next attempt
+                try:
+                    cli.cancel(order_id)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        except Exception as _e:
+            print(f"[TRADER][CLOSE_TEMP_HEDGE] attempt={_attempt+1} err={_e}")
+
+    # ── Last resort: FAK market sell ──────────────────────────────────────
+    remaining = max(0.01, qty - total_filled)
+    if remaining >= 0.01:
+        try:
+            best_bid = _fetch_best_bid()
+            if best_bid >= 0.02:
+                stake_for_sell = remaining * best_bid * 0.98  # ~2% below mid
+                cli_fak = _build_cli()
+                from py_clob_client.clob_types import MarketOrderArgs as _MOA
+                mo = _MOA(
+                    token_id=poly_token_id,
+                    amount=stake_for_sell,
+                    side=POLY_SELL,
+                    order_type=OrderType.FAK,
+                )
+                signed_fak = cli_fak.create_market_order(mo)
+                resp_fak = cli_fak.post_order(signed_fak, OrderType.FAK)
+                fak_status = (resp_fak.get("status") or "").lower()
+                if fak_status in ("matched", "filled") or resp_fak.get("transactionsHashes"):
+                    total_filled += remaining
+                    last_price = best_bid
+                    return {
+                        "filled_qty": total_filled, "price": last_price,
+                        "status": "fak_matched", "attempts": 3,
+                    }
+                return {
+                    "filled_qty": total_filled, "price": last_price,
+                    "status": f"fak_failed:{fak_status}", "attempts": 3,
+                }
+        except Exception as _fak_e:
+            return {
+                "filled_qty": total_filled, "price": last_price,
+                "status": f"fak_error:{_fak_e}", "attempts": 3,
+            }
+
+    return {"filled_qty": total_filled, "price": last_price, "status": "close_exhausted", "attempts": 3}
 
 
 def _place_polymarket_limit_buy_exact_shares(
@@ -2856,14 +3166,16 @@ def _place_predict_limit_sell(
     if not _idx_raw:
         _idx_raw = os.environ.get("PREDICT_UNWIND_BAL_TIMEOUT_SEC", "").strip()
     _idx_wait = float(_idx_raw or "90")
+    _positions_seen_sec: float | None = None
     if _idx_wait > 0 and sell_qty >= 0.01:
-        _bal = _predict_wait_for_balance(
+        _bal, _pos_wait = _predict_wait_for_balance(
             session,
             int(leg.market_id),
             sell_qty,
             timeout_sec=_idx_wait,
             token_id=str(token_id) if token_id else None,
         )
+        _positions_seen_sec = _pos_wait
         if _bal <= 0 and token_id:
             # Token id in /positions may not match SDK string; use largest row on this market.
             # Tight band vs requested size avoids picking the wrong outcome when user holds both.
@@ -3095,6 +3407,7 @@ def _place_predict_limit_sell(
         "sell_price": current_price,
         "order_hash": _active_order_hash or order_hash,
         "get": last_get,
+        "positions_seen_sec": _positions_seen_sec,
     }
 
 
@@ -3412,15 +3725,27 @@ def opportunity(opp: Opportunity) -> dict:
     if pred_leg is None or poly_leg is None:
         raise HTTPException(status_code=400, detail="Expected both polymarket and predict legs")
 
-    # Guard: не торговать если до закрытия рынка < 30 секунд
+    # Guard: не торговать если до закрытия рынка недостаточно времени.
+    # Минимальный буфер = PREDICT_SELL_INDEX_WAIT_SEC (90s, индексер) +
+    # fill_timeout_sec unwind (60s) × 3 retry + задержки (~300s итого).
+    # Самый опасный сценарий: Predict-fill уже произошёл, а продать обратно
+    # некуда — рынок закрылся, позиция висит без хеджа до экспайри.
     if opp.end_date:
         try:
             _end_dt = datetime.fromisoformat(opp.end_date.rstrip("Z")).replace(tzinfo=timezone.utc)
             _secs_to_end = (_end_dt - datetime.now(timezone.utc)).total_seconds()
-            if _secs_to_end < 30:
+            _static_buf = float(os.environ.get("PREDICT_MIN_EXPIRY_BUFFER_SEC", "300") or "300")
+            _p99_lag = _positions_lag_p99()
+            # unwind budget: fill_timeout_sec=60 × up to 5 retries + 60s safety margin
+            _unwind_budget_sec = 60.0 * 5 + 60.0
+            _dynamic_buf = (_p99_lag * 1.5 + _unwind_budget_sec) if _p99_lag is not None else None
+            _min_expiry_buf = max(_static_buf, _dynamic_buf) if _dynamic_buf is not None else _static_buf
+            if _secs_to_end < _min_expiry_buf:
                 print(
                     f"[TRADER]{_t}[SKIP] label={opp.label} "
-                    f"reason=market_close_imminent secs_to_end={_secs_to_end:.1f}"
+                    f"reason=market_close_imminent secs_to_end={_secs_to_end:.1f} "
+                    f"min_buffer={_min_expiry_buf:.0f}s "
+                    f"(static={_static_buf:.0f}s dynamic={f'{_dynamic_buf:.0f}s' if _dynamic_buf is not None else 'n/a'} p99_lag={f'{_p99_lag:.1f}s' if _p99_lag is not None else 'n/a'})"
                 )
                 return {"status": "skipped", "reason": "market_close_imminent", "secs_to_end": round(_secs_to_end, 1)}
         except Exception:
@@ -4014,7 +4339,59 @@ def opportunity(opp: Opportunity) -> dict:
                     # Forcing the hedge at terrible poly price locks in a guaranteed large loss.
                     # Only fall through to forced hedge if unwind completely fails.
                     _ne_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                    _ne_unwind_price = max(_ne_unwind_tick, _ba_actual_pred_bid - _ne_unwind_tick)
+                    _ne_unwind_price = _predict_live_sell_price(
+                        session, int(pred_leg.market_id), pred_leg.side,
+                        fallback=_ba_actual_pred_bid, tick=_ne_unwind_tick,
+                    )
+
+                    # ── Emergency Poly temp-hedge ──────────────────────────────────────────
+                    # If Predict positions are not yet indexed, we can't sell immediately.
+                    # Place a temporary opposite-side position on Poly to neutralize delta
+                    # exposure during the indexer lag window.
+                    # State path: CHAIN_FILLED_UNINDEXED → TEMP_POLY_HEDGED → PREDICT_UNWOUND
+                    #             → TEMP_HEDGE_RELEASED (or TEMP_HEDGE_RETAINED on Predict fail)
+                    _ne_temp_hedge_result: dict[str, Any] = {}
+                    _ne_temp_hedge_qty: float = 0.0
+                    _ne_temp_hedge_state: str = "none"
+                    _ne_use_temp_hedge = (
+                        os.environ.get("PREDICT_EMERGENCY_POLY_HEDGE", "1") not in ("0", "false", "no")
+                        and poly_leg.token_id is not None
+                    )
+                    if _ne_use_temp_hedge:
+                        # Quick balance check (no blocking wait) — 0 means positions not indexed
+                        _ne_quick_bal = _predict_max_shares_for_market(session, int(pred_leg.market_id))
+                        if _ne_quick_bal < _ba_net_sell_qty * 0.5:
+                            print(
+                                f"[TRADER][EMERGENCY_HEDGE] positions_not_indexed label={opp.label} "
+                                f"quick_bal={_ne_quick_bal:.4f} target={_ba_net_sell_qty:.4f} "
+                                f"— placing temp Poly hedge"
+                            )
+                            _ne_temp_hedge_result = _place_poly_temp_hedge(
+                                str(poly_leg.token_id), _ba_net_sell_qty
+                            )
+                            _ne_temp_hedge_qty = _ne_temp_hedge_result.get("filled_qty", 0.0)
+                            if _ne_temp_hedge_qty > 0:
+                                _ne_temp_hedge_state = "placed"
+                                notify(
+                                    f"🟡 <b>TEMP POLY HEDGE PLACED</b>\n"
+                                    f"\n"
+                                    f"<b>{opp.label}</b>\n"
+                                    f"\n"
+                                    f"Predict long {_ba_net_sell_qty:.2f} shares — indexer lag\n"
+                                    f"Poly: куплено {_ne_temp_hedge_qty:.2f} sh противоположной ноги\n"
+                                    f"VWAP: {_ne_temp_hedge_result.get('vwap', 0):.3f} | Стоимость: ${_ne_temp_hedge_result.get('cost_usd', 0):.2f}\n"
+                                    f"\n"
+                                    f"Ждём Predict indexer..."
+                                )
+                            else:
+                                _ne_temp_hedge_state = "placement_failed"
+                                print(
+                                    f"[TRADER][EMERGENCY_HEDGE] placement_failed label={opp.label} "
+                                    f"status={_ne_temp_hedge_result.get('status')} "
+                                    f"— proceeding without temp hedge"
+                                )
+                    # ──────────────────────────────────────────────────────────────────────
+
                     _ne_unwind_result: dict[str, Any] = {}
                     _ne_unwind_err: str | None = None
                     _NE_UW_RETRIES = 3
@@ -4037,6 +4414,8 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _ne_uw_sold += _ne_unwind_result.get("filled_qty", 0.0)
+                            if _ne_unwind_result.get("positions_seen_sec") is not None:
+                                row["timing"]["positions_seen_sec"] = _ne_unwind_result["positions_seen_sec"]
                             if _ne_uw_sold >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _ne_uw_e:
@@ -4055,6 +4434,71 @@ def opportunity(opp: Opportunity) -> dict:
                     _ne_uw_qty = _ne_uw_sold
                     if _ne_uw_filled or _ne_uw_qty > 0:
                         # Unwind succeeded (fully or partially) → declare incident, do NOT hedge
+
+                        # Close temp Poly hedge proportional to what we sold on Predict.
+                        # MUST close — retry until sold or all attempts exhausted.
+                        _ne_close_result: dict[str, Any] = {}
+                        if _ne_temp_hedge_qty > 0 and _ne_temp_hedge_state == "placed":
+                            _close_ratio = _ne_uw_qty / _ba_net_sell_qty if _ba_net_sell_qty > 0 else 1.0
+                            _ne_close_qty = round(
+                                min(_ne_temp_hedge_qty, _ne_temp_hedge_qty * _close_ratio), 4
+                            )
+                            if _ne_close_qty >= 0.01:
+                                print(
+                                    f"[TRADER][EMERGENCY_HEDGE] closing_temp_hedge label={opp.label} "
+                                    f"hedge_qty={_ne_temp_hedge_qty:.4f} close_qty={_ne_close_qty:.4f}"
+                                )
+                                # _close_poly_temp_hedge already retries internally (GTC×2 + FAK).
+                                # If it still fails, retry the whole closer up to 2 more times
+                                # before declaring stuck.
+                                _CLOSE_OUTER_RETRIES = 3
+                                for _close_outer in range(_CLOSE_OUTER_RETRIES):
+                                    if _close_outer > 0:
+                                        time.sleep(3.0)
+                                    _ne_close_result = _close_poly_temp_hedge(
+                                        str(poly_leg.token_id), _ne_close_qty
+                                    )
+                                    if _ne_close_result.get("filled_qty", 0) > 0:
+                                        break
+                                    print(
+                                        f"[TRADER][EMERGENCY_HEDGE] close_outer_retry "
+                                        f"attempt={_close_outer+1}/{_CLOSE_OUTER_RETRIES} "
+                                        f"label={opp.label} status={_ne_close_result.get('status')}"
+                                    )
+
+                                _ne_temp_hedge_state = (
+                                    "released" if _ne_close_result.get("filled_qty", 0) > 0
+                                    else "stuck"  # exhausted all attempts
+                                )
+                                print(
+                                    f"[TRADER][EMERGENCY_HEDGE] close_final label={opp.label} "
+                                    f"state={_ne_temp_hedge_state} "
+                                    f"filled={_ne_close_result.get('filled_qty', 0):.4f} "
+                                    f"price={_ne_close_result.get('price', 0):.4f} "
+                                    f"status={_ne_close_result.get('status')}"
+                                )
+                                if _ne_temp_hedge_state == "stuck":
+                                    notify(
+                                        f"🚨🚨🚨 <b>STUCK TEMP HEDGE — РУЧНАЯ ЗАКРЫТИЕ ОБЯЗАТЕЛЬНО</b>\n"
+                                        f"\n"
+                                        f"<b>{opp.label}</b>\n"
+                                        f"\n"
+                                        f"Predict unwind: ✅ {_ne_uw_qty:.2f} sh продано\n"
+                                        f"Poly temp hedge: {_ne_close_qty:.2f} sh — закрыть не удалось!\n"
+                                        f"Token: <code>{str(poly_leg.token_id)[:32]}</code>\n"
+                                        f"\n"
+                                        f"Нужно продать вручную на Polymarket!\n"
+                                    )
+                            else:
+                                _ne_temp_hedge_state = "skip_close_qty_too_small"
+                        row["temp_hedge"] = {
+                            "state": _ne_temp_hedge_state,
+                            "placed_qty": _ne_temp_hedge_qty,
+                            "placed_cost_usd": _ne_temp_hedge_result.get("cost_usd", 0.0),
+                            "placed_vwap": _ne_temp_hedge_result.get("vwap", 0.0),
+                            "close_result": _ne_close_result,
+                        }
+
                         row["ok"] = False
                         row["summary"]["status"] = "incident"
                         row["summary"]["reason_code"] = "bid_ask_hedge_no_edge"
@@ -4073,6 +4517,21 @@ def opportunity(opp: Opportunity) -> dict:
                         else:
                             _ne_uw_rem = _ba_net_sell_qty - _ne_uw_qty
                             _ne_uw_status = f"⚠️ ЧАСТИЧНО {_ne_uw_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ne_uw_rem:.2f} — ручная проверка!"
+                        # Build temp hedge line for notification
+                        _ne_th_line = ""
+                        if _ne_temp_hedge_state == "released":
+                            _ne_th_line = (
+                                f"\n<i>🛡 Temp hedge закрыт: продано {_ne_close_result.get('filled_qty', 0):.2f} sh Poly "
+                                f"@ {_ne_close_result.get('price', 0):.3f}</i>"
+                            )
+                        elif _ne_temp_hedge_state == "placed":
+                            _ne_th_line = (
+                                f"\n<i>⚠️ Temp hedge НЕ закрыт: {_ne_temp_hedge_qty:.2f} sh Poly — ручная проверка!</i>"
+                            )
+                        elif _ne_temp_hedge_state == "close_failed":
+                            _ne_th_line = (
+                                f"\n<i>🔴 Temp hedge: закрытие не удалось! {_ne_temp_hedge_qty:.2f} sh Poly — ручная!</i>"
+                            )
                         notify(
                             f"🟡🟡🟡 <b>INCIDENT: HEDGE NO EDGE → UNWIND</b>\n"
                             f"\n"
@@ -4082,10 +4541,34 @@ def opportunity(opp: Opportunity) -> dict:
                             f"Poly цена ухудшилась: {_live_vwap_ba:.2f} → edge {_live_net_edge_ba * 10_000:.0f}bps\n"
                             f"\n"
                             f"Продажа обратно на Predict по {_ne_unwind_price:.2f}: {_ne_uw_status}\n"
+                            f"{_ne_th_line}\n"
                         )
                         _append_jsonl(trades_file, row)
                         return {"status": "incident", "reason": "bid_ask_hedge_no_edge"}
                     else:
+                        # Unwind completely failed → if temp hedge is active, RETAIN it as protection
+                        if _ne_temp_hedge_qty > 0 and _ne_temp_hedge_state == "placed":
+                            _ne_temp_hedge_state = "retained"
+                            notify(
+                                f"🔴 <b>TEMP POLY HEDGE RETAINED</b>\n"
+                                f"\n"
+                                f"<b>{opp.label}</b>\n"
+                                f"\n"
+                                f"Predict unwind не удался — temp hedge на Poly оставлен как защита\n"
+                                f"Poly: {_ne_temp_hedge_qty:.2f} sh @ {_ne_temp_hedge_result.get('vwap', 0):.3f}\n"
+                                f"Следующий шаг: вручную продать Predict-позицию и закрыть Poly-хедж\n"
+                            )
+                            print(
+                                f"[TRADER][EMERGENCY_HEDGE] retained label={opp.label} "
+                                f"hedge_qty={_ne_temp_hedge_qty:.4f} — predict_unwind_failed"
+                            )
+                        row["temp_hedge"] = {
+                            "state": _ne_temp_hedge_state,
+                            "placed_qty": _ne_temp_hedge_qty,
+                            "placed_cost_usd": _ne_temp_hedge_result.get("cost_usd", 0.0),
+                            "placed_vwap": _ne_temp_hedge_result.get("vwap", 0.0),
+                            "close_result": {},
+                        }
                         # Unwind completely failed → fall through to forced hedge
                         # Hedging is still better than directional exposure with no exit
                         print(
@@ -4108,7 +4591,10 @@ def opportunity(opp: Opportunity) -> dict:
             if _live_vwap_ba is not None and _live_vwap_ba >= _poly_max_hedge_price:
                 # Unwind Predict position before declaring price_cap incident
                 _pc_unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                _pc_unwind_price = max(_pc_unwind_tick, _ba_actual_pred_bid - _pc_unwind_tick)
+                _pc_unwind_price = _predict_live_sell_price(
+                    session, int(pred_leg.market_id), pred_leg.side,
+                    fallback=_ba_actual_pred_bid, tick=_pc_unwind_tick,
+                )
                 _pc_unwind_result: dict[str, Any] = {}
                 _pc_unwind_err: str | None = None
                 _PC_UW_RETRIES = 3
@@ -4131,6 +4617,8 @@ def opportunity(opp: Opportunity) -> dict:
                             trace_id=trace_id,
                         )
                         _pc_uw_total_sold += _pc_unwind_result.get("filled_qty", 0.0)
+                        if _pc_unwind_result.get("positions_seen_sec") is not None:
+                            row["timing"]["positions_seen_sec"] = _pc_unwind_result["positions_seen_sec"]
                         if _pc_uw_total_sold >= _ba_net_sell_qty * 0.99:
                             break
                     except Exception as _pc_uw_e:
@@ -4197,7 +4685,10 @@ def opportunity(opp: Opportunity) -> dict:
             if _pred_fill_usd < _pred_min_fill_usd:
                 _min_unwind_usd = 0.01
                 _unwind_tick_pre = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                _unwind_price_pre = max(_unwind_tick_pre, _ba_actual_pred_bid - _unwind_tick_pre)
+                _unwind_price_pre = _predict_live_sell_price(
+                    session, int(pred_leg.market_id), pred_leg.side,
+                    fallback=_ba_actual_pred_bid, tick=_unwind_tick_pre,
+                )
                 _unwind_pre_filled = False
                 _unwind_pre_err: str | None = None
                 _unwind_pre_qty = 0.0
@@ -4220,6 +4711,8 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _unwind_pre_qty += _unwind_pre_result.get("filled_qty", 0.0)
+                            if _unwind_pre_result.get("positions_seen_sec") is not None:
+                                row["timing"]["positions_seen_sec"] = _unwind_pre_result["positions_seen_sec"]
                             if _unwind_pre_qty >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _upre_e:
@@ -4315,9 +4808,10 @@ def opportunity(opp: Opportunity) -> dict:
                         row["summary"]["reason_code"] = "below_min_dust"
                         _append_jsonl(trades_file, row)
                         return {"status": "skipped", "reason": "below_min_dust"}
-                    _unwind_price = max(
-                        _poly_over_hedge_threshold / 10,  # floor sanity
-                        _ba_actual_pred_bid - float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
+                    _unwind_price = _predict_live_sell_price(
+                        session, int(pred_leg.market_id), pred_leg.side,
+                        fallback=_ba_actual_pred_bid,
+                        tick=float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01"),
                     )
                     _unwind_result: dict[str, Any] = {}
                     _unwind_err: str | None = None
@@ -4341,6 +4835,8 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _uw_total_sold += _unwind_result.get("filled_qty", 0.0)
+                            if _unwind_result.get("positions_seen_sec") is not None:
+                                row["timing"]["positions_seen_sec"] = _unwind_result["positions_seen_sec"]
                             if _uw_total_sold >= _ba_net_sell_qty * 0.99:
                                 break
                         except Exception as _uw_e:
@@ -4664,7 +5160,10 @@ def opportunity(opp: Opportunity) -> dict:
                         # If the remaining Predict position after selling the excess would be
                         # below the minimum viable size, sell ALL shares and also unwind Poly.
                         _mm_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                        _mm_unwind_price = max(0.01, _ba_actual_pred_bid - _mm_tick)
+                        _mm_unwind_price = _predict_live_sell_price(
+                            session, int(pred_leg.market_id), pred_leg.side,
+                            fallback=_ba_actual_pred_bid, tick=_mm_tick,
+                        )
                         _mm_min_usd = float(os.environ.get("PREDICT_MIN_FILL_USD", "1.0") or "1.0")
                         _mm_remaining_usd = (_ba_hedge_qty - _ba_mismatch_shares) * _ba_pred_price
                         _mm_sell_all = _mm_remaining_usd < _mm_min_usd
@@ -4678,6 +5177,8 @@ def opportunity(opp: Opportunity) -> dict:
                                 trace_id=trace_id,
                             )
                             _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
+                            if _ba_mismatch_sell_result.get("positions_seen_sec") is not None:
+                                row["timing"]["positions_seen_sec"] = _ba_mismatch_sell_result["positions_seen_sec"]
                         except Exception as _mm_e:
                             _ba_mismatch_sell_err = str(_mm_e)
 
@@ -4927,7 +5428,10 @@ def opportunity(opp: Opportunity) -> dict:
             else:
                 # Predict filled, poly failed → try to unwind on Predict before declaring incident
                 _unwind_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                _unwind_sell_price = max(_unwind_tick, _ba_actual_pred_bid - _unwind_tick)
+                _unwind_sell_price = _predict_live_sell_price(
+                    session, int(pred_leg.market_id), pred_leg.side,
+                    fallback=_ba_actual_pred_bid, tick=_unwind_tick,
+                )
                 _uw2_result: dict[str, Any] = {}
                 _uw2_err: str | None = None
                 _uw2_total_sold = 0.0
@@ -4954,6 +5458,8 @@ def opportunity(opp: Opportunity) -> dict:
                             trace_id=trace_id,
                         )
                         _uw2_total_sold += _uw2_result.get("filled_qty", 0.0)
+                        if _uw2_result.get("positions_seen_sec") is not None:
+                            row["timing"]["positions_seen_sec"] = _uw2_result["positions_seen_sec"]
                         if _uw2_total_sold >= _ba_net_sell_qty * 0.99:
                             break
                     except Exception as _uw2_e:
