@@ -2259,7 +2259,7 @@ def _place_polymarket_limit_buy_exact_shares(
                             "success": True,
                             "status": "matched",
                             "orderID": order_id,
-                            "takingAmount": str(int(_fill_qty * 1_000_000)),
+                            "takingAmount": str(_fill_qty),
                             "transactionsHashes": [t.get("transaction_hash", "") for t in _recent_trades if t.get("transaction_hash")],
                         }
                         return {
@@ -5035,6 +5035,10 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_poly_qty = float(_ba_poly_resp.get("takingAmount") or 0)
             except (ValueError, TypeError):
                 pass
+            # size_matched fallback: used when GTC order was verified via get_order() after
+            # cancel (auth_order path) — that response has size_matched but no takingAmount.
+            if _ba_poly_qty == 0 and _ba_poly_size_matched > 0:
+                _ba_poly_qty = _ba_poly_size_matched
             # takingAmount = gross shares BEFORE Poly fee deduction from shares.
             # Net shares actually credited = gross * (1 - feeRate * max(fill_price, 1-fill_price)).
             _ba_poly_qty_actual = _ba_poly_qty
