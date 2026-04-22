@@ -366,22 +366,12 @@ def _startup_warmup() -> None:
                 _down_reason = _reason or f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
                 _halt_api_path.write_text(_down_reason)
                 print(f"[TRADER][API_WATCHDOG] API DOWN — halt_api created reason={_down_reason}")
-                notify(
-                    "🔴 <b>API УПАЛ — БОТ ОСТАНОВЛЕН</b>\n"
-                    "\n"
-                    f"predict_ok={_predict_ok} poly_ok={_poly_ok}\n"
-                    f"<code>{_down_reason[:200]}</code>\n"
-                    f"Проверка каждые {_api_check_interval:.0f}s — возобновлю автоматически\n"
-                )
+                notify("🔴 <b>API DOWN</b>\n")
             elif _all_ok and _was_down:
                 _was_down = False
                 _halt_api_path.unlink(missing_ok=True)
                 print("[TRADER][API_WATCHDOG] API RESTORED — halt_api removed")
-                notify(
-                    "🟢 <b>API ВОССТАНОВЛЕН — БОТ ВОЗОБНОВИЛ РАБОТУ</b>\n"
-                    "\n"
-                    "predict ✅  polymarket ✅\n"
-                )
+                notify("🟢 <b>API RESTORED</b>\n")
 
     threading.Thread(target=_api_health_watchdog, daemon=True, name="api_health_watchdog").start()
 
@@ -1009,51 +999,6 @@ def _save_ba_fill_state() -> None:
 
 # In-memory hourly P&L log: list of (unix_ts, net_pnl) for the last hour
 _trade_pnl_log: list[tuple[float, float]] = []
-_pnl_checkpoint_ts: float = time.time() - 3600  # rolling 1-hour window, survives restarts
-
-
-def _pnl_last_hour() -> tuple[float, int]:
-    """Return (sum_net_pnl, count) for trades since _pnl_checkpoint_ts, reading from file."""
-    cutoff = _pnl_checkpoint_ts
-    success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
-    p = Path(success_file)
-    if not p.exists():
-        return 0.0, 0
-    total, count = 0.0, 0
-    try:
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                if not row.get("ok"):
-                    continue
-                ts_str = row.get("ts", "")
-                if not ts_str:
-                    continue
-                ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
-                if ts < cutoff:
-                    continue
-                # Use stored net_pnl if available (most accurate)
-                if "net_pnl" in row:
-                    trade_pnl = float(row["net_pnl"])
-                else:
-                    lr = row.get("live_hedge_recheck") or {}
-                    hq = float(lr.get("hedge_qty") or 0)
-                    pb = float(lr.get("pred_bid") or 0)
-                    vwap = float(lr.get("live_poly_vwap") or 0)
-                    lf = float(lr.get("live_poly_fee") or 0)
-                    pred_fee_bps = float(os.environ.get("PREDICT_FEE_BPS", "0") or "0")
-                    gross = hq * (1.0 - pb - vwap)
-                    trade_pnl = gross - lf * hq - pred_fee_bps / 10_000 * pb * hq
-                total += trade_pnl
-                count += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return total, count
 
 
 def _fmt_usd(x: float | int | None) -> str:
@@ -5468,30 +5413,20 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(trades_file, row)
                 _append_jsonl(success_trades_file, row)
 
-                # Effective quantities for notification: adjust for mismatch correction
+                # Effective quantities for notification: adjust for mismatch correction (no extra lines in TG)
                 _notif_poly_qty = _ba_poly_qty_actual  # net shares after Poly fee (≈gross at high prices)
                 _notif_pred_qty = _ba_hedge_qty
-                _notif_mismatch_line = ""
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
                     _mm_action_final = locals().get("_mm_action", "sell_predict")
                     _mm_poly_bought_final = locals().get("_mm_poly_bought", False)
                     _mm_sell_all_final = locals().get("_mm_sell_all", False)
                     if _mm_action_final == "buy_poly" and _mm_poly_bought_final:
                         _notif_poly_qty = _ba_poly_qty_actual + _ba_mismatch_shares
-                        _notif_mismatch_line = f"<i>📎 +{_ba_mismatch_shares:.3f} sh rebuyed on Poly</i>\n"
                     elif _mm_sell_all_final:
-                        # Sold ALL shares on both sides — position fully closed
                         _notif_pred_qty = 0.0
                         _notif_poly_qty = 0.0
-                        _mm_poly_sold_f = locals().get("_mm_poly_sell_qty", 0.0)
-                        _notif_mismatch_line = (
-                            f"<i>📎 продано ВСЁ: {_ba_hedge_qty:.3f} sh Predict"
-                            + (f" + {_mm_poly_sold_f:.3f} sh Poly" if _mm_poly_sold_f > 0 else "")
-                            + f"</i>\n"
-                        )
                     else:
                         _notif_pred_qty = _ba_hedge_qty - _ba_mismatch_shares
-                        _notif_mismatch_line = f"<i>📎 −{_ba_mismatch_shares:.3f} sh sold back on Predict</i>\n"
 
                 _tkey = str(poly_leg.token_id)
                 _prev = _ba_fill_state.get(_tkey)
@@ -5512,21 +5447,6 @@ def opportunity(opp: Opportunity) -> dict:
                         _mkt_title = _leg["title"]
                         break
 
-                # Fetch current total position from Polymarket (best-effort, non-blocking)
-                _poly_pos_line = ""
-                try:
-                    _poly_pos = _fetch_poly_position(str(poly_leg.token_id), timeout=2.5)
-                    if _poly_pos is not None:
-                        _pos_shares, _pos_avg = _poly_pos
-                        if _pos_shares > 0:
-                            _poly_pos_line = (
-                                f"<i>💼 Poly total position: {_pos_shares:.2f} shares"
-                                f" @ avg {_pos_avg:.2f}</i>\n"
-                            )
-                except Exception:
-                    pass
-
-                _is_tyanuchka = (_ba_pred_price + _ba_poly_price) < 1.0
                 if _ba_net_pnl >= 0:
                     _pnl_suffix = " — TYANUCHKA IS CANCELED"
                 else:
@@ -5539,10 +5459,6 @@ def opportunity(opp: Opportunity) -> dict:
                 _roi_pct = (_ba_net_pnl / _total_stake_corrected * 100) if _total_stake_corrected > 0 else 0.0
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
-                _h1_pnl, _h1_n = _pnl_last_hour()
-
-                # Final hedge qty (balanced side) for the "invested / payout" summary line
-                _final_hedge_qty = min(_notif_poly_qty, _notif_pred_qty)
 
                 _msg_id = notify(
                     f"{_title}\n"
@@ -5554,9 +5470,6 @@ def opportunity(opp: Opportunity) -> dict:
                     f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_net_poly_cost:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
                     f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_net_pred_cost:.2f}</b>\n"
-                    + _notif_mismatch_line
-                    + f"<i>💰 вложено ${_total_stake_corrected:.2f} → при разрешении получишь ${_final_hedge_qty:.2f}</i>\n"
-                    + _poly_pos_line
                     + f"\n"
                     f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
                     + _cum_line
