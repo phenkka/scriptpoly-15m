@@ -5289,12 +5289,12 @@ def opportunity(opp: Opportunity) -> dict:
                 _ba_mismatch_corrected = False
                 _ba_mismatch_sell_result: dict = {}
                 _ba_mismatch_sell_err: str | None = None
+                _mm_poly_bought = False
+                _mm_poly_price: float | None = None
 
                 if _ba_mismatch_shares > _ba_mismatch_threshold:
                     # First try: buy the missing shares on Poly at current market price.
                     # Cheaper than selling excess on Predict (avoids bid-ask spread loss).
-                    _mm_poly_bought = False
-                    _mm_poly_price: float | None = None
                     _mm_action = "sell_predict"
                     try:
                         _mm_book = _polymarket_book(str(poly_leg.token_id))
@@ -5566,6 +5566,15 @@ def opportunity(opp: Opportunity) -> dict:
                     f"<i>⏱ fill={_ba_quote_meta.get('time_to_first_fill_ms', 0)/1000:.1f}s  unhedged={_ba_unhedged_sec:.1f}s  total={_ba_total_sec:.1f}s</i>\n",
                     reply_to_message_id=_reply_to_id,
                 )
+                # Second CLOB order (mismatch top-up) → reply in thread so 2nd buy is visible
+                if _mm_poly_bought and _msg_id is not None and _ba_mismatch_shares > _ba_mismatch_threshold:
+                    _mm_p2 = _mm_poly_price if _mm_poly_price is not None else _ba_poly_price
+                    notify(
+                        f"➕ <b>Polymarket top-up (2nd order)</b>\n"
+                        f"+{_ba_mismatch_shares:.3f} sh  @  <code>{_mm_p2:.2f}</code>\n"
+                        f"<i>First hedge was short vs Predict — 2nd buy to match</i>\n",
+                        reply_to_message_id=_msg_id,
+                    )
                 # Store state: use original msg_id for the whole group so all replies chain to first
                 _stored_id = (_prev[0] if _is_grouped else _msg_id) if _msg_id is not None else (_reply_to_id or 0)
                 if _stored_id:
