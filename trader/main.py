@@ -5581,6 +5581,19 @@ def opportunity(opp: Opportunity) -> dict:
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
                 _title = f"🟢🟢🟢 <b>HEDGE FILLED ×{_fill_n}</b>" if _fill_n > 1 else "🟢🟢🟢 <b>HEDGE FILLED</b>"
 
+                _ph_show = (str(pred_hash_ba).strip() if pred_hash_ba else "") or ""
+                _replaced_n = len(_ba_pred_resp.get("replaced_order_hashes") or [])
+                _rfs = float(_ba_quote_meta.get("replaced_filled_shares") or 0.0)
+                _ph_line = (
+                    f"\n<i>Predict order</i> <code>{_ph_show[:18]}…{_ph_show[-6:]}</code>\n"
+                    if len(_ph_show) > 24
+                    else (f"\n<i>Predict order</i> <code>{_ph_show}</code>\n" if _ph_show else "")
+                )
+                _repl_line = (
+                    f"<i>Replaced prior bids: {_replaced_n}  (+{_rfs:.3f} sh in total)</i>\n"
+                    if (_replaced_n > 0 or _rfs > 0.0001)
+                    else ""
+                )
                 _msg_id = notify(
                     f"{_title}\n"
                     + (f"<i>{_mkt_title}</i>\n" if _mkt_title else "")
@@ -5591,6 +5604,8 @@ def opportunity(opp: Opportunity) -> dict:
                     f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_net_poly_cost:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
                     f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_net_pred_cost:.2f}</b>\n"
+                    + _ph_line
+                    + _repl_line
                     + f"\n"
                     f"{_pnl_emoji} <b>{_ba_net_pnl:+.2f}$</b>  ({_roi_pct:+.2f}%){_pnl_suffix}\n"
                     + _cum_line
