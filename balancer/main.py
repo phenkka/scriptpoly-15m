@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from pathlib import Path
@@ -711,8 +712,52 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
         return 0.0
 
 
-def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
-    """Return (net_pnl, total_count, plus_count, minus_count) for successful trades since since_ts."""
+def _json_ts_to_unix(raw: object) -> float | None:
+    """Event time as Unix sec. Strips Z and applies UTC; numeric ts allowed."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip()
+    if not s:
+        return None
+    utc_flag = s.endswith("Z") or s.endswith("z")
+    if utc_flag:
+        s = s[:-1]
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None and utc_flag:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _local_prev_full_hour_bounds(now: float) -> tuple[float, float, str]:
+    """Previous full local calendar hour [start, end), end exclusive, as Unix times + short label.
+
+    e.g. if now is 13:10 local → [12:00, 13:00). Trades at 13:04 go into the *next* hour's report.
+    """
+    dt = datetime.fromtimestamp(now)
+    end_dt = dt.replace(minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(hours=1)
+    if start_dt.date() == end_dt.date():
+        label = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+    else:
+        label = f"{start_dt.strftime('%d.%m %H:%M')}–{end_dt.strftime('%d.%m %H:%M')}"
+    return start_dt.timestamp(), end_dt.timestamp(), label
+
+
+def _hourly_pnl(
+    since_ts: float, until_ts: float | None = None
+) -> tuple[float, int, int, int]:
+    """Return (net_pnl, total_count, plus_count, minus_count) for successful trades in the window.
+
+    If until_ts is set, only since_ts <= ts < until_ts. Otherwise ts >= since_ts (rolling window).
+    """
     success_file = os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl")
     p = Path(success_file)
     if not p.exists():
@@ -725,12 +770,12 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
             continue
         try:
             row = json.loads(line)
-            ts_str = row.get("ts", "")
-            if not ts_str:
+            ts = _json_ts_to_unix(row.get("ts"))
+            if ts is None:
                 continue
-            from datetime import datetime
-            ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
             if ts < since_ts or not row.get("ok"):
+                continue
+            if until_ts is not None and ts >= until_ts:
                 continue
             # Use stored net_pnl if available (most accurate, avoids wrong fee defaults)
             if "net_pnl" in row:
@@ -754,8 +799,13 @@ def _hourly_pnl(since_ts: float) -> tuple[float, int, int, int]:
     return total, count, plus_n, minus_n
 
 
-def _hourly_trade_details(since_ts: float) -> tuple[int, dict[str, int], dict[str, int]]:
-    """Return (ok_count, incidents_by_code, skips_by_code) for trades since since_ts."""
+def _hourly_trade_details(
+    since_ts: float, until_ts: float | None = None
+) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Return (ok_count, incidents_by_code, skips_by_code) for trades in the time window.
+
+    If until_ts is set, only since_ts <= ts < until_ts.
+    """
     p = Path(os.environ.get("TRADER_TRADES_FILE", "/data/trades.jsonl"))
     if not p.exists():
         return 0, {}, {}
@@ -767,13 +817,13 @@ def _hourly_trade_details(since_ts: float) -> tuple[int, dict[str, int], dict[st
         if not line:
             continue
         try:
-            from datetime import datetime
             row = json.loads(line)
-            ts_str = row.get("ts", "")
-            if not ts_str:
+            ts = _json_ts_to_unix(row.get("ts"))
+            if ts is None:
                 continue
-            ts = datetime.fromisoformat(ts_str.rstrip("Z")).timestamp()
             if ts < since_ts:
+                continue
+            if until_ts is not None and ts >= until_ts:
                 continue
             if row.get("ok"):
                 ok_n += 1
@@ -946,7 +996,13 @@ def main() -> None:
         while True:
             try:
                 _tm = time.localtime()
-                if _tm.tm_min == 4 and _tm.tm_hour != _last_hour:
+                try:
+                    _stats_min = int(
+                        float(os.environ.get("BALANCER_HOURLY_STATS_MIN", "10") or "10")
+                    )
+                except Exception:
+                    _stats_min = 10
+                if _tm.tm_min == _stats_min and _tm.tm_hour != _last_hour:
                     _last_hour = _tm.tm_hour
                     try:
                         with BALANCER_STATUS_LOCK:
@@ -968,9 +1024,14 @@ def main() -> None:
                         _pred_total = _pred_cash + _pred_port
                         _total_cash = _poly_cash + _pred_cash
                         _total_with_pos = _poly_total + _pred_total
-                        _since_ts = time.time() - 3600
-                        _h1_pnl, _, _, _ = _hourly_pnl(since_ts=_since_ts)
-                        _ok_n, _incidents, _skips = _hourly_trade_details(since_ts=_since_ts)
+                        _now = time.time()
+                        _since_ts, _until_ts, _prev_hour_label = _local_prev_full_hour_bounds(_now)
+                        _h1_pnl, _, _, _ = _hourly_pnl(
+                            since_ts=_since_ts, until_ts=_until_ts
+                        )
+                        _ok_n, _incidents, _skips = _hourly_trade_details(
+                            since_ts=_since_ts, until_ts=_until_ts
+                        )
                         _inc_n = sum(_incidents.values())
                         _skip_n = sum(_skips.values())
                         _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
@@ -1001,20 +1062,27 @@ def main() -> None:
                         else:
                             _tlines.append("⏭ Skipped: <b>0</b>")
                         _halt_line = "🛑 <b>Трейдер остановлен (низкий баланс)</b>\n" if Path("/data/halt").exists() else ""
+                        _tz_hint = (time.tzname[0] or "local")
                         _notify(
                             f"📊 <b>HOURLY STATS</b>\n"
+                            f"<i>Прошлый полный час (сделки/PnL): <b>{_prev_hour_label}</b> "
+                            f"({_tz_hint}, время сервера)</i>\n"
+                            f"<i>Баланс — снимок сейчас; PnL/трейды — только за период выше.</i>\n"
                             f"\n"
                             f"<b>BALANCE</b>\n"
                             + _poly_line
                             + _pred_line
                             + _total_line
                             + f"\n"
-                            + f"{_pnl_emoji} PnL per hour: <b>{_h1_pnl:+.2f}$</b>\n"
+                            + f"{_pnl_emoji} PnL за тот час: <b>{_h1_pnl:+.2f}$</b>\n"
                             + f"\n"
                             + "\n".join(_tlines) + "\n"
                             + _halt_line
                         )
-                        print(f"[BALANCER] hourly_notify_sent hour={_tm.tm_hour} total={_total_with_pos:.2f}")
+                        print(
+                            f"[BALANCER] hourly_notify_sent local_hour={_tm.tm_hour} "
+                            f"prev_hour={_prev_hour_label} total={_total_with_pos:.2f}"
+                        )
                     except Exception as _e:
                         print(f"[BALANCER][WARN] hourly_notify_failed err={_e}")
             except Exception:
@@ -1023,7 +1091,14 @@ def main() -> None:
 
     _hn_thread = threading.Thread(target=_hourly_notify_worker, daemon=True)
     _hn_thread.start()
-    print("[BALANCER] hourly_notify_thread_started")
+    try:
+        _hsm = int(float(os.environ.get("BALANCER_HOURLY_STATS_MIN", "10") or "10"))
+    except Exception:
+        _hsm = 10
+    print(
+        f"[BALANCER] hourly_notify_thread_started "
+        f"at_minute={_hsm} window=prev_full_local_hour"
+    )
 
     while True:
         now = time.time()
