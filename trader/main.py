@@ -3100,7 +3100,38 @@ def _place_predict_limit_buy(
             except Exception:
                 pass
 
-    total_filled_wei = prev_filled_wei
+    # Replaced outbid orders: we reset prev_filled_wei to 0 for the new hash, but the old hash
+    # may have partial/late amountFilled on-chain. If we only count the final order, Poly hedge
+    # matches too few shares (Predict activity shows two buys; Poly one).
+    replaced_filled_wei_total = 0
+    for _rh in replaced_order_hashes:
+        if not _rh:
+            continue
+        _rh_best = 0
+        for _ri in range(6):
+            try:
+                _rh_get = _predict_get_order_by_hash(session, str(_rh))
+                _rh_w = _get_filled_wei(_rh_get)
+                if _rh_w > _rh_best:
+                    _rh_best = _rh_w
+            except Exception:
+                pass
+            if _ri < 5:
+                time.sleep(0.25)
+        replaced_filled_wei_total += _rh_best
+        if _rh_best > 0:
+            print(
+                f"[PREDICT_LIMIT]{_trace} replaced_hash_filled "
+                f"hash={str(_rh)[:16]}... sh={_rh_best / 10**18:.4f}"
+            )
+
+    total_filled_wei = prev_filled_wei + replaced_filled_wei_total
+    if replaced_filled_wei_total > 0:
+        print(
+            f"[PREDICT_LIMIT]{_trace} total_filled merge final={prev_filled_wei / 10**18:.4f} sh "
+            f"+ replaced={replaced_filled_wei_total / 10**18:.4f} sh "
+            f"(n_replaced={len(replaced_order_hashes)})"
+        )
     if not filled and total_filled_wei > 0:
         filled = True  # post-cancel fill found
 
@@ -3128,6 +3159,7 @@ def _place_predict_limit_buy(
             "final_bid_price": current_bid_price,
             "initial_bid_price": float(leg.ask),
             "partial_fill_count": len(partial_fills),
+            "replaced_filled_shares": round(replaced_filled_wei_total / 10**18, 6) if replaced_filled_wei_total else 0.0,
             "queue_pricing": queue_pricing_meta,
         },
     }
