@@ -771,16 +771,20 @@ def _fetch_hourly_balance_snapshot(
 
 
 def _sleep_until_local_minute(
-    target_minute: int, *, fire_window_sec: float = 10.0, poll_max_sec: float = 30.0
+    target_minute: int, *, poll_max_sec: float = 30.0
 ) -> None:
-    """Block until `time.localtime()` is in [target_minute:00, target_minute:fire_window_sec)."""
+    """Block until the local clock is in the **entire** target minute (e.g. :00:00–:00:59 for min=0).
+
+    Previously a 10s window with an accidental cap of 30s: if the thread woke a few
+    seconds *after* the window (RPC/GIL load), the whole hour was skipped until next
+    hour — hourly TG never arrived.
+    """
     tm = max(0, min(59, int(target_minute)))
-    wmax = min(30.0, max(1.0, float(fire_window_sec)))
     while True:
-        lt = time.localtime()
-        if lt.tm_min == tm and float(lt.tm_sec) < wmax:
-            return
         now = datetime.now()
+        if now.minute == tm:
+            return
+        # next occurrence of local HH:tm:00
         cand = now.replace(minute=tm, second=0, microsecond=0)
         if cand <= now:
             cand = cand + timedelta(hours=1)
@@ -1082,7 +1086,7 @@ def main() -> None:
                 except Exception:
                     _stats_min = 0
                 _stats_min = max(0, min(59, _stats_min))
-                _sleep_until_local_minute(_stats_min, fire_window_sec=10.0, poll_max_sec=30.0)
+                _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
                 _tm = time.localtime()
                 _fkey = (_tm.tm_year, _tm.tm_yday, _tm.tm_hour, _stats_min)
                 if _fkey == _last_fired:
