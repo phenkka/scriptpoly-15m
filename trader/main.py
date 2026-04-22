@@ -408,6 +408,133 @@ _BSC_NEG_RISK_CTF_EXCHANGE = "0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A"
 # keccak256("getOrderStatus(bytes32)")[:4] — computed once on first use
 _ORDER_STATUS_SELECTOR: str | None = None
 
+
+def _predict_maker_taker_wei_from_get_payload(payload: dict[str, Any] | None) -> tuple[int, int] | None:
+    """Read maker/taker (wei) from GET/POST /v1/orders `data` payload (on-chain order sizes)."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    order = data.get("order")
+    if not isinstance(order, dict):
+        return None
+    try:
+        mk = int(str(order.get("makerAmount") or "0"))
+        tk = int(str(order.get("takerAmount") or "0"))
+    except (ValueError, TypeError):
+        return None
+    if mk <= 0 or tk <= 0:
+        return None
+    return (mk, tk)
+
+
+def _bsc_get_order_status(
+    order_hash_hex: str,
+) -> tuple[bool, int, str] | None:
+    """eth_call CTF/NegRisk getOrderStatus — returns (isFilledOrCancelled, remaining, contract_tag) or None.
+
+    `remaining` is the unfilled *maker* amount (CTF Exchange v3); see _bsc_taker_filled_shares.
+    Tries *both* exchanges on the first RPC: a hash is valid on only one; the other is (false,0).
+    Partial or full must not be lost by stopping after the first empty-looking decode.
+    """
+    global _ORDER_STATUS_SELECTOR
+    try:
+        if _ORDER_STATUS_SELECTOR is None:
+            from eth_utils import keccak as eth_keccak
+
+            _ORDER_STATUS_SELECTOR = "0x" + eth_keccak(text="getOrderStatus(bytes32)")[:4].hex()
+
+        if not order_hash_hex.startswith("0x"):
+            order_hash_hex = "0x" + order_hash_hex
+        call_data = _ORDER_STATUS_SELECTOR + order_hash_hex[2:].zfill(64)
+
+        def _decode_st(_rpc: str, to_addr: str) -> tuple[bool, int] | None:
+            try:
+                resp = requests.post(
+                    _rpc,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "eth_call",
+                        "params": [{"to": to_addr, "data": call_data}, "latest"],
+                        "id": 1,
+                    },
+                    timeout=5,
+                )
+                result = resp.json()
+                if "error" in result:
+                    return None
+                raw = result.get("result", "")
+                if len(raw) < 2 + 128:
+                    return None
+                raw_bytes = bytes.fromhex(raw[2:])
+                is_fc = bool(int.from_bytes(raw_bytes[0:32], "big"))
+                rem = int.from_bytes(raw_bytes[32:64], "big")
+                return (is_fc, rem)
+            except Exception:
+                return None
+
+        for _rpc in _BSC_RPCS:
+            ctf = _decode_st(_rpc, _BSC_CTF_EXCHANGE)
+            neg = _decode_st(_rpc, _BSC_NEG_RISK_CTF_EXCHANGE)
+            # Definitive full fill on either contract
+            for st, cname in ((ctf, "CTF"), (neg, "NEG_RISK")):
+                if st and st[0] and st[1] == 0:
+                    return (st[0], st[1], cname)
+            # In-flight or partial / on-chain cancel with maker remainder
+            for st, cname in ((ctf, "CTF"), (neg, "NEG_RISK")):
+                if st and st[1] > 0:
+                    return (st[0], st[1], cname)
+            # Only (false,0) “empty / unknown on this book”
+            if ctf and ctf == (False, 0) and neg and neg == (False, 0):
+                return (False, 0, "CTF")
+            if ctf:
+                return (ctf[0], ctf[1], "CTF")
+            if neg:
+                return (neg[0], neg[1], "NEG_RISK")
+            break
+    except Exception as _e:
+        print(f"[TRADER][BSC_CHECK] err={_e}")
+    return None
+
+
+def _bsc_taker_filled_shares(
+    is_fc: bool,
+    remaining: int,
+    maker_amt: int | None,
+    taker_amt: int | None,
+    leg_shares: float,
+) -> float:
+    """Convert BSC getOrderStatus + on-chain order sizes to outcome shares filled (BUY taker side).
+
+    CTF: remaining is *maker* not yet filled. Filled taker (wei) = (maker_amt - remaining) * taker_amt // maker_amt
+    (same as CalculatorHelper.calculateTakingAmount for the cumulative fill).
+
+    Without maker/taker, only a *full* fill can be represented (is_fc and remaining==0) — same as the old
+    _bsc_check_order_filled; partials need maker/taker from API or late_watch.
+    """
+    if not is_fc and remaining == 0:
+        return 0.0
+    if (
+        maker_amt is not None
+        and taker_amt is not None
+        and maker_amt > 0
+        and taker_amt > 0
+    ):
+        filled_maker = maker_amt - remaining
+        if filled_maker <= 0:
+            return 0.0
+        if filled_maker > maker_amt:
+            filled_maker = maker_amt
+        taker_filled_wei = (filled_maker * taker_amt) // maker_amt
+        out = taker_filled_wei / 10**18
+        if leg_shares and leg_shares > 0:
+            return min(float(leg_shares), out)
+        return out
+    if is_fc and remaining == 0:
+        return max(0.0, float(leg_shares))
+    return 0.0
+
 # ── BSC WebSocket (newHeads) — wake poll loops + optional early getOrderStatus ──
 # Public HTTP RPCs often disable eth_getLogs; we still use eth_call for fills.
 # WS gives a proactive ~block-time signal instead of relying only on late_fill + fixed sleeps.
@@ -724,8 +851,20 @@ def _parse_predict_filled_wei(resp: dict[str, Any]) -> int:
         return 0
 
 
-def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shares: float) -> None:
-    """Register a cancelled Predict order for background late-fill monitoring."""
+def _late_watch_save(
+    order_hash: str,
+    market_id: int,
+    token_id: str | None,
+    shares: float,
+    *,
+    maker_amount: int | None = None,
+    taker_amount: int | None = None,
+) -> None:
+    """Register a cancelled Predict order for background late-fill monitoring.
+
+    maker_amount / taker_amount (wei) enable BSC partial-fill → taker hedge sizing
+    (CTF stores remaining in *maker* units).
+    """
     try:
         with _late_watch_file_lock:
             data: dict = {}
@@ -734,16 +873,37 @@ def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shar
                     data = json.loads(_LATE_WATCH_FILE.read_text())
                 except Exception:
                     data = {}
-            data[order_hash] = {
+            row: dict[str, Any] = {
                 "order_hash": order_hash,
                 "market_id": market_id,
                 "token_id": token_id,
                 "shares": shares,
                 "ts": time.time(),
             }
+            if maker_amount is not None and maker_amount > 0:
+                row["makerAmount"] = int(maker_amount)
+            if taker_amount is not None and taker_amount > 0:
+                row["takerAmount"] = int(taker_amount)
+            data[order_hash] = row
             _LATE_WATCH_FILE.write_text(json.dumps(data))
     except Exception as _e:
         print(f"[TRADER] late_watch_save error={_e}")
+
+
+def _late_watch_maker_taker_from_entry(entry: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Integer maker/taker from persisted late_watch row (may be missing on old files)."""
+    try:
+        mk = entry.get("makerAmount")
+        tk = entry.get("takerAmount")
+        if mk is None and tk is None:
+            return (None, None)
+        m = int(str(mk or "0"))
+        t = int(str(tk or "0"))
+        if m > 0 and t > 0:
+            return (m, t)
+    except (ValueError, TypeError):
+        pass
+    return (None, None)
 
 
 def _incident_tg_emoji(self_resolved: bool) -> str:
@@ -841,65 +1001,38 @@ def _auto_hedge_late_fill(token_id: str | None, shares: float, market_id: int) -
 
 
 def _bsc_check_order_filled(order_hash_hex: str, entry_shares: float) -> float:
-    """Check if a Predict order was fully filled on BSC via eth_call to getOrderStatus.
+    """Legacy: full fill only (no maker/taker) — same as _bsc_taker_filled_shares with mk/tk=None."""
+    st = _bsc_get_order_status(order_hash_hex)
+    if st is None:
+        return 0.0
+    is_fc, rem, cname = st
+    sh = _bsc_taker_filled_shares(is_fc, rem, None, None, float(entry_shares))
+    if sh > 0 and is_fc and rem == 0:
+        print(f"[TRADER][BSC_CHECK] FILLED hash={order_hash_hex[:18]}... contract={cname}")
+    return sh
 
-    Uses CTFExchange.getOrderStatus(bytes32) → (bool isFilledOrCancelled, uint256 remaining).
-    eth_getLogs is NOT used — public BSC RPCs reject it with -32005 (limit exceeded).
 
-    Predict uses OFF-CHAIN cancellations (no on-chain cancelOrder tx), so:
-      {isFilledOrCancelled=true, remaining=0} → order was FULLY FILLED on-chain.
-      {isFilledOrCancelled=false, remaining=0} → never touched on-chain (cancelled off-chain).
-      {isFilledOrCancelled=true, remaining>0} → cancelled on-chain after partial fill.
-      {isFilledOrCancelled=false, remaining>0} → partially filled, still open.
-
-    Returns entry_shares if fully filled, 0.0 otherwise or on any error.
-    Checks both CTF Exchange and NegRisk CTF Exchange.
-    """
-    global _ORDER_STATUS_SELECTOR
-    try:
-        if _ORDER_STATUS_SELECTOR is None:
-            from eth_utils import keccak as eth_keccak
-            _ORDER_STATUS_SELECTOR = "0x" + eth_keccak(text="getOrderStatus(bytes32)")[:4].hex()
-
-        if not order_hash_hex.startswith("0x"):
-            order_hash_hex = "0x" + order_hash_hex
-        call_data = _ORDER_STATUS_SELECTOR + order_hash_hex[2:].zfill(64)
-
-        contracts = [_BSC_CTF_EXCHANGE, _BSC_NEG_RISK_CTF_EXCHANGE]
-        for _rpc in _BSC_RPCS:
-            for _contract in contracts:
-                try:
-                    resp = requests.post(
-                        _rpc,
-                        json={
-                            "jsonrpc": "2.0",
-                            "method": "eth_call",
-                            "params": [{"to": _contract, "data": call_data}, "latest"],
-                            "id": 1,
-                        },
-                        timeout=5,
-                    )
-                    result = resp.json()
-                    if "error" in result:
-                        continue
-                    raw = result.get("result", "")
-                    if len(raw) < 2 + 128:  # 0x + 2×32bytes
-                        continue
-                    raw_bytes = bytes.fromhex(raw[2:])
-                    is_fc = bool(int.from_bytes(raw_bytes[0:32], "big"))
-                    remaining = int.from_bytes(raw_bytes[32:64], "big")
-                    if is_fc and remaining == 0:
-                        # Fully filled on-chain
-                        cname = "CTF" if _contract == _BSC_CTF_EXCHANGE else "NEG_RISK"
-                        print(f"[TRADER][BSC_CHECK] FILLED hash={order_hash_hex[:18]}... contract={cname}")
-                        return entry_shares
-                except Exception:
-                    continue
-            # If we got a valid response from first RPC that wasn't filled, stop
-            break
-    except Exception as _e:
-        print(f"[TRADER][BSC_CHECK] err={_e}")
-    return 0.0
+def _bsc_filled_taker_shares_for_hedge(
+    order_hash_hex: str,
+    leg_shares: float,
+    maker_amt: int | None,
+    taker_amt: int | None,
+    *,
+    log: bool = True,
+) -> float:
+    """BSC ground-truth taker (outcome) shares: full or partial. maker/taker from GET /orders if available."""
+    st = _bsc_get_order_status(order_hash_hex)
+    if st is None:
+        return 0.0
+    is_fc, rem, cname = st
+    sh = _bsc_taker_filled_shares(is_fc, rem, maker_amt, taker_amt, float(leg_shares))
+    if sh > 0 and log:
+        _p = "partial" if rem > 0 else "full"
+        print(
+            f"[TRADER][BSC_CHECK] {_p} taker_sh={sh:.6f} hash={order_hash_hex[:18]}... "
+            f"contract={cname} is_fc={is_fc} rem_maker={rem}"
+        )
+    return sh
 
 
 def _late_fill_watcher() -> None:
@@ -943,8 +1076,12 @@ def _late_fill_watcher() -> None:
                     # Entry expired after _MAX_WATCH_SEC — Predict API never showed a fill.
                     # Do a final BSC on-chain check to distinguish:
                     #   - real fill (is_fc=True, remaining=0) → strong alert, unhedged position
+                    #   - partial on-chain (remaining>0 in maker units) + maker/taker → size hedge
                     #   - clean cancel (never seen on-chain) → mild alert, position likely not open
-                    bsc_shares = _bsc_check_order_filled(oh, float(entry.get("shares", 0)))
+                    _mk, _tk = _late_watch_resolve_maker_taker(session, oh, entry)
+                    bsc_shares = _bsc_filled_taker_shares_for_hedge(
+                        oh, float(entry.get("shares", 0)), _mk, _tk
+                    )
                     if bsc_shares > 0:
                         _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
@@ -992,7 +1129,10 @@ def _late_fill_watcher() -> None:
                     else:
                         # Predict API still shows 0 — check BSC directly as fallback.
                         # The API indexer can lag on-chain confirms by several minutes.
-                        bsc_shares = _bsc_check_order_filled(oh, float(entry.get("shares", 0)))
+                        _mk2, _tk2 = _late_watch_resolve_maker_taker(session, oh, entry)
+                        bsc_shares = _bsc_filled_taker_shares_for_hedge(
+                            oh, float(entry.get("shares", 0)), _mk2, _tk2
+                        )
                         if bsc_shares > 0:
                             _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                             print(
@@ -1242,6 +1382,23 @@ def _predict_get_order_by_hash(session: requests.Session, order_hash: str) -> di
     if not isinstance(j, dict):
         raise RuntimeError("predict_get_order_bad_response")
     return j
+
+
+def _late_watch_resolve_maker_taker(
+    session: requests.Session, order_hash: str, entry: dict[str, Any]
+) -> tuple[int | None, int | None]:
+    """On-chain BSC fill math needs maker/taker (wei). Prefer JSON row; else GET /v1/orders/{hash}."""
+    mk, tk = _late_watch_maker_taker_from_entry(entry)
+    if mk is not None and tk is not None:
+        return (mk, tk)
+    try:
+        g = _predict_get_order_by_hash(session, order_hash)
+        p = _predict_maker_taker_wei_from_get_payload(g)
+        if p:
+            return p
+    except Exception:
+        pass
+    return (None, None)
 
 
 def _predict_remove_orders(session: requests.Session, ids: list[str]) -> dict[str, Any]:
@@ -2689,6 +2846,13 @@ def _place_predict_limit_buy(
     all_creates: list[dict[str, Any]] = [out]
     need_final_get_check: bool = False
 
+    def _limit_buy_mktk() -> tuple[int | None, int | None]:
+        """On-chain taker-amount-from-BSC for BUY needs maker/taker in wei; prefer latest GET, else last create body."""
+        p = _predict_maker_taker_wei_from_get_payload(last_get) if last_get else None
+        if p:
+            return p
+        return _predict_maker_taker_wei_from_get_payload(all_creates[-1] if all_creates else None)
+
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     filled = False
 
@@ -2910,7 +3074,10 @@ def _place_predict_limit_buy(
             _poll_new = _bsc_wait_new_head_or_timeout(_poll_prev, max(0.05, poll_interval_sec))
             if order_hash and not filled and _poll_new > _poll_prev:
                 try:
-                    _poll_bsc = _bsc_check_order_filled(order_hash, float(leg.shares or 0))
+                    _pm, _pt = _limit_buy_mktk()
+                    _poll_bsc = _bsc_filled_taker_shares_for_hedge(
+                        order_hash, float(leg.shares or 0), _pm, _pt, log=False
+                    )
                     if _poll_bsc > 0:
                         filled = True
                         _pb_wei = int(_poll_bsc * 10**18)
@@ -2986,9 +3153,9 @@ def _place_predict_limit_buy(
             # the API responds OK but hasn't indexed the fill yet.
             if not filled and _attempt % 3 == 0:
                 try:
-                    _bsc_shares = _bsc_check_order_filled(
-                        order_hash,
-                        float(leg.shares or 0),
+                    _bm, _bt = _limit_buy_mktk()
+                    _bsc_shares = _bsc_filled_taker_shares_for_hedge(
+                        order_hash, float(leg.shares or 0), _bm, _bt, log=False
                     )
                     if _bsc_shares > 0:
                         now_ts = time.time()
@@ -3020,7 +3187,10 @@ def _place_predict_limit_buy(
                 _gf_new = _bsc_wait_new_head_or_timeout(_gf_prev, _FINAL_GET_SLEEP_SEC)
                 if not filled and order_hash and _gf_new > _gf_prev and (_attempt % 3 != 0):
                     try:
-                        _gf_bsc = _bsc_check_order_filled(order_hash, float(leg.shares or 0))
+                        _gm, _gt = _limit_buy_mktk()
+                        _gf_bsc = _bsc_filled_taker_shares_for_hedge(
+                            order_hash, float(leg.shares or 0), _gm, _gt, log=False
+                        )
                         if _gf_bsc > 0:
                             now_ts = time.time()
                             if first_fill_ts is None:
@@ -4298,8 +4468,21 @@ def opportunity(opp: Opportunity) -> dict:
                 # (Previously only poly_hedge_no_edge — but terminal_status:CANCELLED and
                 # replace_* cancels can also race with on-chain fills.)
                 _ba_cancel_rsn = _ba_quote_meta.get("cancel_reason") or ""
+                _ba_mktk = _predict_maker_taker_wei_from_get_payload(
+                    _ba_pred_resp.get("get") if isinstance(_ba_pred_resp.get("get"), dict) else None
+                ) or _predict_maker_taker_wei_from_get_payload(
+                    _ba_pred_resp.get("create") if isinstance(_ba_pred_resp.get("create"), dict) else None
+                )
+                _ba_mk, _ba_tk = _ba_mktk if _ba_mktk else (None, None)
                 if pred_hash_ba and _ba_cancel_rsn and pred_leg.market_id is not None:
-                    _late_watch_save(str(pred_hash_ba), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
+                    _late_watch_save(
+                        str(pred_hash_ba),
+                        int(pred_leg.market_id),
+                        poly_leg.token_id if poly_leg else None,
+                        float(opp.shares),
+                        maker_amount=_ba_mk,
+                        taker_amount=_ba_tk,
+                    )
                     print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}... cancel_reason={_ba_cancel_rsn}")
                     # Also register every hash that was replaced during the order lifetime.
                     # When a replace happens, the OLD hash is broadcast to BSC before replacement
@@ -4307,7 +4490,14 @@ def opportunity(opp: Opportunity) -> dict:
                     _ba_replaced_hashes = _ba_pred_resp.get("replaced_order_hashes") or []
                     for _old_h in _ba_replaced_hashes:
                         if _old_h and _old_h != str(pred_hash_ba):
-                            _late_watch_save(str(_old_h), int(pred_leg.market_id), poly_leg.token_id if poly_leg else None, float(opp.shares))
+                            # Do not use current order's maker/taker for a *previous* order hash
+                            # (replaced at a new price) — late_watch resolves m/t via GET by hash.
+                            _late_watch_save(
+                                str(_old_h),
+                                int(pred_leg.market_id),
+                                poly_leg.token_id if poly_leg else None,
+                                float(opp.shares),
+                            )
                             print(f"[TRADER]{_t} late_watch_registered_replaced hash={str(_old_h)[:14]}... (was replaced by {str(pred_hash_ba)[:14]}...)")
                 _append_jsonl(trades_file, row)
                 return {"status": "skipped", "reason": _skip_code_ba}
