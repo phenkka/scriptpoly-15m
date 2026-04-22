@@ -746,6 +746,64 @@ def _late_watch_save(order_hash: str, market_id: int, token_id: str | None, shar
         print(f"[TRADER] late_watch_save error={_e}")
 
 
+def _incident_tg_emoji(self_resolved: bool) -> str:
+    return "🟡🟡🟡" if self_resolved else "🔴🔴🔴"
+
+
+def _auto_hedge_late_fill_succeeded(hedge_status: str) -> bool:
+    """True if _auto_hedge_late_fill placed a hedge (status starts with 'ok:')."""
+    return bool(hedge_status) and hedge_status.startswith("ok:")
+
+
+def _late_ghost_fill_incident(
+    incidents_file: str,
+    *,
+    detection: Literal["predict_api_lag", "bsc_onchain", "bsc_watcher_expiry"],
+    order_hash: str,
+    market_id: object,
+    shares: float,
+    hedge_st: str,
+) -> None:
+    """Log late ghost fill to incidents.jsonl and send one Telegram with full outcome."""
+    _resolved = _auto_hedge_late_fill_succeeded(hedge_st)
+    _em = _incident_tg_emoji(_resolved)
+    _sub = "RESOLVED" if _resolved else "ACTION REQUIRED"
+    _det = {
+        "predict_api_lag": "Predict API reported a fill after cancel (late / indexer lag).",
+        "bsc_onchain": "BSC: on-chain fill; Predict API had not yet indexed 0 (API vs chain lag).",
+        "bsc_watcher_expiry": "After 30 min watcher still had API=0; fill confirmed on BSC (on-chain).",
+    }[detection]
+    _row: dict[str, Any] = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "type": "late_ghost_fill",
+        "detection": detection,
+        "order_hash": order_hash,
+        "market_id": market_id,
+        "shares": round(float(shares), 6),
+        "poly_hedge_result": hedge_st,
+        "self_resolved": _resolved,
+    }
+    _append_jsonl(incidents_file, _row)
+    _outcome = (
+        "<i>Outcome: emergency Polymarket hedge (FOK) succeeded — flat.</i>\n"
+        if _resolved
+        else "<i>Outcome: auto-hedge failed — check Predict + Polymarket manually.</i>\n"
+    )
+    notify(
+        f"{_em} <b>INCIDENT: LATE GHOST FILL — {_sub}</b>\n"
+        f"\n"
+        f"<i>{_det}</i>\n"
+        f"\n"
+        f"Order: <code>{str(order_hash)[:20]}…</code>\n"
+        f"Market: <code>{market_id}</code>\n"
+        f"Shares: <b>{shares:.3f}</b>\n"
+        f"\n"
+        f"<b>Poly auto-hedge</b> <code>{hedge_st}</code>\n"
+        f"\n"
+        f"{_outcome}"
+    )
+
+
 def _auto_hedge_late_fill(token_id: str | None, shares: float, market_id: int) -> str:
     """Emergency Poly hedge after detecting a late BSC fill.
 
@@ -848,12 +906,13 @@ def _late_fill_watcher() -> None:
     """Background thread: checks cancelled Predict order hashes for late fills.
 
     When ghost_fill_watch (60s) times out without finding a fill, the order hash
-    is saved to _LATE_WATCH_FILE. This thread keeps polling those hashes every 15s
-    for up to 10 minutes. If a late fill is detected it sends a Telegram alert —
-    the position on Predict is unhedged and requires manual intervention.
+    is saved to _LATE_WATCH_FILE. This thread keeps polling for up to 30 min.
+    On late fill: emergency Poly FOK hedge, one INCIDENT: LATE GHOST FILL message
+    (🟡 if hedge ok, 🔴 if not) + line in incidents.jsonl.
     """
     _POLL_INTERVAL = 15.0
     _MAX_WATCH_SEC = 1800  # 30 minutes — Predict API can lag BSC by several minutes
+    _inc_path = os.environ.get("TRADER_INCIDENTS_FILE", "/data/incidents.jsonl")
     while True:
         time.sleep(_POLL_INTERVAL)
         try:
@@ -889,19 +948,17 @@ def _late_fill_watcher() -> None:
                     if bsc_shares > 0:
                         _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
-                            f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_CONFIRMED_ON_EXPIRY "
+                            f"[TRADER][LATE_WATCH] BSC_FILL_CONFIRMED_ON_EXPIRY "
                             f"hash={oh[:14]}... market_id={mkt_id} "
                             f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
-                        notify(
-                            f"🔴 <b>BSC fill confirmed — auto-hedge</b>\n"
-                            f"<i>Watcher expired, Predict API showed 0 for 30 min</i>\n"
-                            f"\n"
-                            f"- Shares: <b>{bsc_shares:.3f}</b>\n"
-                            f"- Hash: <code>{oh[:18]}...</code>\n"
-                            f"- Market: <code>{mkt_id}</code>\n"
-                            f"\n"
-                            f"Poly hedge: <code>{_hedge_st}</code>"
+                        _late_ghost_fill_incident(
+                            _inc_path,
+                            detection="bsc_watcher_expiry",
+                            order_hash=oh,
+                            market_id=mkt_id,
+                            shares=bsc_shares,
+                            hedge_st=_hedge_st,
                         )
                     else:
                         print(
@@ -919,19 +976,17 @@ def _late_fill_watcher() -> None:
                         shares = filled_wei / 10 ** 18
                         _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                         print(
-                            f"[TRADER][LATE_WATCH] ⚠️ LATE GHOST FILL DETECTED (API) "
+                            f"[TRADER][LATE_WATCH] LATE_GHOST_FILL_API "
                             f"hash={oh[:14]}... market_id={mkt_id} "
                             f"shares={shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                         )
-                        notify(
-                            f"🟡 <b>Late ghost fill — auto-hedge triggered</b>\n"
-                            f"<i>Predict API reported fill +{age:.0f}s after cancel</i>\n"
-                            f"\n"
-                            f"- Shares: <b>{shares:.3f}</b>\n"
-                            f"- Hash: <code>{oh[:18]}...</code>\n"
-                            f"- Market: <code>{mkt_id}</code>\n"
-                            f"\n"
-                            f"Poly hedge: <code>{_hedge_st}</code>"
+                        _late_ghost_fill_incident(
+                            _inc_path,
+                            detection="predict_api_lag",
+                            order_hash=oh,
+                            market_id=mkt_id,
+                            shares=shares,
+                            hedge_st=_hedge_st,
                         )
                         to_remove.append(oh)
                     else:
@@ -941,19 +996,17 @@ def _late_fill_watcher() -> None:
                         if bsc_shares > 0:
                             _hedge_st = _auto_hedge_late_fill(entry.get("token_id"), bsc_shares, int(mkt_id) if str(mkt_id).isdigit() else 0)
                             print(
-                                f"[TRADER][LATE_WATCH] 🔴 BSC_FILL_DETECTED (API lag!) "
+                                f"[TRADER][LATE_WATCH] BSC_FILL_API_STILL_0 "
                                 f"hash={oh[:14]}... market_id={mkt_id} "
                                 f"bsc_shares={bsc_shares:.4f} age={age:.0f}s hedge={_hedge_st}"
                             )
-                            notify(
-                                f"🔴 <b>BSC fill (API lag) — auto-hedge triggered</b>\n"
-                                f"<i>On-chain fill detected, Predict API lag = {age:.0f}s</i>\n"
-                                f"\n"
-                                f"- Shares: <b>{bsc_shares:.3f}</b>\n"
-                                f"- Hash: <code>{oh[:18]}...</code>\n"
-                                f"- Market: <code>{mkt_id}</code>\n"
-                                f"\n"
-                                f"Poly hedge: <code>{_hedge_st}</code>"
+                            _late_ghost_fill_incident(
+                                _inc_path,
+                                detection="bsc_onchain",
+                                order_hash=oh,
+                                market_id=mkt_id,
+                                shares=bsc_shares,
+                                hedge_st=_hedge_st,
                             )
                             to_remove.append(oh)
                 except Exception as _pe:
@@ -4377,11 +4430,11 @@ def opportunity(opp: Opportunity) -> dict:
                                     f"\n"
                                     f"<b>{opp.label}</b>\n"
                                     f"\n"
-                                    f"Predict long {_ba_net_sell_qty:.2f} shares — indexer lag\n"
-                                    f"Poly: куплено {_ne_temp_hedge_qty:.2f} sh противоположной ноги\n"
-                                    f"VWAP: {_ne_temp_hedge_result.get('vwap', 0):.3f} | Стоимость: ${_ne_temp_hedge_result.get('cost_usd', 0):.2f}\n"
+                                    f"Predict long {_ba_net_sell_qty:.2f} sh — position indexer lag\n"
+                                    f"Poly: bought {_ne_temp_hedge_qty:.2f} sh (opposite leg)\n"
+                                    f"VWAP: {_ne_temp_hedge_result.get('vwap', 0):.3f} | cost ${_ne_temp_hedge_result.get('cost_usd', 0):.2f}\n"
                                     f"\n"
-                                    f"Ждём Predict indexer..."
+                                    f"Waiting for Predict indexer…"
                                 )
                             else:
                                 _ne_temp_hedge_state = "placement_failed"
@@ -4546,15 +4599,15 @@ def opportunity(opp: Opportunity) -> dict:
                                 )
                                 if _ne_temp_hedge_state == "stuck":
                                     notify(
-                                        f"🚨🚨🚨 <b>STUCK TEMP HEDGE — РУЧНАЯ ЗАКРЫТИЕ ОБЯЗАТЕЛЬНО</b>\n"
+                                        f"🚨🚨🚨 <b>STUCK TEMP HEDGE — CLOSE MANUALLY</b>\n"
                                         f"\n"
                                         f"<b>{opp.label}</b>\n"
                                         f"\n"
-                                        f"Predict unwind: ✅ {_ne_uw_qty:.2f} sh продано\n"
-                                        f"Poly temp hedge: {_ne_close_qty:.2f} sh — закрыть не удалось!\n"
+                                        f"Predict unwind: ✅ sold {_ne_uw_qty:.2f} sh\n"
+                                        f"Poly temp hedge: {_ne_close_qty:.2f} sh — close failed\n"
                                         f"Token: <code>{str(poly_leg.token_id)[:32]}</code>\n"
                                         f"\n"
-                                        f"Нужно продать вручную на Polymarket!\n"
+                                        f"Sell the Poly leg manually on Polymarket.\n"
                                     )
                             else:
                                 _ne_temp_hedge_state = "skip_close_qty_too_small"
@@ -4580,34 +4633,43 @@ def opportunity(opp: Opportunity) -> dict:
                             f"sold={_ne_uw_qty:.4f}/{_ba_net_sell_qty:.4f} price={_ne_unwind_price:.4f}"
                         )
                         if _ne_uw_filled:
-                            _ne_uw_status = f"✅ продано {_ne_uw_qty:.2f} шарес по {_ne_unwind_price:.2f}"
+                            _ne_uw_status = f"✅ sold {_ne_uw_qty:.2f} sh @ {_ne_unwind_price:.2f}"
                         else:
                             _ne_uw_rem = _ba_net_sell_qty - _ne_uw_qty
-                            _ne_uw_status = f"⚠️ ЧАСТИЧНО {_ne_uw_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ne_uw_rem:.2f} — ручная проверка!"
+                            _ne_uw_status = (
+                                f"⚠️ PARTIAL {_ne_uw_qty:.2f}/{_ba_net_sell_qty:.2f} sh — "
+                                f"left {_ne_uw_rem:.2f} sh — check manually"
+                            )
                         # Build temp hedge line for notification
                         _ne_th_line = ""
                         if _ne_temp_hedge_state == "released":
                             _ne_th_line = (
-                                f"\n<i>🛡 Temp hedge закрыт: продано {_ne_close_result.get('filled_qty', 0):.2f} sh Poly "
+                                f"\n<i>🛡 Temp hedge closed: sold {_ne_close_result.get('filled_qty', 0):.2f} sh Poly "
                                 f"@ {_ne_close_result.get('price', 0):.3f}</i>"
                             )
                         elif _ne_temp_hedge_state == "placed":
                             _ne_th_line = (
-                                f"\n<i>⚠️ Temp hedge НЕ закрыт: {_ne_temp_hedge_qty:.2f} sh Poly — ручная проверка!</i>"
+                                f"\n<i>⚠️ Temp hedge not closed: {_ne_temp_hedge_qty:.2f} sh Poly — check manually</i>"
                             )
                         elif _ne_temp_hedge_state == "close_failed":
                             _ne_th_line = (
-                                f"\n<i>🔴 Temp hedge: закрытие не удалось! {_ne_temp_hedge_qty:.2f} sh Poly — ручная!</i>"
+                                f"\n<i>🔴 Temp hedge close failed: {_ne_temp_hedge_qty:.2f} sh Poly — manual</i>"
                             )
+                        _ne_tg_resolved = _ne_uw_filled and _ne_temp_hedge_state not in (
+                            "placed",
+                            "stuck",
+                            "close_failed",
+                        )
+                        _em_ne = _incident_tg_emoji(_ne_tg_resolved)
                         notify(
-                            f"🟡🟡🟡 <b>INCIDENT: HEDGE NO EDGE → UNWIND</b>\n"
+                            f"{_em_ne} <b>INCIDENT: HEDGE NO EDGE → UNWIND</b>\n"
                             f"\n"
                             f"<b>{opp.label}</b>\n"
                             f"\n"
-                            f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
-                            f"Poly цена ухудшилась: {_live_vwap_ba:.2f} → edge {_live_net_edge_ba * 10_000:.0f}bps\n"
+                            f"Predict fill: <b>{_ba_hedge_qty:.2f} sh</b> @ {_ba_actual_pred_bid:.2f}\n"
+                            f"Poly moved: VWAP {_live_vwap_ba:.2f} → edge {_live_net_edge_ba * 10_000:.0f} bps\n"
                             f"\n"
-                            f"Продажа обратно на Predict по {_ne_unwind_price:.2f}: {_ne_uw_status}\n"
+                            f"Predict sell @ {_ne_unwind_price:.2f}: {_ne_uw_status}\n"
                             f"{_ne_th_line}\n"
                         )
                         _append_jsonl(trades_file, row)
@@ -4622,10 +4684,10 @@ def opportunity(opp: Opportunity) -> dict:
                                     f"\n"
                                     f"<b>{opp.label}</b>\n"
                                     f"\n"
-                                    f"Predict unwind не удался — temp hedge на Poly оставлен как защита\n"
+                                    f"Predict unwind failed — temp Poly hedge left on as cover\n"
                                     f"Poly: {_ne_temp_hedge_qty:.2f} sh @ "
                                     f"{_ne_temp_hedge_result.get('vwap', 0):.3f}\n"
-                                    f"Следующий шаг: вручную продать Predict и закрыть Poly-хедж\n"
+                                    f"Next: manually unwind Predict and close the Poly temp hedge\n"
                                 )
                                 print(
                                     f"[TRADER][EMERGENCY_HEDGE] retained label={opp.label} "
@@ -4647,12 +4709,12 @@ def opportunity(opp: Opportunity) -> dict:
                                 f"\n"
                                 f"<b>{opp.label}</b>\n"
                                 f"\n"
-                                f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
-                                f"Poly цена ухудшилась: {_live_vwap_ba:.2f} → "
-                                f"edge {_live_net_edge_ba * 10_000:.0f}bps\n"
-                                f"Unwind не удался: {(_ne_unwind_err or 'нет ответа')[:200]}\n"
+                                f"Predict fill: <b>{_ba_hedge_qty:.2f} sh</b> @ {_ba_actual_pred_bid:.2f}\n"
+                                f"Poly moved: {_live_vwap_ba:.2f} → "
+                                f"edge {_live_net_edge_ba * 10_000:.0f} bps\n"
+                                f"Unwind failed: {(_ne_unwind_err or 'no fill')[:200]}\n"
                                 f"\n"
-                                f"Вынужден хеджировать чтобы закрыть позицию!\n"
+                                f"Hedging on Polymarket to close exposure.\n"
                             )
                         else:
                             row["temp_hedge"] = {
@@ -4731,21 +4793,25 @@ def opportunity(opp: Opportunity) -> dict:
                     f"unwind_filled={_pc_uw_filled} unwind_qty={_pc_uw_qty:.4f}"
                 )
                 if _pc_uw_filled:
-                    _pc_uw_status = f"✅ продано {_pc_uw_qty:.2f} шарес по {_pc_unwind_price:.2f}"
+                    _pc_uw_status = f"✅ sold {_pc_uw_qty:.2f} sh @ {_pc_unwind_price:.2f}"
                 elif _pc_uw_qty > 0:
-                    _pc_uw_status = f"⚠️ ЧАСТИЧНО продано {_pc_uw_qty:.2f}/{_ba_hedge_qty:.2f} шарес — остаток {_ba_hedge_qty - _pc_uw_qty:.2f} — ручная проверка!"
+                    _pc_uw_status = (
+                        f"⚠️ PARTIAL {_pc_uw_qty:.2f}/{_ba_hedge_qty:.2f} sh — "
+                        f"left {_ba_hedge_qty - _pc_uw_qty:.2f} — check manually"
+                    )
                 else:
-                    _pc_uw_status = "❌ не продано — ручная проверка!" + (f" err: {_pc_unwind_err}" if _pc_unwind_err else "")
+                    _pc_uw_status = "❌ not sold — check manually" + (f" err: {_pc_unwind_err}" if _pc_unwind_err else "")
+                _em_pc = _incident_tg_emoji(_pc_uw_filled)
                 notify(
-                    f"🟡🟡🟡 <b>INCIDENT: HEDGE PRICE CAP → UNWIND</b>\n"
+                    f"{_em_pc} <b>INCIDENT: HEDGE PRICE CAP → UNWIND</b>\n"
                     f"\n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
-                    f"Poly цена {_live_vwap_ba:.2f} ≥ лимит {_poly_max_hedge_price:.2f} → хедж отменён\n"
-                    f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> @ {_ba_actual_pred_bid:.2f}\n"
+                    f"Poly VWAP {_live_vwap_ba:.2f} ≥ cap {_poly_max_hedge_price:.2f} → hedge skipped\n"
+                    f"Predict fill: <b>{_ba_hedge_qty:.2f} sh</b> @ {_ba_actual_pred_bid:.2f}\n"
                     f"\n"
-                    f"Продажа обратно на Predict по {_pc_unwind_price:.2f}: {_pc_uw_status}\n"
-                    + (f"Ошибка: {_pc_unwind_err}\n" if _pc_unwind_err and _pc_uw_qty == 0 else "")
+                    f"Predict sell @ {_pc_unwind_price:.2f}: {_pc_uw_status}\n"
+                    + (f"Error: {_pc_unwind_err}\n" if _pc_unwind_err and _pc_uw_qty == 0 else "")
                 )
                 _append_jsonl(trades_file, row)
                 return {"status": "incident", "reason": "bid_ask_hedge_price_cap"}
@@ -4802,22 +4868,41 @@ def opportunity(opp: Opportunity) -> dict:
                                 break
                     _unwind_pre_filled = _unwind_pre_qty >= _ba_net_sell_qty * 0.99
                 if _unwind_pre_filled:
-                    _unwind_pre_status = f"✅ продано {_unwind_pre_qty:.2f} шарес"
+                    _unwind_pre_status = f"✅ sold {_unwind_pre_qty:.2f} sh"
                 elif _unwind_pre_qty > 0:
-                    _unwind_pre_status = f"⚠️ ЧАСТИЧНО продано {_unwind_pre_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ba_net_sell_qty - _unwind_pre_qty:.2f} — ручная проверка!"
+                    _unwind_pre_status = (
+                        f"⚠️ PARTIAL {_unwind_pre_qty:.2f}/{_ba_net_sell_qty:.2f} sh — "
+                        f"left {_ba_net_sell_qty - _unwind_pre_qty:.2f} — check manually"
+                    )
                 else:
-                    _unwind_pre_status = f"❌ не удалось{(' — ' + _unwind_pre_err[:80]) if _unwind_pre_err else ''}"
+                    _unwind_pre_status = f"❌ failed{(' — ' + _unwind_pre_err[:80]) if _unwind_pre_err else ''}"
                 _unwind_pre_loss = (_unwind_price_pre - _ba_actual_pred_bid) * _ba_net_sell_qty
+                _fts_resolved = bool(_unwind_pre_filled)
+                _em_fts = _incident_tg_emoji(_fts_resolved)
+                _inc_fts: dict[str, Any] = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "type": "predict_fill_too_small",
+                    "label": opp.label,
+                    "pred_filled_shares": round(float(_ba_net_sell_qty), 6),
+                    "pred_fill_usd": round(_pred_fill_usd, 4),
+                    "pred_min_fill_usd": _pred_min_fill_usd,
+                    "unwind_filled": _unwind_pre_filled,
+                    "unwind_qty": round(_unwind_pre_qty, 6),
+                    "unwind_error": _unwind_pre_err,
+                    "approx_loss_usd": round(abs(_unwind_pre_loss), 6) if _fts_resolved else None,
+                    "self_resolved": _fts_resolved,
+                }
+                _append_jsonl(incidents_file, _inc_fts)
                 notify(
-                    f"🟡🟡🟡 <b>INCIDENT: PREDICT FILL TOO SMALL → UNWIND</b>\n"
+                    f"{_em_fts} <b>INCIDENT: PREDICT FILL TOO SMALL → UNWIND</b>\n"
                     f"\n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
-                    f"Predict заполнил: <b>{_ba_net_sell_qty:.2f} shares</b> (${_pred_fill_usd:.2f})\n"
-                    f"Слишком мало для хеджа (мин ${_pred_min_fill_usd:.2f})\n"
+                    f"Predict fill: <b>{_ba_net_sell_qty:.2f} sh</b> (${_pred_fill_usd:.2f})\n"
+                    f"Below min hedge notional (min ${_pred_min_fill_usd:.2f})\n"
                     f"\n"
-                    f"Продажа обратно на Predict по {_unwind_price_pre:.2f}: {_unwind_pre_status}\n"
-                    f"Убыток: ~${abs(_unwind_pre_loss):.3f}\n"
+                    f"Predict sell @ {_unwind_price_pre:.2f}: {_unwind_pre_status}\n"
+                    f"Loss ~${abs(_unwind_pre_loss):.3f}\n"
                 )
                 row["ok"] = False
                 row["incident"] = {
@@ -4955,22 +5040,26 @@ def opportunity(opp: Opportunity) -> dict:
                         f"unwind_filled={_uw_filled} unwind_qty={_uw_qty:.4f}"
                     )
                     if _uw_filled:
-                        _uw_status = f"✅ продано {_uw_qty:.2f} шарес по {_unwind_price:.2f}"
+                        _uw_status = f"✅ sold {_uw_qty:.2f} sh @ {_unwind_price:.2f}"
                     elif _uw_qty > 0:
-                        _uw_status = f"⚠️ ЧАСТИЧНО продано {_uw_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — остаток {_ba_net_sell_qty - _uw_qty:.2f} — ручная проверка!"
+                        _uw_status = (
+                            f"⚠️ PARTIAL {_uw_qty:.2f}/{_ba_net_sell_qty:.2f} sh — "
+                            f"left {_ba_net_sell_qty - _uw_qty:.2f} — check manually"
+                        )
                     else:
-                        _uw_status = "❌ не продано — ручная проверка!" + (f" err: {_unwind_err}" if _unwind_err else "")
+                        _uw_status = "❌ not sold — check manually" + (f" err: {_unwind_err}" if _unwind_err else "")
+                    _em_bm = _incident_tg_emoji(_uw_filled)
                     notify(
-                        f"🟡🟡🟡 <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
+                        f"{_em_bm} <b>INCIDENT: HEDGE BELOW MIN → UNWIND</b>\n"
                         f"\n"
                         f"<b>{opp.label}</b>\n"
                         f"\n"
-                        f"Predict заполнил: <b>{_ba_hedge_qty:.2f} shares</b> (${_ba_hedge_cost_usd:.2f})\n"
-                        f"Слишком мало для Poly (мин ${_poly_min_hedge:.2f})\n"
+                        f"Predict fill: <b>{_ba_hedge_qty:.2f} sh</b> (${_ba_hedge_cost_usd:.2f} notional)\n"
+                        f"Below Polymarket $ min (min ${_poly_min_hedge:.2f})\n"
                         f"\n"
-                        f"Продажа обратно на Predict по {_unwind_price:.2f}: {_uw_status}\n"
-                        + (f"Убыток: ~${_uw_loss:.3f}\n" if _uw_filled else "")
-                        + (f"Ошибка: {_unwind_err}\n" if _unwind_err else "")
+                        f"Predict sell @ {_unwind_price:.2f}: {_uw_status}\n"
+                        + (f"Loss ~${_uw_loss:.3f}\n" if _uw_filled else "")
+                        + (f"Error: {_unwind_err}\n" if _unwind_err else "")
                     )
                     _append_jsonl(trades_file, row)
                     return {"status": "incident", "reason": "bid_ask_hedge_below_min_unwind"}
@@ -5448,9 +5537,9 @@ def opportunity(opp: Opportunity) -> dict:
                         break
 
                 if _ba_net_pnl >= 0:
-                    _pnl_suffix = " — TYANUCHKA IS CANCELED"
+                    _pnl_suffix = " — in the green"
                 else:
-                    _pnl_suffix = " — GG PROEBALI"
+                    _pnl_suffix = " — in the red"
                 _pnl_emoji = "📈" if _ba_net_pnl >= 0 else "📉"
                 # Recalculate ROI based on corrected PnL and actual net stake
                 _net_pred_cost = _notif_pred_qty * _ba_pred_price
@@ -5544,12 +5633,14 @@ def opportunity(opp: Opportunity) -> dict:
                 _ghost_poly_sold = 0.0
                 _ghost_poly_sell_err: str | None = None
                 _ghost_poly_price: float | None = None
+                _gp_shares_seen = 0.0
+                _gp_threshold_un = 0.5
                 try:
                     _gp_pos = _fetch_poly_position(str(poly_leg.token_id), timeout=4.0)
                     _gp_shares = float(_gp_pos[0]) if _gp_pos else 0.0
+                    _gp_shares_seen = _gp_shares
                     # Only act if we see meaningful shares that weren't reported filled
-                    _gp_threshold = 0.5
-                    if _gp_shares >= _gp_threshold:
+                    if _gp_shares >= _gp_threshold_un:
                         print(
                             f"[TRADER][GHOST_POLY] detected position on Poly "
                             f"token={str(poly_leg.token_id)[:16]} shares={_gp_shares:.4f} "
@@ -5600,6 +5691,34 @@ def opportunity(opp: Opportunity) -> dict:
                     _ghost_poly_sell_err = str(_gp_e)
                     print(f"[TRADER][GHOST_POLY] check/sell error: {_gp_e}")
 
+                if _uw2_filled:
+                    _uw2_status = f"✅ sold {_uw2_qty:.2f} sh @ {_unwind_sell_price:.2f}"
+                elif _uw2_qty > 0:
+                    _uw2_remaining_qty = _ba_net_sell_qty - _uw2_qty
+                    _uw2_status = (
+                        f"⚠️ PARTIAL {_uw2_qty:.2f}/{_ba_net_sell_qty:.2f} sh — "
+                        f"left {_uw2_remaining_qty:.2f} sh — check manually"
+                        + (f" err: {_uw2_err[:200]}" if _uw2_err else "")
+                    )
+                else:
+                    _uw2_status = f"❌ failed — check manually{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
+                _gp_tg = ""
+                if _ghost_poly_sold > 0:
+                    _gp_tg = f"\nGhost Poly: ✅ sold {_ghost_poly_sold:.2f} sh @ {(_ghost_poly_price or 0):.2f}"
+                elif _ghost_poly_sell_err:
+                    _gp_tg = f"\nGhost Poly: ❌ err: {_ghost_poly_sell_err[:200]}"
+                _poly_ghost_resolved = bool(
+                    (_gp_shares_seen < _gp_threshold_un and not _ghost_poly_sell_err)
+                    or (
+                        _gp_shares_seen >= _gp_threshold_un
+                        and not _ghost_poly_sell_err
+                        and _ghost_poly_sold > 0
+                        and _ghost_poly_sold >= 0.99 * _gp_shares_seen
+                    )
+                )
+                _ug_tg_resolved = bool(_uw2_filled and _poly_ghost_resolved)
+                _em_ug = _incident_tg_emoji(_ug_tg_resolved)
+                _ug_sub = " (auto-resolved)" if _ug_tg_resolved else " — action required"
                 _ba_inc2 = {
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "bid_ask_unhedged_predict",
@@ -5613,9 +5732,13 @@ def opportunity(opp: Opportunity) -> dict:
                     "poly_error": str(poly_exec_error_ba) if poly_exec_error_ba else None,
                     "unwind": _uw2_result,
                     "unwind_error": _uw2_err,
+                    "unwind_filled": _uw2_filled,
+                    "unwind_qty": _uw2_qty,
+                    "ghost_poly_shares_seen": round(_gp_shares_seen, 6),
                     "ghost_poly_sold": _ghost_poly_sold,
                     "ghost_poly_sell_err": _ghost_poly_sell_err,
                     "ghost_poly_price": _ghost_poly_price,
+                    "self_resolved": _ug_tg_resolved,
                     "quote_meta": _ba_quote_meta,
                 }
                 _append_jsonl(incidents_file, _ba_inc2)
@@ -5626,26 +5749,10 @@ def opportunity(opp: Opportunity) -> dict:
                     f"[TRADER][INCIDENT] BID_ASK_UNHEDGED_PREDICT label={opp.label} "
                     f"pred_qty={_ba_hedge_qty:.6f} poly_err={poly_exec_error_ba} "
                     f"residual={_ba_residual:.6f} unwind_filled={_uw2_filled} unwind_qty={_uw2_qty:.4f} "
-                    f"ghost_poly_sold={_ghost_poly_sold:.4f}"
+                    f"ghost_poly_sold={_ghost_poly_sold:.4f} self_resolved={_ug_tg_resolved}"
                 )
-                if _uw2_filled:
-                    _uw2_status = f"✅ продано {_uw2_qty:.2f} шарес по {_unwind_sell_price:.2f}"
-                elif _uw2_qty > 0:
-                    _uw2_remaining_qty = _ba_net_sell_qty - _uw2_qty
-                    _uw2_status = (
-                        f"⚠️ ЧАСТИЧНО продано {_uw2_qty:.2f}/{_ba_net_sell_qty:.2f} шарес — "
-                        f"остаток {_uw2_remaining_qty:.2f} шарес — ручная проверка!"
-                        + (f" err: {_uw2_err[:200]}" if _uw2_err else "")
-                    )
-                else:
-                    _uw2_status = f"❌ не удалось — ручная проверка!{(' err: ' + _uw2_err[:200]) if _uw2_err else ''}"
-                _gp_tg = ""
-                if _ghost_poly_sold > 0:
-                    _gp_tg = f"\nGhost Poly: ✅ продано {_ghost_poly_sold:.2f} шарес по {(_ghost_poly_price or 0):.2f}"
-                elif _ghost_poly_sell_err:
-                    _gp_tg = f"\nGhost Poly: ❌ err: {_ghost_poly_sell_err[:200]}"
                 notify(
-                    f"🔴🔴🔴 <b>INCIDENT: UNHEDGED PREDICT</b>\n"
+                    f"{_em_ug} <b>INCIDENT: UNHEDGED PREDICT</b>{_ug_sub}\n"
                     f"\n"
                     f"<b>{opp.label}</b>\n"
                     f"\n"
@@ -5654,7 +5761,7 @@ def opportunity(opp: Opportunity) -> dict:
                     f"Polymarket ({poly_leg.side.upper()} ASK) ❌\n"
                     f"price: {(_live_vwap_ba if _live_vwap_ba is not None else float(poly_leg.ask)):.2f} (est.) - err: {str(poly_exec_error_ba)[:200] if poly_exec_error_ba else 'unknown'}\n"
                     f"\n"
-                    f"Unwind на Predict: {_uw2_status}"
+                    f"Predict unwind: {_uw2_status}"
                     f"{_gp_tg}\n"
                 )
                 _append_jsonl(trades_file, row)
