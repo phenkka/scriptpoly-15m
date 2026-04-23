@@ -340,44 +340,67 @@ def _startup_warmup() -> None:
     def _api_health_watchdog() -> None:
         _was_down = _halt_api_path.exists()
         _down_reason = ""
-        # Debounce: require this many consecutive failures before declaring DOWN.
-        # A single SSL handshake timeout (transient VPN hiccup) will not trigger an alert.
-        _FAIL_THRESHOLD = int(os.environ.get("API_DOWN_FAIL_THRESHOLD", "2") or "2")
+        # Debounce: require N consecutive failures before DOWN, N consecutive successes before RESTORED.
+        # Prevents SSL handshake timeouts (transient VPN hiccups) from triggering flapping alerts.
+        _FAIL_THRESHOLD = int(os.environ.get("API_DOWN_FAIL_THRESHOLD", "3") or "3")
+        _OK_THRESHOLD = int(os.environ.get("API_UP_OK_THRESHOLD", "2") or "2")
         _fail_streak = 0
+        _ok_streak = 0
+        # Inner retry: on first failure, wait this long then retry once before counting as failed.
+        # Handles transient SSL handshake drops without bumping the fail_streak.
+        _INNER_RETRY_DELAY = float(os.environ.get("API_HEALTH_RETRY_DELAY_SEC", "4") or "4")
+        _INNER_RETRIES = int(os.environ.get("API_HEALTH_INNER_RETRIES", "2") or "2")
+
+        def _check_url(url: str, kw: dict) -> tuple[bool, str]:
+            """Try up to _INNER_RETRIES times; return (ok, last_err)."""
+            _last_err = ""
+            for _attempt in range(_INNER_RETRIES):
+                if _attempt > 0:
+                    time.sleep(_INNER_RETRY_DELAY)
+                try:
+                    _resp = httpx.get(url, timeout=httpx.Timeout(8.0, connect=4.0), **kw)
+                    if _resp.status_code < 500:
+                        return True, ""
+                    _last_err = f"status {_resp.status_code}"
+                except Exception as _ex:
+                    _last_err = str(_ex)
+            return False, _last_err
+
         while True:
             time.sleep(_api_check_interval)
             _predict_ok = False
             _poly_ok = False
             _reason = ""
-            try:
-                _r = httpx.get(_PREDICT_HEALTH_URL, timeout=httpx.Timeout(8.0, connect=4.0))
-                _predict_ok = _r.status_code < 500
-            except Exception as _e:
-                _reason = f"predict: {_e}"
-                print(f"[TRADER][API_WATCHDOG] predict_health_failed err={_e}")
-            try:
-                _kw: dict = {}
-                if _proxy_url:
-                    _kw["proxy"] = _proxy_url
-                _r2 = httpx.get(_POLY_HEALTH_URL, timeout=httpx.Timeout(8.0, connect=4.0), **_kw)
-                _poly_ok = _r2.status_code < 500
-            except Exception as _e2:
+            _predict_ok, _predict_err = _check_url(_PREDICT_HEALTH_URL, {})
+            if not _predict_ok:
+                _reason = f"predict: {_predict_err}"
+                print(f"[TRADER][API_WATCHDOG] predict_health_failed err={_predict_err}")
+            _kw: dict = {}
+            if _proxy_url:
+                _kw["proxy"] = _proxy_url
+            _poly_ok, _poly_err = _check_url(_POLY_HEALTH_URL, _kw)
+            if not _poly_ok:
                 if not _reason:
-                    _reason = f"poly: {_e2}"
-                print(f"[TRADER][API_WATCHDOG] poly_health_failed err={_e2}")
+                    _reason = f"poly: {_poly_err}"
+                print(f"[TRADER][API_WATCHDOG] poly_health_failed err={_poly_err}")
 
             _all_ok = _predict_ok and _poly_ok
             if not _all_ok:
                 _fail_streak += 1
+                _ok_streak = 0
                 print(
                     f"[TRADER][API_WATCHDOG] fail_streak={_fail_streak}/{_FAIL_THRESHOLD} "
                     f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
                 )
             else:
+                _ok_streak += 1
                 _fail_streak = 0
+                if _was_down:
+                    print(f"[TRADER][API_WATCHDOG] ok_streak={_ok_streak}/{_OK_THRESHOLD}")
 
             if not _all_ok and _fail_streak >= _FAIL_THRESHOLD and not _was_down:
                 _was_down = True
+                _ok_streak = 0
                 _down_reason = _reason or f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
                 _halt_api_path.write_text(_down_reason)
                 print(
@@ -385,10 +408,11 @@ def _startup_warmup() -> None:
                     f" — halt_api created reason={_down_reason}"
                 )
                 notify("🔴 <b>API DOWN</b>\n")
-            elif _all_ok and _was_down:
+            elif _all_ok and _was_down and _ok_streak >= _OK_THRESHOLD:
                 _was_down = False
+                _fail_streak = 0
                 _halt_api_path.unlink(missing_ok=True)
-                print("[TRADER][API_WATCHDOG] API RESTORED — halt_api removed")
+                print(f"[TRADER][API_WATCHDOG] API RESTORED after {_ok_streak} consecutive OK — halt_api removed")
                 notify("🟢 <b>API RESTORED</b>\n")
 
     threading.Thread(target=_api_health_watchdog, daemon=True, name="api_health_watchdog").start()
