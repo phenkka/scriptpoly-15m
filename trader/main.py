@@ -284,6 +284,8 @@ def _startup_warmup() -> None:
 
     # BSC WebSocket newHeads — wakes Predict poll / ghost_fill_watch on each block (~3s)
     _start_bsc_ws_thread()
+    # Polygon newHeads — same idea for Polymarket CTF / reconcile vs REST indexer lag
+    _start_polygon_ws_thread()
 
     # VPN watchdog: проверяем доступность прокси каждые 60 секунд.
     # Если прокси недоступен — создаём /data/halt_vpn и уведомляем.
@@ -696,6 +698,286 @@ def _start_bsc_ws_thread() -> None:
     )
     _bsc_ws_thread.start()
     print("[TRADER][BSC_WS] background thread started")
+
+
+# ── Polygon (Polymarket CTF) — on-chain balance + WS newHeads (mirrors BSC+Predict pattern) ──
+_POLY_CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_POLY_OUTCOME_SHARE_SCALE = 1_000_000.0  # CTF ERC1155 outcome amounts (same as CLOB takingAmount/1e6)
+_POLY_CTF_BALANCE_ABI = [
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "id", "type": "uint256"},
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+# Default public Polygon HTTP RPCs (tried in order; proxy via PROXY_URL when set on Provider)
+_DEFAULT_POLYGON_RPCS = [
+    "https://polygon-bor.publicnode.com",
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+]
+_poly_head_cv = _threading.Condition()
+_poly_head_gen: int = 0
+_poly_ws_stop = _threading.Event()
+_poly_ws_thread: _threading.Thread | None = None
+
+
+def _polygon_http_rpcs() -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in (os.environ.get("POLYGON_RPC_URL", "").strip(),):
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    for part in (os.environ.get("POLYGON_RPC_URLS", "") or "").split(","):
+        p = part.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    for d in _DEFAULT_POLYGON_RPCS:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _get_web3_polygon() -> Any:
+    from web3 import Web3
+
+    proxy_url = os.environ.get("PROXY_URL", "").strip() or None
+    req_kwargs: dict[str, Any] = {"timeout": 20}
+    if proxy_url:
+        req_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    for url in _polygon_http_rpcs():
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs=req_kwargs))
+            try:
+                from web3.middleware import ExtraDataToPOAMiddleware
+                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            except ImportError:
+                try:
+                    from web3.middleware import geth_poa_middleware
+                    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                except ImportError:
+                    pass
+            if w3.is_connected():
+                return w3
+        except Exception:
+            continue
+    raise RuntimeError("polygon_rpc_not_connected")
+
+
+def _poly_ctf_shares_onchain(funder: str, token_id: str) -> float | None:
+    """CTF balanceOf(account, id) on Polygon; returns human shares, or None on failure."""
+    funder = (funder or "").strip()
+    if not funder or not str(token_id).strip():
+        return None
+    try:
+        from web3 import Web3
+    except ImportError:
+        return None
+    try:
+        tid = int(str(token_id).strip())
+    except Exception:
+        return None
+    try:
+        w3 = _get_web3_polygon()
+        ctf = w3.eth.contract(
+            address=Web3.to_checksum_address(_POLY_CTF_ADDRESS),
+            abi=_POLY_CTF_BALANCE_ABI,
+        )
+        raw = int(
+            ctf.functions.balanceOf(Web3.to_checksum_address(funder), tid).call()
+        )
+        return float(raw) / _POLY_OUTCOME_SHARE_SCALE
+    except Exception as _e:
+        print(f"[TRADER][POLY][CTF] balance err token={str(token_id)[:20]}... err={_e}")
+        return None
+
+
+def _poly_head_gen_snapshot() -> int:
+    with _poly_head_cv:
+        return _poly_head_gen
+
+
+def _poly_signal_new_head() -> None:
+    global _poly_head_gen
+    with _poly_head_cv:
+        _poly_head_gen += 1
+        _poly_head_cv.notify_all()
+
+
+def _poly_wait_new_head_or_timeout(prev_gen: int, timeout: float) -> int:
+    """Block up to `timeout` or until a Polygon newHead (eth_subscribe) fires."""
+    if timeout <= 0:
+        return _poly_head_gen_snapshot()
+    with _poly_head_cv:
+        end = time.monotonic() + timeout
+        while _poly_head_gen == prev_gen:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            _poly_head_cv.wait(timeout=remaining)
+        return _poly_head_gen
+
+
+def _polygon_ws_urls_resolved() -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in (os.environ.get("POLYGON_WS_URL", "").strip(),):
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    for part in (os.environ.get("POLYGON_WS_URLS", "") or "").split(","):
+        p = part.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    if out:
+        return out
+    for w in (
+        "wss://polygon-bor.publicnode.com",
+        "wss://polygon.drpc.org",
+    ):
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    for h in _polygon_http_rpcs():
+        h = (h or "").strip()
+        if h.startswith("https://"):
+            cand = "wss://" + h[8:].rstrip("/")
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+        elif h.startswith("http://"):
+            cand = "ws://" + h[7:].rstrip("/")
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+    return out
+
+
+def _polygon_ws_should_run() -> bool:
+    if os.environ.get("POLYGON_WS_ENABLE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        import websocket  # noqa: F401
+    except ImportError:
+        print(
+            "[TRADER][POLYGON_WS] websocket-client not installed — pip install websocket-client"
+        )
+        return False
+    return True
+
+
+def _polygon_ws_newheads_loop() -> None:
+    import json
+
+    try:
+        import websocket
+    except ImportError:
+        return
+    backoff = 1.0
+    while not _poly_ws_stop.is_set():
+        urls = _polygon_ws_urls_resolved()
+        if not urls:
+            time.sleep(30.0)
+            continue
+        connected = False
+        for wurl in urls:
+            if _poly_ws_stop.is_set():
+                break
+            ws = None
+            try:
+                ws = websocket.create_connection(wurl, timeout=20, enable_multithread=True)
+                ws.settimeout(120)
+                ws.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_subscribe",
+                            "params": ["newHeads"],
+                        }
+                    )
+                )
+                sub_raw = ws.recv()
+                sub_msg = json.loads(sub_raw)
+                if sub_msg.get("error") or not sub_msg.get("result"):
+                    raise RuntimeError(sub_msg.get("error") or "no subscription id")
+                print(f"[TRADER][POLYGON_WS] subscribed newHeads url={wurl[:56]}...")
+                backoff = 1.0
+                connected = True
+                while not _poly_ws_stop.is_set():
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if msg.get("method") == "eth_subscription":
+                        _poly_signal_new_head()
+            except Exception as _wse:
+                print(f"[TRADER][POLYGON_WS] session_error url={wurl[:40]}... err={_wse}")
+            finally:
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        if not connected:
+            time.sleep(min(backoff, 45.0))
+            backoff = min(backoff * 1.4, 60.0)
+
+
+def _start_polygon_ws_thread() -> None:
+    global _poly_ws_thread
+    if not _polygon_ws_should_run():
+        print("[TRADER][POLYGON_WS] disabled or unavailable")
+        return
+    if _poly_ws_thread is not None and _poly_ws_thread.is_alive():
+        return
+    _poly_ws_thread = _threading.Thread(
+        target=_polygon_ws_newheads_loop,
+        daemon=True,
+        name="polygon_ws_newheads",
+    )
+    _poly_ws_thread.start()
+    print("[TRADER][POLYGON_WS] background thread started")
+
+
+def _poly_ba_reconcile_shares(
+    token_id: str,
+    funder: str,
+) -> tuple[float, float | None, dict[str, float | None]]:
+    """Polymarket hedge visibility: data-api (REST) + CTF on Polygon. Max = conservative estimate.
+
+    CLOB may be wrong after GTC/cancel; chain CTF and indexer can lag differently — we take max.
+    """
+    funder = (funder or "").strip()
+    d_sh = 0.0
+    d_avg: float | None = None
+    p = _fetch_poly_position(str(token_id), timeout=5.0)
+    if p:
+        d_sh = float(p[0])
+        if len(p) > 1 and float(p[1] or 0) > 0:
+            d_avg = float(p[1])
+    ctf = _poly_ctf_shares_onchain(funder, str(token_id)) if funder else None
+    ctf_f = 0.0 if ctf is None else ctf
+    m = max(d_sh, ctf_f)
+    meta: dict[str, float | None] = {
+        "data_api": d_sh,
+        "polygon_ctf": ctf,
+    }
+    return m, d_avg, meta
 # State for grouping repeated HEDGE FILLED notifications in the same market
 # key: poly token_id  value: (message_id, cumulative_pnl, fill_count, timestamp)
 _BA_FILL_STATE_FILE = Path("/data/ba_fill_state.json")
@@ -5385,6 +5667,104 @@ def opportunity(opp: Opportunity) -> dict:
                 row["timing"]["unhedged_ms"] = (
                     _poly_timing_ba["submit_ts"] - _pred_timing_ba["ack_ts"]
                 ) * 1000.0
+
+            # CLOB may return poly_gtc_not_filled after cancel while the wallet already has CTF
+            # shares (GTC fill vs cancel race). Like Predict (REST + BSC + WS): data-api + Polygon
+            # CTF balance + optional newHead wait, then optional GTC gap top-up.
+            if poly_exec_error_ba is not None and _ba_net_sell_qty > 0.01:
+                _pr_need = float(_ba_net_sell_qty)
+                _pr_lo = max(0.5, 0.95 * _pr_need)
+                _pr_pos: tuple[float, float] | None = None
+                _pr_sh = 0.0
+                _pr_src_latest: dict[str, float | None] = {}
+                for _pr_i in (0, 1):
+                    if _pr_i:
+                        time.sleep(2.0)
+                    _g0 = _poly_head_gen_snapshot()
+                    _pr_m, _pr_davg, _pr_src_latest = _poly_ba_reconcile_shares(
+                        str(poly_leg.token_id), _poly_funder
+                    )
+                    _pr_sh = _pr_m
+                    print(
+                        f"[TRADER][POLY][RECONCILE_CHECK] pass={_pr_i + 1} max_sh={_pr_sh:.4f} "
+                        f"need>={_pr_lo:.4f} data_api={_pr_src_latest.get('data_api')} "
+                        f"polygon_ctf={_pr_src_latest.get('polygon_ctf')}"
+                    )
+                    if _pr_sh >= _pr_lo:
+                        _pav = (
+                            _pr_davg
+                            if _pr_davg and _pr_davg > 0
+                            else float(_ba_limit_price)
+                        )
+                        _pr_pos = (_pr_sh, _pav)
+                        break
+                    _poly_wait_new_head_or_timeout(_g0, 3.0)
+                if _pr_sh < _pr_lo and 0.5 <= _pr_sh < _pr_lo:
+                    _gap = max(0.0, _pr_lo - _pr_sh)
+                    _gap_sh = _math.ceil(_gap * 100) / 100
+                    if _gap_sh >= 0.01:
+                        try:
+                            _g_book = _polymarket_book(str(poly_leg.token_id))
+                            _g_vw = _vwap_and_worst_from_poly_book(_g_book, _gap_sh)
+                            if _g_vw:
+                                _g_vwap, _g_worst = _g_vw
+                                _g_lp = min(0.99, _math.ceil(_g_worst * _ba_lp_mult * 1000) / 1000)
+                                _place_polymarket_limit_buy_exact_shares(
+                                    str(poly_leg.token_id),
+                                    shares=_gap_sh,
+                                    price=_g_lp,
+                                    private_key=_poly_pk,
+                                    funder=_poly_funder,
+                                    signature_type=_poly_sig_type,
+                                    poly_api_key=_poly_api_key,
+                                    poly_secret=_poly_secret,
+                                    poly_passphrase=_poly_passphrase,
+                                    fak_fallback=True,
+                                    gtc_fill_timeout_sec=_ba_gtc_to,
+                                )
+                                time.sleep(1.5)
+                                _pr_m, _pr_davg, _pr_src_latest = _poly_ba_reconcile_shares(
+                                    str(poly_leg.token_id), _poly_funder
+                                )
+                                _pr_sh = _pr_m
+                                if _pr_sh >= _pr_lo:
+                                    _pav = (
+                                        _pr_davg
+                                        if _pr_davg and _pr_davg > 0
+                                        else float(_ba_limit_price)
+                                    )
+                                    _pr_pos = (_pr_sh, _pav)
+                        except Exception as _gap_e:
+                            print(
+                                f"[TRADER][POLY][RECONCILE_GAP] label={opp.label} "
+                                f"gap_sh={_gap_sh:.2f} err={_gap_e}"
+                            )
+                if _pr_sh >= _pr_lo and _pr_pos is not None:
+                    _pavg = float(_pr_pos[1]) if len(_pr_pos) > 1 else float(_ba_limit_price)
+                    _pavg = _pavg if _pavg > 0 else float(_ba_limit_price)
+                    _pmk = _pr_sh * _pavg
+                    print(
+                        f"[TRADER][POLY][POSITION_RECONCILE] CLOB err was {poly_exec_error_ba!s} but "
+                        f"visible sh={_pr_sh:.4f} (need>={_pr_lo:.4f}) — treating Poly leg as filled"
+                    )
+                    poly_exec_error_ba = None
+                    polymarket_result_ba = {
+                        "token_id": str(poly_leg.token_id),
+                        "shares_requested": _ba_final_hedge_qty_gross,
+                        "price": _pavg,
+                        "response": {
+                            "success": True,
+                            "status": "matched",
+                            "takingAmount": str(_pr_sh),
+                            "makingAmount": str(_pmk),
+                            "transactionsHashes": [],
+                        },
+                        "order_type": "POSITION_RECONCILE",
+                        "filled": True,
+                    }
+                    row["polymarket"] = polymarket_result_ba
+                    row["polymarket_position_reconciled"] = True
+                    row["polymarket_reconcile_sources"] = dict(_pr_src_latest)
 
             _ba_poly_resp = (polymarket_result_ba.get("response") or {}) if polymarket_result_ba else {}
             _ba_poly_txhashes = _ba_poly_resp.get("transactionsHashes") or []
