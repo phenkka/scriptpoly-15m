@@ -5,6 +5,7 @@ requests==2.32.3
 httpx==0.27.0
 predict-sdk
 eth-account==0.13.4
-web3==6.20.2
+# web3 6.x requires eth-account<0.13; 7.x allows eth-account 0.13.x (align with eth-account pin below)
+web3==7.10.0
 py-clob-client
 websocket-client>=1.7.0
