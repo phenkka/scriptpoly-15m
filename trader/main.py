@@ -5972,6 +5972,33 @@ def opportunity(opp: Opportunity) -> dict:
                                 _mm_action = "buy_poly"
                     except Exception as _mm_poly_e:
                         print(f"[TRADER][MISMATCH] poly_rebuy failed: {_mm_poly_e}")
+                        # The request may have been received by Polymarket before the timeout
+                        # (classic "sent but response lost"). Re-read actual Poly balance before
+                        # deciding the rebuy failed — avoids selling excess Predict when Poly
+                        # actually executed.
+                        try:
+                            time.sleep(2.5)
+                            _mm_recheck_sh, _, _ = _poly_ba_reconcile_shares(
+                                str(poly_leg.token_id), _poly_funder
+                            )
+                            _mm_expected = _ba_poly_qty_actual + _ba_mismatch_shares
+                            if _mm_recheck_sh >= _mm_expected * 0.95:
+                                _mm_poly_bought = True
+                                _mm_poly_price = _mm_poly_price or _ba_poly_price
+                                _mm_action = "buy_poly"
+                                print(
+                                    f"[TRADER][MISMATCH] rebuy_timeout_but_reconcile_ok "
+                                    f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
+                                    f"— treating rebuy as filled"
+                                )
+                            else:
+                                print(
+                                    f"[TRADER][MISMATCH] rebuy_timeout_reconcile_fail "
+                                    f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
+                                    f"err={_mm_poly_e}"
+                                )
+                        except Exception as _mm_rc_e:
+                            print(f"[TRADER][MISMATCH] rebuy_recheck_failed err={_mm_rc_e}")
 
                     if _mm_poly_bought:
                         _mm_status = f"✅ bought {_ba_mismatch_shares:.3f} shares @ {_mm_poly_price:.2f} on Poly"
