@@ -379,6 +379,11 @@ def _check_arbitrage() -> None:
         _post_opportunity(ba_payload)
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.post("/ingest")
 def ingest(tick: Tick) -> dict[str, str]:
     with _state_lock:

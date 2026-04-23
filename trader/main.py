@@ -4167,6 +4167,12 @@ def _predict_preflight_for_leg(leg: OpportunityLeg) -> dict[str, Any]:
     }
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Liveness for reverse-proxy / monitoring; does not check venue APIs."""
+    return {"status": "ok"}
+
+
 @app.post("/test-predict")
 def test_predict(opp: Opportunity) -> dict:
     """Выполняет только predict.fun ногу, polymarket — пропускается."""

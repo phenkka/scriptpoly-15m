@@ -462,10 +462,24 @@ async def main() -> None:
     dp  = Dispatcher()
     dp.include_router(router)
 
-    # aiohttp для /notify
-    app = web.Application()
-    app["bot"]     = bot
+    @web.middleware
+    async def _catch_mw(request: web.Request, handler: Any) -> Any:
+        try:
+            return await handler(request)
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            log.exception("request_unhandled err=%s", e)
+            return web.json_response({"ok": False, "error": "internal"}, status=500)
+
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "service": "bot"})
+
+    # aiohttp для /notify + GET /health (прокси/мониторинг; снижает шум от мусорных коннектов)
+    app = web.Application(middlewares=[_catch_mw])
+    app["bot"] = bot
     app["chat_id"] = chat_id
+    app.router.add_get("/health", handle_health)
     app.router.add_post("/notify", handle_notify)
 
     runner = web.AppRunner(app)

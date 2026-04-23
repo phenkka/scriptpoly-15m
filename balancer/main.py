@@ -844,17 +844,52 @@ def _save_hourly_last_fired(fkey: tuple[int, int, int, int]) -> None:
     p = _hourly_last_fired_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(
-                {
-                    "fkey": list(fkey),
-                    "saved_at": datetime.now().isoformat(),
-                }
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "fkey": list(fkey),
+                "saved_at": datetime.now().isoformat(),
+            }
         )
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(p)
     except Exception as _e:
         print(f"[BALANCER][WARN] hourly_last_save err={_e}")
+
+
+def _hourly_send_lock_path() -> Path:
+    return Path(
+        os.environ.get("BALANCER_HOURLY_LOCK_FILE", "/data/balancer_hourly_send.lock")
+    )
+
+
+def _hourly_send_lock_acquire() -> Any:
+    """Exclusive flock so only one process (or balancer replica) sends HOURLY STATS per hour."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    p = _hourly_send_lock_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        f = open(p, "a+b")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        return f
+    except Exception as _e:
+        print(f"[BALANCER][WARN] hourly_send_lock_acquire err={_e}")
+        return None
+
+
+def _hourly_send_lock_release(fh: Any) -> None:
+    if fh is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+    except Exception:
+        pass
 
 
 def _local_prev_full_hour_bounds(now: float) -> tuple[float, float, str]:
@@ -1114,13 +1149,10 @@ def main() -> None:
     # ── Hourly stats thread: wake at BALANCER_HOURLY_STATS_MIN (default 0 = top of hour),
     #    fresh RPC + Polymarket data-api + Predict API balances; PnL/trades = previous full local hour
     def _hourly_notify_worker() -> None:
-        # In-memory + disk: avoid duplicate digest if balancer restarts during :00
-        # (new process would otherwise pass _sleep_until_local_minute immediately)
-        _last_fired: tuple[int, int, int, int] | None = _load_hourly_last_fired()
-        if _last_fired:
-            print(
-                f"[BALANCER] hourly_last_fired_from_disk fkey={_last_fired}"
-            )
+        # Disk + flock: two processes/replicas can both pass sleep; only one may send per fkey.
+        _last_disk: tuple[int, int, int, int] | None = _load_hourly_last_fired()
+        if _last_disk:
+            print(f"[BALANCER] hourly_last_fired_from_disk fkey={_last_disk}")
         while True:
             try:
                 try:
@@ -1131,91 +1163,108 @@ def main() -> None:
                     _stats_min = 0
                 _stats_min = max(0, min(59, _stats_min))
                 _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
-                _tm = time.localtime()
-                _fkey = (_tm.tm_year, _tm.tm_yday, _tm.tm_hour, _stats_min)
-                if _fkey == _last_fired:
-                    time.sleep(12.0)
-                    continue
-                _proxy = proxy_url or None
-                _poly_cash, _pred_cash, _poly_port, _pred_port = _fetch_hourly_balance_snapshot(
-                    bsc_rpcs=bsc_rpcs,
-                    polygon_rpcs=polygon_rpcs,
-                    bsc_token=bsc_usdt,
-                    poly_token=polygon_usdce,
-                    pred_wallet=pred_wallet,
-                    poly_wallet=poly_wallet,
-                    poly_funder=poly_funder,
-                    predict_account=predict_account_addr,
-                    pred_pk=pred_pk,
-                    proxy=_proxy,
-                )
-                _poly_total = _poly_cash + _poly_port
-                _pred_total = _pred_cash + _pred_port
-                _total_cash = _poly_cash + _pred_cash
-                _total_with_pos = _poly_total + _pred_total
-                _now = time.time()
-                _since_ts, _until_ts, _prev_hour_label = _local_prev_full_hour_bounds(_now)
-                _h1_pnl, _, _, _ = _hourly_pnl(
-                    since_ts=_since_ts, until_ts=_until_ts
-                )
-                _ok_n, _incidents, _skips = _hourly_trade_details(
-                    since_ts=_since_ts, until_ts=_until_ts
-                )
-                _inc_n = sum(_incidents.values())
-                _skip_n = sum(_skips.values())
-                _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
-                _snap_lbl = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _lock_fh = _hourly_send_lock_acquire()
+                try:
+                    _tm = time.localtime()
+                    _fkey = (_tm.tm_year, _tm.tm_yday, _tm.tm_hour, _stats_min)
+                    _disk_now = _load_hourly_last_fired()
+                    if _fkey == _disk_now:
+                        print(
+                            f"[BALANCER] hourly_notify_skip_duplicate fkey={_fkey} "
+                            f"(flock+dedup, already sent for this local hour slot)"
+                        )
+                        _last_disk = _disk_now
+                        continue
+                    _proxy = proxy_url or None
+                    _poly_cash, _pred_cash, _poly_port, _pred_port = _fetch_hourly_balance_snapshot(
+                        bsc_rpcs=bsc_rpcs,
+                        polygon_rpcs=polygon_rpcs,
+                        bsc_token=bsc_usdt,
+                        poly_token=polygon_usdce,
+                        pred_wallet=pred_wallet,
+                        poly_wallet=poly_wallet,
+                        poly_funder=poly_funder,
+                        predict_account=predict_account_addr,
+                        pred_pk=pred_pk,
+                        proxy=_proxy,
+                    )
+                    _poly_total = _poly_cash + _poly_port
+                    _pred_total = _pred_cash + _pred_port
+                    _total_cash = _poly_cash + _pred_cash
+                    _total_with_pos = _poly_total + _pred_total
+                    _now = time.time()
+                    _since_ts, _until_ts, _prev_hour_label = _local_prev_full_hour_bounds(
+                        _now
+                    )
+                    _h1_pnl, _, _, _ = _hourly_pnl(
+                        since_ts=_since_ts, until_ts=_until_ts
+                    )
+                    _ok_n, _incidents, _skips = _hourly_trade_details(
+                        since_ts=_since_ts, until_ts=_until_ts
+                    )
+                    _inc_n = sum(_incidents.values())
+                    _skip_n = sum(_skips.values())
+                    _pnl_emoji = "📈" if _h1_pnl >= 0 else "📉"
+                    _snap_lbl = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                def _bal_line(name: str, cash: float, total: float) -> str:
-                    pos = total - cash
-                    if pos > 0.01:
-                        return f"{name}: <b>${total:.2f}</b>  <i>(cash ${cash:.2f} + pos ${pos:.2f})</i>\n"
-                    return f"{name}: <b>${cash:.2f}</b>\n"
+                    def _bal_line(name: str, cash: float, total: float) -> str:
+                        pos = total - cash
+                        if pos > 0.01:
+                            return f"{name}: <b>${total:.2f}</b>  <i>(cash ${cash:.2f} + pos ${pos:.2f})</i>\n"
+                        return f"{name}: <b>${cash:.2f}</b>\n"
 
-                _poly_line = _bal_line("Polymarket", _poly_cash, _poly_total)
-                _pred_line = _bal_line("Predict", _pred_cash, _pred_total)
-                _total_line = f"<b>TOTAL: ${_total_with_pos:.2f}</b>"
-                if _total_with_pos > _total_cash + 0.01:
-                    _total_line += f"  <i>(liquid ${_total_cash:.2f})</i>"
-                _total_line += "\n"
-                _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
-                if _incidents:
-                    _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
-                    for _code, _cnt in sorted(_incidents.items(), key=lambda x: -x[1]):
-                        _tlines.append(f"  • {_code}: {_cnt}")
-                else:
-                    _tlines.append("🔴 Incidents: <b>0</b>")
-                if _skips:
-                    _tlines.append(f"⏭ Skipped: <b>{_skip_n}</b>")
-                    for _code, _cnt in sorted(_skips.items(), key=lambda x: -x[1]):
-                        _tlines.append(f"  - {_code}: {_cnt}")
-                else:
-                    _tlines.append("⏭ Skipped: <b>0</b>")
-                _halt_line = "🛑 <b>Trader halted (low balance)</b>\n" if Path("/data/halt").exists() else ""
-                _tz_hint = (time.tzname[0] or "local")
-                _notify(
-                    f"📊 <b>HOURLY STATS</b>\n"
-                    f"<i>Trades &amp; PnL — previous full local hour: <b>{_prev_hour_label}</b> "
-                    f"({_tz_hint}, server time)</i>\n"
-                    f"<i>Balances — on-chain + venue APIs, snapshot: <b>{_snap_lbl}</b> ({_tz_hint})</i>\n"
-                    f"\n"
-                    f"<b>BALANCE</b>\n"
-                    + _poly_line
-                    + _pred_line
-                    + _total_line
-                    + f"\n"
-                    + f"{_pnl_emoji} PnL (that hour): <b>{_h1_pnl:+.2f}$</b>\n"
-                    + f"\n"
-                    + "\n".join(_tlines) + "\n"
-                    + _halt_line
-                )
-                print(
-                    f"[BALANCER] hourly_notify_sent local_hour={_tm.tm_hour} "
-                    f"prev_window={_prev_hour_label} total_with_pos={_total_with_pos:.2f} "
-                    f"snap={_snap_lbl}"
-                )
-                _last_fired = _fkey
-                _save_hourly_last_fired(_fkey)
+                    _poly_line = _bal_line("Polymarket", _poly_cash, _poly_total)
+                    _pred_line = _bal_line("Predict", _pred_cash, _pred_total)
+                    _total_line = f"<b>TOTAL: ${_total_with_pos:.2f}</b>"
+                    if _total_with_pos > _total_cash + 0.01:
+                        _total_line += f"  <i>(liquid ${_total_cash:.2f})</i>"
+                    _total_line += "\n"
+                    _tlines = ["<b>TRADES</b>", f"🟢 Successful: <b>{_ok_n}</b>"]
+                    if _incidents:
+                        _tlines.append(f"🔴 Incidents: <b>{_inc_n}</b>")
+                        for _code, _cnt in sorted(
+                            _incidents.items(), key=lambda x: -x[1]
+                        ):
+                            _tlines.append(f"  • {_code}: {_cnt}")
+                    else:
+                        _tlines.append("🔴 Incidents: <b>0</b>")
+                    if _skips:
+                        _tlines.append(f"⏭ Skipped: <b>{_skip_n}</b>")
+                        for _code, _cnt in sorted(_skips.items(), key=lambda x: -x[1]):
+                            _tlines.append(f"  - {_code}: {_cnt}")
+                    else:
+                        _tlines.append("⏭ Skipped: <b>0</b>")
+                    _halt_line = (
+                        "🛑 <b>Trader halted (low balance)</b>\n"
+                        if Path("/data/halt").exists()
+                        else ""
+                    )
+                    _tz_hint = (time.tzname[0] or "local")
+                    _notify(
+                        f"📊 <b>HOURLY STATS</b>\n"
+                        f"<i>Trades &amp; PnL — previous full local hour: <b>{_prev_hour_label}</b> "
+                        f"({_tz_hint}, server time)</i>\n"
+                        f"<i>Balances — on-chain + venue APIs, snapshot: <b>{_snap_lbl}</b> ({_tz_hint})</i>\n"
+                        f"\n"
+                        f"<b>BALANCE</b>\n"
+                        + _poly_line
+                        + _pred_line
+                        + _total_line
+                        + f"\n"
+                        + f"{_pnl_emoji} PnL (that hour): <b>{_h1_pnl:+.2f}$</b>\n"
+                        + f"\n"
+                        + "\n".join(_tlines) + "\n"
+                        + _halt_line
+                    )
+                    print(
+                        f"[BALANCER] hourly_notify_sent local_hour={_tm.tm_hour} "
+                        f"prev_window={_prev_hour_label} total_with_pos={_total_with_pos:.2f} "
+                        f"snap={_snap_lbl}"
+                    )
+                    _save_hourly_last_fired(_fkey)
+                    _last_disk = _fkey
+                finally:
+                    _hourly_send_lock_release(_lock_fh)
             except Exception as _e:
                 print(f"[BALANCER][WARN] hourly_notify_failed err={_e}")
             time.sleep(12.0)
