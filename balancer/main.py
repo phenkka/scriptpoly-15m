@@ -1163,6 +1163,15 @@ def main() -> None:
                     _stats_min = 0
                 _stats_min = max(0, min(59, _stats_min))
                 _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
+                # Fast in-memory check — avoids flock acquisition when we already sent
+                # this hour slot (covers tight-loop case where continue skips time.sleep).
+                _tm_pre = time.localtime()
+                _fkey_pre = (_tm_pre.tm_year, _tm_pre.tm_yday, _tm_pre.tm_hour, _stats_min)
+                if _fkey_pre == _last_disk:
+                    # Already sent this slot — sleep until we're well into the next minute
+                    # so _sleep_until_local_minute won't return again for the same slot.
+                    time.sleep(65.0)
+                    continue
                 _lock_fh = _hourly_send_lock_acquire()
                 try:
                     _tm = time.localtime()
@@ -1174,6 +1183,7 @@ def main() -> None:
                             f"(flock+dedup, already sent for this local hour slot)"
                         )
                         _last_disk = _disk_now
+                        time.sleep(65.0)  # avoid tight loop: sleep past the current minute
                         continue
                     _proxy = proxy_url or None
                     _poly_cash, _pred_cash, _poly_port, _pred_port = _fetch_hourly_balance_snapshot(

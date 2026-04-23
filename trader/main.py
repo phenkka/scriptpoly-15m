@@ -340,6 +340,10 @@ def _startup_warmup() -> None:
     def _api_health_watchdog() -> None:
         _was_down = _halt_api_path.exists()
         _down_reason = ""
+        # Debounce: require this many consecutive failures before declaring DOWN.
+        # A single SSL handshake timeout (transient VPN hiccup) will not trigger an alert.
+        _FAIL_THRESHOLD = int(os.environ.get("API_DOWN_FAIL_THRESHOLD", "2") or "2")
+        _fail_streak = 0
         while True:
             time.sleep(_api_check_interval)
             _predict_ok = False
@@ -363,11 +367,23 @@ def _startup_warmup() -> None:
                 print(f"[TRADER][API_WATCHDOG] poly_health_failed err={_e2}")
 
             _all_ok = _predict_ok and _poly_ok
-            if not _all_ok and not _was_down:
+            if not _all_ok:
+                _fail_streak += 1
+                print(
+                    f"[TRADER][API_WATCHDOG] fail_streak={_fail_streak}/{_FAIL_THRESHOLD} "
+                    f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
+                )
+            else:
+                _fail_streak = 0
+
+            if not _all_ok and _fail_streak >= _FAIL_THRESHOLD and not _was_down:
                 _was_down = True
                 _down_reason = _reason or f"predict_ok={_predict_ok} poly_ok={_poly_ok}"
                 _halt_api_path.write_text(_down_reason)
-                print(f"[TRADER][API_WATCHDOG] API DOWN — halt_api created reason={_down_reason}")
+                print(
+                    f"[TRADER][API_WATCHDOG] API DOWN after {_fail_streak} consecutive failures"
+                    f" — halt_api created reason={_down_reason}"
+                )
                 notify("🔴 <b>API DOWN</b>\n")
             elif _all_ok and _was_down:
                 _was_down = False
@@ -494,7 +510,8 @@ def _bsc_get_order_status(
                 return (ctf[0], ctf[1], "CTF")
             if neg:
                 return (neg[0], neg[1], "NEG_RISK")
-            break
+            # Both ctf and neg are None — this RPC failed entirely; try the next one.
+            continue
     except Exception as _e:
         print(f"[TRADER][BSC_CHECK] err={_e}")
     return None
@@ -5705,7 +5722,7 @@ def opportunity(opp: Opportunity) -> dict:
                         _pr_pos = (_pr_sh, _pav)
                         break
                     _poly_wait_new_head_or_timeout(_g0, 3.0)
-                if _pr_sh < _pr_lo and 0.5 <= _pr_sh < _pr_lo:
+                if _pr_sh < _pr_lo:
                     _gap = max(0.0, _pr_lo - _pr_sh)
                     _gap_sh = _math.ceil(_gap * 100) / 100
                     if _gap_sh >= 0.01:
