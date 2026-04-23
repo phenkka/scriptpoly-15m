@@ -1149,10 +1149,15 @@ def main() -> None:
     # ── Hourly stats thread: wake at BALANCER_HOURLY_STATS_MIN (default 0 = top of hour),
     #    fresh RPC + Polymarket data-api + Predict API balances; PnL/trades = previous full local hour
     def _hourly_notify_worker() -> None:
-        # Disk + flock: two processes/replicas can both pass sleep; only one may send per fkey.
-        _last_disk: tuple[int, int, int, int] | None = _load_hourly_last_fired()
-        if _last_disk:
-            print(f"[BALANCER] hourly_last_fired_from_disk fkey={_last_disk}")
+        # Disk fkey is loaded only to show in logs and for flock-based multi-replica dedup
+        # (see inside the flock below). It must NOT be used as in-process skip guard —
+        # after a restart the process hasn't sent anything yet, so we must always attempt
+        # to fire even if a previous run's fkey matches the current slot.
+        _last_disk_at_start = _load_hourly_last_fired()
+        if _last_disk_at_start:
+            print(f"[BALANCER] hourly_last_fired_from_disk fkey={_last_disk_at_start}")
+        # Track only what THIS session has successfully sent.
+        _last_sent_this_session: tuple[int, int, int, int] | None = None
         while True:
             try:
                 try:
@@ -1163,17 +1168,12 @@ def main() -> None:
                     _stats_min = 0
                 _stats_min = max(0, min(59, _stats_min))
                 _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
-                # Fast in-memory check — avoids flock acquisition when we already sent
-                # this hour slot (covers tight-loop case where continue skips time.sleep).
-                # IMPORTANT: fkey is based on the REPORTED window's start hour, not the
-                # current local hour.  This prevents double-send when the balance fetch
-                # crosses the hour boundary (e.g. _tm captured at 12:59, fetch takes 33s
-                # → snap shows 13:00, second loop wakes at 13:00 minute-0 and would fire
-                # again because current_hour=13 ≠ saved_hour=12).
+                # Fast in-memory check — only skip if WE already sent in this process
+                # session.  A fresh restart always falls through to attempt the send.
                 _since_pre, _, _ = _local_prev_full_hour_bounds(time.time())
                 _slot_pre = time.localtime(int(_since_pre))
                 _fkey_pre = (_slot_pre.tm_year, _slot_pre.tm_yday, _slot_pre.tm_hour, _stats_min)
-                if _fkey_pre == _last_disk:
+                if _fkey_pre == _last_sent_this_session:
                     # Already sent this slot — sleep until we're well into the next minute
                     # so _sleep_until_local_minute won't return again for the same slot.
                     time.sleep(65.0)
@@ -1190,7 +1190,7 @@ def main() -> None:
                             f"[BALANCER] hourly_notify_skip_duplicate fkey={_fkey} "
                             f"(flock+dedup, already sent for this local hour slot)"
                         )
-                        _last_disk = _disk_now
+                        _last_sent_this_session = _fkey
                         time.sleep(65.0)  # avoid tight loop: sleep past the current minute
                         continue
                     _proxy = proxy_url or None
@@ -1280,7 +1280,7 @@ def main() -> None:
                         f"snap={_snap_lbl}"
                     )
                     _save_hourly_last_fired(_fkey)
-                    _last_disk = _fkey
+                    _last_sent_this_session = _fkey
                 finally:
                     _hourly_send_lock_release(_lock_fh)
             except Exception as _e:
