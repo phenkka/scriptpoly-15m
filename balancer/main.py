@@ -1165,8 +1165,14 @@ def main() -> None:
                 _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
                 # Fast in-memory check — avoids flock acquisition when we already sent
                 # this hour slot (covers tight-loop case where continue skips time.sleep).
-                _tm_pre = time.localtime()
-                _fkey_pre = (_tm_pre.tm_year, _tm_pre.tm_yday, _tm_pre.tm_hour, _stats_min)
+                # IMPORTANT: fkey is based on the REPORTED window's start hour, not the
+                # current local hour.  This prevents double-send when the balance fetch
+                # crosses the hour boundary (e.g. _tm captured at 12:59, fetch takes 33s
+                # → snap shows 13:00, second loop wakes at 13:00 minute-0 and would fire
+                # again because current_hour=13 ≠ saved_hour=12).
+                _since_pre, _, _ = _local_prev_full_hour_bounds(time.time())
+                _slot_pre = time.localtime(int(_since_pre))
+                _fkey_pre = (_slot_pre.tm_year, _slot_pre.tm_yday, _slot_pre.tm_hour, _stats_min)
                 if _fkey_pre == _last_disk:
                     # Already sent this slot — sleep until we're well into the next minute
                     # so _sleep_until_local_minute won't return again for the same slot.
@@ -1175,7 +1181,9 @@ def main() -> None:
                 _lock_fh = _hourly_send_lock_acquire()
                 try:
                     _tm = time.localtime()
-                    _fkey = (_tm.tm_year, _tm.tm_yday, _tm.tm_hour, _stats_min)
+                    _since_slot, _, _ = _local_prev_full_hour_bounds(time.time())
+                    _slot_tm = time.localtime(int(_since_slot))
+                    _fkey = (_slot_tm.tm_year, _slot_tm.tm_yday, _slot_tm.tm_hour, _stats_min)
                     _disk_now = _load_hourly_last_fired()
                     if _fkey == _disk_now:
                         print(

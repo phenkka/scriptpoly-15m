@@ -1904,7 +1904,10 @@ def _predict_cancel_all_open_orders(session: requests.Session) -> int:
 
 
 def _polymarket_book(token_id: str) -> dict[str, Any]:
-    r = requests.get("https://clob.polymarket.com/book", params={"token_id": token_id}, timeout=5)
+    _req_kw: dict[str, Any] = {"params": {"token_id": token_id}, "timeout": 5}
+    if _proxy_url:
+        _req_kw["proxies"] = {"http": _proxy_url, "https": _proxy_url}
+    r = requests.get("https://clob.polymarket.com/book", **_req_kw)
     if not r.ok:
         raise RuntimeError(f"polymarket_book_http_{r.status_code}: {r.text[:500]}")
     j = r.json()
@@ -3951,7 +3954,38 @@ def _place_predict_limit_sell(
             print(f"[TRADER]{_trace} predict_limit_sell re-place err={_rep_e} — stop")
             break
 
-    # Cancel remainder if still open
+    # Cancel remainder if still open — but first check BSC for full or partial fill.
+    # A 400 on re-place often means the order was partially/fully matched while we were
+    # trying to replace it, locking shares and causing the subsequent index-wait to see 0.
+    if _active_order_hash and not filled and filled_wei == 0:
+        try:
+            _post_st = _bsc_get_order_status(_active_order_hash)
+            if _post_st is not None:
+                _post_isfc, _post_rem, _post_cname = _post_st
+                if _post_isfc and _post_rem == 0:
+                    # Order fully filled on-chain — do NOT cancel, record full fill.
+                    filled = True
+                    filled_wei = int(sell_qty * 10**18)
+                    print(
+                        f"[TRADER]{_trace} predict_limit_sell post_loop_bsc_full_fill "
+                        f"hash={_active_order_hash} price={current_price:.4f} qty={sell_qty:.4f}"
+                    )
+                    _active_order_id = None  # nothing to cancel
+                elif _post_rem > 0:
+                    # Partially filled — for a SELL order, remaining is unfilled maker
+                    # amount (shares wei). filled_shares = sell_qty - remaining_shares.
+                    _post_filled_shares = sell_qty - (_post_rem / 10**18)
+                    if _post_filled_shares > 0.005:
+                        filled_wei = int(_post_filled_shares * 10**18)
+                        print(
+                            f"[TRADER]{_trace} predict_limit_sell post_loop_bsc_partial_fill "
+                            f"hash={_active_order_hash} price={current_price:.4f} "
+                            f"filled={_post_filled_shares:.4f} remaining={_post_rem / 10**18:.4f}"
+                        )
+                        # _active_order_id still set → will be cancelled below to free remaining shares
+        except Exception as _post_e:
+            print(f"[TRADER]{_trace} predict_limit_sell post_loop_bsc_check err={_post_e}")
+
     if _active_order_id:
         try:
             _predict_remove_orders(session, [_active_order_id])
