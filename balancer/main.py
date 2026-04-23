@@ -819,6 +819,44 @@ def _json_ts_to_unix(raw: object) -> float | None:
         return None
 
 
+def _hourly_last_fired_path() -> Path:
+    return Path(
+        os.environ.get("BALANCER_HOURLY_LAST_FILE", "/data/balancer_hourly_last.json")
+    )
+
+
+def _load_hourly_last_fired() -> tuple[int, int, int, int] | None:
+    """Persisted (year, yday, hour, stats_min) of last successful HOURLY STATS — survives restarts."""
+    p = _hourly_last_fired_path()
+    try:
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        fk = d.get("fkey")
+        if isinstance(fk, list) and len(fk) == 4:
+            return (int(fk[0]), int(fk[1]), int(fk[2]), int(fk[3]))
+    except Exception as _e:
+        print(f"[BALANCER][WARN] hourly_last_load err={_e}")
+    return None
+
+
+def _save_hourly_last_fired(fkey: tuple[int, int, int, int]) -> None:
+    p = _hourly_last_fired_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {
+                    "fkey": list(fkey),
+                    "saved_at": datetime.now().isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception as _e:
+        print(f"[BALANCER][WARN] hourly_last_save err={_e}")
+
+
 def _local_prev_full_hour_bounds(now: float) -> tuple[float, float, str]:
     """Previous full local calendar hour [start, end), end exclusive, as Unix times + short label.
 
@@ -1076,7 +1114,13 @@ def main() -> None:
     # ── Hourly stats thread: wake at BALANCER_HOURLY_STATS_MIN (default 0 = top of hour),
     #    fresh RPC + Polymarket data-api + Predict API balances; PnL/trades = previous full local hour
     def _hourly_notify_worker() -> None:
-        _last_fired: tuple[int, int, int, int] | None = None
+        # In-memory + disk: avoid duplicate digest if balancer restarts during :00
+        # (new process would otherwise pass _sleep_until_local_minute immediately)
+        _last_fired: tuple[int, int, int, int] | None = _load_hourly_last_fired()
+        if _last_fired:
+            print(
+                f"[BALANCER] hourly_last_fired_from_disk fkey={_last_fired}"
+            )
         while True:
             try:
                 try:
@@ -1171,6 +1215,7 @@ def main() -> None:
                     f"snap={_snap_lbl}"
                 )
                 _last_fired = _fkey
+                _save_hourly_last_fired(_fkey)
             except Exception as _e:
                 print(f"[BALANCER][WARN] hourly_notify_failed err={_e}")
             time.sleep(12.0)
