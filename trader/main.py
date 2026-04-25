@@ -1182,11 +1182,14 @@ def _late_watch_save(
     *,
     maker_amount: int | None = None,
     taker_amount: int | None = None,
+    pre_balance: float | None = None,
 ) -> None:
     """Register a cancelled Predict order for background late-fill monitoring.
 
     maker_amount / taker_amount (wei) enable BSC partial-fill → taker hedge sizing
     (CTF stores remaining in *maker* units).
+    pre_balance: token balance snapshot before order was placed — used for delta-based
+    unhedged detection on expiry when BSC shows empty (off-chain Predict fills).
     """
     try:
         with _late_watch_file_lock:
@@ -1207,6 +1210,8 @@ def _late_watch_save(
                 row["makerAmount"] = int(maker_amount)
             if taker_amount is not None and taker_amount > 0:
                 row["takerAmount"] = int(taker_amount)
+            if pre_balance is not None and pre_balance >= 0:
+                row["pre_balance"] = round(float(pre_balance), 6)
             data[order_hash] = row
             _LATE_WATCH_FILE.write_text(json.dumps(data))
     except Exception as _e:
@@ -1421,12 +1426,54 @@ def _late_fill_watcher() -> None:
                             hedge_st=_hedge_st,
                         )
                     else:
-                        print(
-                            f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
-                            f"hash={oh[:14]}... market_id={mkt_id} "
-                            f"shares={entry.get('shares', '?')} age={age:.0f}s"
-                        )
-                        # No notify — BSC empty = clean cancel, position not open
+                        # BSC empty — check balance delta vs pre-order snapshot.
+                        # Off-chain Predict fills don't appear in BSC but show in /v1/positions.
+                        # pre_balance is the snapshot taken before order placement.
+                        _saved_pre_bal = entry.get("pre_balance")
+                        if _saved_pre_bal is not None and str(mkt_id).isdigit():
+                            try:
+                                _tid_entry = entry.get("token_id") or None
+                                _cur_bal = _predict_max_shares_for_market(
+                                    session, int(mkt_id),
+                                    token_id=str(_tid_entry) if _tid_entry else None,
+                                )
+                                _bal_delta = max(0.0, _cur_bal - float(_saved_pre_bal))
+                                if _bal_delta >= 0.005:
+                                    notify(
+                                        f"⚠️ <b>[ТЕСТ] Возможная незахеджированная позиция</b>\n"
+                                        f"\nMarket: <code>{mkt_id}</code>\n"
+                                        f"Order: <code>{oh[:20]}…</code>\n"
+                                        f"Баланс до ордера: {float(_saved_pre_bal):.4f}\n"
+                                        f"Баланс сейчас: {_cur_bal:.4f}\n"
+                                        f"Дельта: <b>{_bal_delta:.4f}</b> шейров\n"
+                                        f"\n<i>Авто-хедж не выполнен (тестовый режим)</i>"
+                                    )
+                                    print(
+                                        f"[TRADER][LATE_WATCH] ⚠️ TEST_UNHEDGED_DELTA "
+                                        f"hash={oh[:14]}... market_id={mkt_id} "
+                                        f"pre={float(_saved_pre_bal):.4f} cur={_cur_bal:.4f} "
+                                        f"delta={_bal_delta:.4f}"
+                                    )
+                                else:
+                                    print(
+                                        f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
+                                        f"hash={oh[:14]}... market_id={mkt_id} "
+                                        f"pre={float(_saved_pre_bal):.4f} cur={_cur_bal:.4f} "
+                                        f"delta={_bal_delta:.4f} age={age:.0f}s"
+                                    )
+                            except Exception as _bd_e:
+                                print(f"[TRADER][LATE_WATCH] balance_delta_err hash={oh[:14]} err={_bd_e}")
+                                print(
+                                    f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
+                                    f"hash={oh[:14]}... market_id={mkt_id} "
+                                    f"shares={entry.get('shares', '?')} age={age:.0f}s"
+                                )
+                        else:
+                            print(
+                                f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
+                                f"hash={oh[:14]}... market_id={mkt_id} "
+                                f"shares={entry.get('shares', '?')} age={age:.0f}s"
+                            )
                     to_remove.append(oh)
                     continue
                 try:
@@ -1781,8 +1828,9 @@ def _parse_predict_position_amount_shares(pos: dict[str, Any]) -> float:
         return 0.0
 
 
-def _predict_max_shares_for_market(session: requests.Session | None, market_id: int) -> float:
-    """Largest position size on this market (any outcome) — fallback when token match fails."""
+def _predict_max_shares_for_market(session: requests.Session | None, market_id: int, token_id: str | None = None) -> float:
+    """Largest position size on this market (any outcome) — fallback when token match fails.
+    If token_id is set, only the matching outcome row is counted."""
     if session is None:
         session = _predict_monitor.get()
     best = 0.0
@@ -1800,6 +1848,10 @@ def _predict_max_shares_for_market(session: requests.Session | None, market_id: 
             mkt = pos.get("market") or {}
             if str(mkt.get("id")) != str(market_id):
                 continue
+            if token_id:
+                row_tid = _predict_position_row_token_id(pos)
+                if row_tid and row_tid.lower() != str(token_id).lower():
+                    continue
             sh = _parse_predict_position_amount_shares(pos)
             if sh > best:
                 best = sh
@@ -3149,6 +3201,13 @@ def _place_predict_limit_buy(
             f"max_bid={max_bid:.4f} (no live bids on Predict)"
         )
 
+    # Snapshot balance before placing order — used in late_watch for delta-based unhedged detection.
+    _pre_pos_bal = 0.0
+    try:
+        _pre_pos_bal = _predict_max_shares_for_market(session, int(leg.market_id), token_id=str(token_id) if token_id else None)
+    except Exception:
+        pass
+
     out, payload = _build_and_post(current_bid_price)
     create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
     order_id = str(create_data.get("orderId") or "").strip() or None
@@ -3645,6 +3704,7 @@ def _place_predict_limit_buy(
         "partial_fills": partial_fills,
         "total_filled_wei": total_filled_wei,
         "total_filled_shares": total_filled_wei / 10**18 if total_filled_wei > 0 else 0.0,
+        "pre_pos_bal": _pre_pos_bal,
         "quote_meta": {
             "quote_age_ms": round((time.time() - quote_post_ts) * 1000.0, 1),
             "quote_total_age_ms": round(quote_total_age_ms, 1),
@@ -4837,6 +4897,7 @@ def opportunity(opp: Opportunity) -> dict:
                     _ba_pred_resp.get("create") if isinstance(_ba_pred_resp.get("create"), dict) else None
                 )
                 _ba_mk, _ba_tk = _ba_mktk if _ba_mktk else (None, None)
+                _ba_pre_pos_bal = float(_ba_pred_resp.get("pre_pos_bal") or 0.0)
                 if pred_hash_ba and _ba_cancel_rsn and pred_leg.market_id is not None:
                     _late_watch_save(
                         str(pred_hash_ba),
@@ -4845,6 +4906,7 @@ def opportunity(opp: Opportunity) -> dict:
                         float(opp.shares),
                         maker_amount=_ba_mk,
                         taker_amount=_ba_tk,
+                        pre_balance=_ba_pre_pos_bal,
                     )
                     print(f"[TRADER]{_t} late_watch_registered hash={str(pred_hash_ba)[:14]}... cancel_reason={_ba_cancel_rsn}")
                     # Also register every hash that was replaced during the order lifetime.
