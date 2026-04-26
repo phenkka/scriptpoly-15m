@@ -3044,9 +3044,10 @@ def _place_predict_limit_buy(
     hard_max_queue_usd = float(os.environ.get("PREDICT_HARD_MAX_QUEUE_USD", "30.0") or "30.0")
 
     # max_bid: highest bid price where net_edge > 0 after all fees
-    # poly fee = feeRate * p * (1-p); using analyzer's poly_hedge_ask as p
+    # poly fee formula (from ctf-exchange docs): feeRate * min(p, 1-p) * shares
+    # per-share: feeRate * min(p, 1-p)
     _fee_mult = 1.0 + predict_fee_bps / 10_000
-    _poly_dynamic_fee = poly_fee_rate * poly_hedge_ask * (1.0 - poly_hedge_ask)
+    _poly_dynamic_fee = poly_fee_rate * min(poly_hedge_ask, 1.0 - poly_hedge_ask)
     max_bid_by_edge = (1.0 - poly_hedge_ask - _poly_dynamic_fee - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
     _predict_max_bid_price = float(os.environ.get("PREDICT_MAX_BID_PRICE", "0.99") or "0.99")
     max_bid = min(max_bid_by_edge, _predict_max_bid_price)
