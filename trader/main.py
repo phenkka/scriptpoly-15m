@@ -3877,6 +3877,24 @@ def _place_predict_limit_sell(
     _active_order_id = order_id
     _active_order_hash = order_hash
 
+    # ── Off-chain sell double-fill guard ──────────────────────────────────
+    # Predict matches SELL orders off-chain. BSC confirms in batches (~30-90s
+    # after match). The existing hash-based BSC guard (_bsc_check_order_filled)
+    # returns 0 during the batch-pending window → the ladder replaces the already-
+    # matched order → both the old and the new order execute → double sell.
+    # Fix: snapshot the REST balance before selling; re-check before each replace.
+    # If balance dropped by ≥ expected amount, the fill went through off-chain → stop.
+    _pre_sell_balance: float = 0.0
+    try:
+        if leg.market_id is not None:
+            _pre_sell_balance = _predict_max_shares_for_market(
+                session, int(leg.market_id),
+                token_id=str(token_id) if token_id else None,
+            )
+    except Exception:
+        pass
+    # ─────────────────────────────────────────────────────────────────────
+
     while _active_order_hash and time.time() < t_deadline:
         t_replace = time.time() + replace_interval_sec
         # Poll until filled or replace-interval elapsed
@@ -3902,6 +3920,31 @@ def _place_predict_limit_sell(
             break
 
         # Cancel current order and re-place one tick lower.
+        # ── Balance guard: detect off-chain sell fills before BSC confirms (batch lag ~30-90s) ──
+        # Check REST /positions: if balance dropped by ≥ expected qty the off-chain engine
+        # already matched the order. Replacing would create a double-sell.
+        if _pre_sell_balance > 0 and leg.market_id is not None:
+            try:
+                _cur_bal = _predict_max_shares_for_market(
+                    session, int(leg.market_id),
+                    token_id=str(token_id) if token_id else None,
+                )
+                _filled_so_far_bal = filled_wei / 10**18 if filled_wei > 0 else 0.0
+                _expected_remaining_bal = _pre_sell_balance - _filled_so_far_bal
+                _sold_offchain = _pre_sell_balance - _cur_bal - _filled_so_far_bal
+                if _sold_offchain >= sell_qty * 0.80:  # 80% threshold to allow rounding
+                    filled = True
+                    if filled_wei == 0:
+                        filled_wei = int(sell_qty * 10**18)
+                    print(
+                        f"[TRADER]{_trace} sell_balance_guard_offchain_fill "
+                        f"pre_bal={_pre_sell_balance:.4f} cur_bal={_cur_bal:.4f} "
+                        f"sold_offchain={_sold_offchain:.4f} sell_qty={sell_qty:.4f} — skipping replace"
+                    )
+                    break
+            except Exception:
+                pass
+
         # ── BSC pre-replace guard: if the order already filled on-chain (API lag), do NOT replace. ──
         # BSC block = 3s; replace_interval_sec = 3s → fills happen before API indexes them.
         # Without this check, the cancelled (ignored) filled order + new replacement BOTH execute,
