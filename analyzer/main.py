@@ -363,6 +363,8 @@ def _check_arbitrage() -> None:
                     "token_id": ba_pred_token_id,
                     "market_id": t_pred.meta.market_id if t_pred.meta else None,
                     "title": t_pred.meta.title if t_pred.meta else None,
+                    "pred_best_bid": float(_side_obj(t_pred, side_pred).bid) if _side_obj(t_pred, side_pred).bid is not None else None,
+                    "pred_best_bid_sz": float(_side_obj(t_pred, side_pred).bid_sz),
                 },
             ],
             "sent_at": datetime.utcnow().isoformat() + "Z",

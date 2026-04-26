@@ -209,6 +209,8 @@ class OpportunityLeg(BaseModel):
     token_id: str | None = None
     market_id: int | None = None
     title: str | None = None
+    pred_best_bid: float | None = None
+    pred_best_bid_sz: float = 0.0
 
 
 class Opportunity(BaseModel):
@@ -3094,10 +3096,12 @@ def _place_predict_limit_buy(
         q_meta["decision"] = "join"
         return best_bid, q_meta
 
-    # Fetch live orderbook for queue-aware initial pricing
+    # Use Analyzer's cached Predict book data (polled every ~0.1s) instead of a live request.
+    # Saves ~270ms before POST /orders. Outbid-loop still uses live _check_predict_best_bid().
     analyzer_bid = float(leg.ask)  # analyzer's recommended bid = pred_bid_top
-    live_best_bid, live_best_bid_sz, live_best_ask = _check_predict_book()
-    queue_pricing_meta: dict[str, Any] = {"analyzer_bid": analyzer_bid}
+    live_best_bid = leg.pred_best_bid
+    live_best_bid_sz = leg.pred_best_bid_sz if leg.pred_best_bid is not None else 0.0
+    queue_pricing_meta: dict[str, Any] = {"analyzer_bid": analyzer_bid, "source": "analyzer_cached"}
 
     if live_best_bid is not None and live_best_bid > 0:
         chosen_price, q_meta = _queue_price(live_best_bid, live_best_bid_sz)
@@ -4654,111 +4658,108 @@ def opportunity(opp: Opportunity) -> dict:
             return {"status": "skipped", "reason": "poly_min_order_usd_static"}
 
         # ────────────────────────────────────────────────────
-        # LIVE POLY NET-EDGE CHECK — перед тем как коммитить
-        # predict-капитал, проверяем что live net-edge > 0.
+        # LIVE POLY NET-EDGE CHECK — отключён: poly book пулится
+        # коллектором каждые ~0.1с, live-запрос только замедляет
+        # размещение ордера на Predict (~100–200ms лишних).
+        # Проверки net-edge и hedge-price работают на данных из Analyzer.
         # ────────────────────────────────────────────────────
-        _pre_fee_rate = float(opp.poly_fee_rate or 0.072)
-        _pre_pred_fee_bps = float(opp.predict_fee_bps or 0)
-        _pre_safety_bps = float(opp.safety_buffer_bps or 0)
-        try:
-            live_book = _polymarket_book(str(poly_leg.token_id))
-            _vwap_worst_pre = _vwap_and_worst_from_poly_book(live_book, float(opp.shares))
-            if _vwap_worst_pre is None:
-                # Poly book doesn't have enough depth for the full qty — skip before Predict
-                _poly_min_pre2 = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
-                row["skipped"] = True
-                row["skip_reason"] = {"code": "poly_insufficient_depth", "shares": float(opp.shares)}
-                row["summary"]["status"] = "skipped"
-                row["summary"]["reason_code"] = "poly_insufficient_depth"
-                row["summary"]["reason"] = row["skip_reason"]
-                print(f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_insufficient_depth shares={opp.shares:.4f}")
-                if _market_id_int is not None:
-                    with _predict_market_in_flight_lock:
-                        _predict_market_in_flight.discard(_market_id_int)
-                _append_jsonl(trades_file, row)
-                return {"status": "skipped", "reason": "poly_insufficient_depth"}
-            _live_vwap_pre = _vwap_worst_pre[0]
-            if _live_vwap_pre is not None:
-                _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
-                _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
-                _poly_eff_pre = _live_vwap_pre + _live_fee_pre
-                _live_net_edge_pre = 1.0 - _pred_eff_pre - _poly_eff_pre - _pre_safety_bps / 10_000
-                row["live_poly_precheck"] = {
-                    "stale_poly_ask": float(poly_leg.ask),
-                    "live_poly_vwap": round(_live_vwap_pre, 6),
-                    "live_poly_fee": round(_live_fee_pre, 6),
-                    "pred_ask": float(pred_leg.ask),
-                    "live_net_edge": round(_live_net_edge_pre, 6),
-                    "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
-                }
-                print(
-                    f"[TRADER]{_t} poly_live_precheck "
-                    f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
-                    f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
-                    f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
-                )
-                if _live_net_edge_pre <= 0:
-                    row["skipped"] = True
-                    row["skip_reason"] = {
-                        "code": "poly_live_no_edge",
-                        "stale_poly_ask": float(poly_leg.ask),
-                        "live_poly_vwap": round(_live_vwap_pre, 6),
-                        "live_net_edge": round(_live_net_edge_pre, 6),
-                    }
-                    row["summary"]["status"] = "skipped"
-                    row["summary"]["reason_code"] = "poly_live_no_edge"
-                    row["summary"]["reason"] = row["skip_reason"]
-                    print(
-                        f"[TRADER]{_t}[SKIP] "
-                        f"label={opp.label} reason=poly_live_no_edge "
-                        f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
-                    )
-                    _append_jsonl(trades_file, row)
-                    return {"status": "skipped", "reason": "poly_live_no_edge"}
-                # Hard cap: poly VWAP exceeds POLY_MAX_HEDGE_PRICE
-                _pre_poly_max_hedge = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
-                if _live_vwap_pre >= _pre_poly_max_hedge:
-                    row["skipped"] = True
-                    row["skip_reason"] = {
-                        "code": "poly_live_hedge_price_cap",
-                        "live_poly_vwap": round(_live_vwap_pre, 6),
-                        "poly_max_hedge_price": _pre_poly_max_hedge,
-                    }
-                    row["summary"]["status"] = "skipped"
-                    row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
-                    row["summary"]["reason"] = row["skip_reason"]
-                    print(
-                        f"[TRADER]{_t}[SKIP] "
-                        f"label={opp.label} reason=poly_live_hedge_price_cap "
-                        f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
-                    )
-                    _append_jsonl(trades_file, row)
-                    return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
-                # Guard: ensure full fill hedge cost >= poly min order ($1).
-                # Partial fills (≥1 share but < full qty) may produce a hedge amount below
-                # Poly's $1 min. We check at full qty; partial fills are handled post-fill.
-                _poly_min_pre = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
-                _hedge_cost_full = float(opp.shares) * _live_vwap_pre
-                if _hedge_cost_full < _poly_min_pre:
-                    row["skipped"] = True
-                    row["skip_reason"] = {
-                        "code": "poly_min_order_usd",
-                        "live_poly_vwap": round(_live_vwap_pre, 6),
-                        "hedge_cost_usd": round(_hedge_cost_full, 4),
-                        "poly_min_order_usd": _poly_min_pre,
-                    }
-                    row["summary"]["status"] = "skipped"
-                    row["summary"]["reason_code"] = "poly_min_order_usd"
-                    row["summary"]["reason"] = row["skip_reason"]
-                    print(
-                        "[TRADER][SKIP] "
-                        f"label={opp.label} reason=poly_min_order_usd "
-                        f"hedge_cost=${_hedge_cost_full:.2f} min=${_poly_min_pre}"
-                    )
-                    _append_jsonl(trades_file, row)
-                    return {"status": "skipped", "reason": "poly_min_order_usd"}
-        except Exception as _e_poly_check:
-            print(f"[TRADER]{_t} poly_live_precheck_failed (non-fatal): {_e_poly_check}")
+        # _pre_fee_rate = float(opp.poly_fee_rate or 0.072)
+        # _pre_pred_fee_bps = float(opp.predict_fee_bps or 0)
+        # _pre_safety_bps = float(opp.safety_buffer_bps or 0)
+        # try:
+        #     live_book = _polymarket_book(str(poly_leg.token_id))
+        #     _vwap_worst_pre = _vwap_and_worst_from_poly_book(live_book, float(opp.shares))
+        #     if _vwap_worst_pre is None:
+        #         _poly_min_pre2 = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+        #         row["skipped"] = True
+        #         row["skip_reason"] = {"code": "poly_insufficient_depth", "shares": float(opp.shares)}
+        #         row["summary"]["status"] = "skipped"
+        #         row["summary"]["reason_code"] = "poly_insufficient_depth"
+        #         row["summary"]["reason"] = row["skip_reason"]
+        #         print(f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_insufficient_depth shares={opp.shares:.4f}")
+        #         if _market_id_int is not None:
+        #             with _predict_market_in_flight_lock:
+        #                 _predict_market_in_flight.discard(_market_id_int)
+        #         _append_jsonl(trades_file, row)
+        #         return {"status": "skipped", "reason": "poly_insufficient_depth"}
+        #     _live_vwap_pre = _vwap_worst_pre[0]
+        #     if _live_vwap_pre is not None:
+        #         _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
+        #         _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
+        #         _poly_eff_pre = _live_vwap_pre + _live_fee_pre
+        #         _live_net_edge_pre = 1.0 - _pred_eff_pre - _poly_eff_pre - _pre_safety_bps / 10_000
+        #         row["live_poly_precheck"] = {
+        #             "stale_poly_ask": float(poly_leg.ask),
+        #             "live_poly_vwap": round(_live_vwap_pre, 6),
+        #             "live_poly_fee": round(_live_fee_pre, 6),
+        #             "pred_ask": float(pred_leg.ask),
+        #             "live_net_edge": round(_live_net_edge_pre, 6),
+        #             "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
+        #         }
+        #         print(
+        #             f"[TRADER]{_t} poly_live_precheck "
+        #             f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
+        #             f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
+        #             f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
+        #         )
+        #         if _live_net_edge_pre <= 0:
+        #             row["skipped"] = True
+        #             row["skip_reason"] = {
+        #                 "code": "poly_live_no_edge",
+        #                 "stale_poly_ask": float(poly_leg.ask),
+        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
+        #                 "live_net_edge": round(_live_net_edge_pre, 6),
+        #             }
+        #             row["summary"]["status"] = "skipped"
+        #             row["summary"]["reason_code"] = "poly_live_no_edge"
+        #             row["summary"]["reason"] = row["skip_reason"]
+        #             print(
+        #                 f"[TRADER]{_t}[SKIP] "
+        #                 f"label={opp.label} reason=poly_live_no_edge "
+        #                 f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
+        #             )
+        #             _append_jsonl(trades_file, row)
+        #             return {"status": "skipped", "reason": "poly_live_no_edge"}
+        #         _pre_poly_max_hedge = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
+        #         if _live_vwap_pre >= _pre_poly_max_hedge:
+        #             row["skipped"] = True
+        #             row["skip_reason"] = {
+        #                 "code": "poly_live_hedge_price_cap",
+        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
+        #                 "poly_max_hedge_price": _pre_poly_max_hedge,
+        #             }
+        #             row["summary"]["status"] = "skipped"
+        #             row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
+        #             row["summary"]["reason"] = row["skip_reason"]
+        #             print(
+        #                 f"[TRADER]{_t}[SKIP] "
+        #                 f"label={opp.label} reason=poly_live_hedge_price_cap "
+        #                 f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
+        #             )
+        #             _append_jsonl(trades_file, row)
+        #             return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
+        #         _poly_min_pre = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
+        #         _hedge_cost_full = float(opp.shares) * _live_vwap_pre
+        #         if _hedge_cost_full < _poly_min_pre:
+        #             row["skipped"] = True
+        #             row["skip_reason"] = {
+        #                 "code": "poly_min_order_usd",
+        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
+        #                 "hedge_cost_usd": round(_hedge_cost_full, 4),
+        #                 "poly_min_order_usd": _poly_min_pre,
+        #             }
+        #             row["summary"]["status"] = "skipped"
+        #             row["summary"]["reason_code"] = "poly_min_order_usd"
+        #             row["summary"]["reason"] = row["skip_reason"]
+        #             print(
+        #                 "[TRADER][SKIP] "
+        #                 f"label={opp.label} reason=poly_min_order_usd "
+        #                 f"hedge_cost=${_hedge_cost_full:.2f} min=${_poly_min_pre}"
+        #             )
+        #             _append_jsonl(trades_file, row)
+        #             return {"status": "skipped", "reason": "poly_min_order_usd"}
+        # except Exception as _e_poly_check:
+        #     print(f"[TRADER]{_t} poly_live_precheck_failed (non-fatal): {_e_poly_check}")
 
         # ════════════════════════════════════════════════════════════════
         # ПАРАЛЛЕЛЬНАЯ отправка обеих ног через ThreadPoolExecutor.
