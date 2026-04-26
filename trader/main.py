@@ -3764,100 +3764,123 @@ def _place_predict_limit_sell(
     is_yield_bearing = bool(market.get("isYieldBearing"))
     token_id = leg.token_id or _predict_token_id_for_side(market, leg.side)
 
-    # Wait for Predict REST to index post-buy balance before SELL (all call sites).
     _idx_raw = os.environ.get("PREDICT_SELL_INDEX_WAIT_SEC", "").strip()
     if not _idx_raw:
         _idx_raw = os.environ.get("PREDICT_UNWIND_BAL_TIMEOUT_SEC", "").strip()
     _idx_wait = float(_idx_raw or "90")
     _positions_seen_sec: float | None = None
-    if _idx_wait > 0 and sell_qty >= 0.01:
-        _bal, _pos_wait = _predict_wait_for_balance(
-            session,
-            int(leg.market_id),
-            sell_qty,
-            timeout_sec=_idx_wait,
-            token_id=str(token_id) if token_id else None,
-        )
-        _positions_seen_sec = _pos_wait
-        if _bal <= 0 and token_id:
-            # Token id in /positions may not match SDK string; use largest row on this market.
-            # Tight band vs requested size avoids picking the wrong outcome when user holds both.
-            _bal_fb = _predict_max_shares_for_market(session, int(leg.market_id))
-            if sell_qty * 0.85 <= _bal_fb <= sell_qty * 1.02:
-                _bal = _bal_fb
-                print(
-                    f"[TRADER]{_trace} predict_sell_index_wait_fallback market_id={leg.market_id} "
-                    f"max_market_shares={_bal_fb:.6f}"
-                )
-        print(
-            f"[TRADER]{_trace} predict_sell_index_wait market_id={leg.market_id} "
-            f"token={str(token_id)[:18]}... need={sell_qty:.4f} found={_bal:.4f} "
-            f"timeout={_idx_wait:.0f}s"
-        )
-        if _bal > 0:
-            # Never ask to sell more than REST reports (fixes insufficient_shares from wei rounding).
-            _cap = min(sell_qty, _bal * (1.0 - 1e-9))
-            sell_qty = max(0.01, math.floor(_cap * 1_000_000) / 1_000_000)
 
     _tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
     sell_price = round(int(sell_price / _tick) * _tick, 6)
-    price_per_share_wei = _wei_from_float(sell_price)
-    quantity_wei = _wei_from_float(sell_qty)
 
-    amounts = builder.get_limit_order_amounts(
-        LimitHelperInput(
-            side=Side.SELL,
-            price_per_share_wei=price_per_share_wei,
-            quantity_wei=quantity_wei,
+    # Optimistic SELL: try immediately without waiting for /positions indexing.
+    # Off-chain Predict fills are accepted by the API directly (no indexing needed).
+    # Only fall back to _predict_wait_for_balance on "insufficient_shares_balance".
+    out: dict[str, Any] = {}
+    for _sell_attempt in range(2):
+        if _sell_attempt == 1:
+            # First attempt returned insufficient_shares → wait for REST indexing then retry.
+            if _idx_wait <= 0 or sell_qty < 0.01:
+                raise RuntimeError("predict_sell_insufficient_shares_no_wait")
+            _bal, _pos_wait = _predict_wait_for_balance(
+                session,
+                int(leg.market_id),
+                sell_qty,
+                timeout_sec=_idx_wait,
+                token_id=str(token_id) if token_id else None,
+            )
+            _positions_seen_sec = _pos_wait
+            if _bal <= 0 and token_id:
+                # Token id in /positions may not match SDK string; use largest row on this market.
+                _bal_fb = _predict_max_shares_for_market(session, int(leg.market_id))
+                if sell_qty * 0.85 <= _bal_fb <= sell_qty * 1.02:
+                    _bal = _bal_fb
+                    print(
+                        f"[TRADER]{_trace} predict_sell_index_wait_fallback market_id={leg.market_id} "
+                        f"max_market_shares={_bal_fb:.6f}"
+                    )
+            print(
+                f"[TRADER]{_trace} predict_sell_index_wait market_id={leg.market_id} "
+                f"token={str(token_id)[:18]}... need={sell_qty:.4f} found={_bal:.4f} "
+                f"timeout={_idx_wait:.0f}s"
+            )
+            if _bal > 0:
+                # Never ask to sell more than REST reports (fixes insufficient_shares from wei rounding).
+                _cap = min(sell_qty, _bal * (1.0 - 1e-9))
+                sell_qty = max(0.01, math.floor(_cap * 1_000_000) / 1_000_000)
+
+        price_per_share_wei = _wei_from_float(sell_price)
+        quantity_wei = _wei_from_float(sell_qty)
+
+        amounts = builder.get_limit_order_amounts(
+            LimitHelperInput(
+                side=Side.SELL,
+                price_per_share_wei=price_per_share_wei,
+                quantity_wei=quantity_wei,
+            )
         )
-    )
-    order = builder.build_order(
-        "LIMIT",
-        BuildOrderInput(
-            side=Side.SELL,
-            token_id=str(token_id),
-            maker_amount=str(amounts.maker_amount),
-            taker_amount=str(amounts.taker_amount),
-            fee_rate_bps=fee_rate_bps,
-        ),
-    )
-    typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
-    signed_order = builder.sign_typed_data_order(typed_data)
-    signed_dump = _dump_obj(signed_order)
-    if not isinstance(signed_dump, dict):
-        raise RuntimeError("predict_sell_signed_order_bad")
-    order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
-    signature = signed_dump.get("signature")
-    if not order_obj or not signature:
-        order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+        order = builder.build_order(
+            "LIMIT",
+            BuildOrderInput(
+                side=Side.SELL,
+                token_id=str(token_id),
+                maker_amount=str(amounts.maker_amount),
+                taker_amount=str(amounts.taker_amount),
+                fee_rate_bps=fee_rate_bps,
+            ),
+        )
+        typed_data = builder.build_typed_data(order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing)
+        signed_order = builder.sign_typed_data_order(typed_data)
+        signed_dump = _dump_obj(signed_order)
+        if not isinstance(signed_dump, dict):
+            raise RuntimeError("predict_sell_signed_order_bad")
+        order_obj = signed_dump.get("order") if isinstance(signed_dump.get("order"), dict) else None
         signature = signed_dump.get("signature")
-    if not str(signature).startswith("0x"):
-        signature = "0x" + str(signature)
-    if "signature" not in order_obj:
-        order_obj["signature"] = signature
-    order_api = _predict_order_to_api(order_obj)
+        if not order_obj or not signature:
+            order_obj = {k: v for k, v in signed_dump.items() if k != "signature"}
+            signature = signed_dump.get("signature")
+        if not str(signature).startswith("0x"):
+            signature = "0x" + str(signature)
+        if "signature" not in order_obj:
+            order_obj["signature"] = signature
+        order_api = _predict_order_to_api(order_obj)
 
-    payload = {
-        "data": {
-            "pricePerShare": str(amounts.price_per_share),
-            "strategy": "LIMIT",
-            "slippageBps": "0",
-            "order": order_api,
+        payload = {
+            "data": {
+                "pricePerShare": str(amounts.price_per_share),
+                "strategy": "LIMIT",
+                "slippageBps": "0",
+                "order": order_api,
+            }
         }
-    }
-    r = session.post(
-        "https://api.predict.fun/v1/orders",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=float(CFG.timeout_sec),
-    )
-    if not r.ok:
-        if r.status_code == 401:
-            _predict_client.invalidate_jwt()
-        raise RuntimeError(f"predict_sell_http_{r.status_code}: {r.text[:500]}")
-    out = r.json()
-    if not out.get("success"):
-        raise RuntimeError(f"predict_sell_order_failed resp={out}")
+        r = session.post(
+            "https://api.predict.fun/v1/orders",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=float(CFG.timeout_sec),
+        )
+        if not r.ok:
+            if r.status_code == 401:
+                _predict_client.invalidate_jwt()
+            _err_txt = r.text[:500]
+            if _sell_attempt == 0 and "insufficient" in _err_txt.lower():
+                print(
+                    f"[TRADER]{_trace} predict_sell_optimistic_miss qty={sell_qty:.4f}"
+                    f" http={r.status_code} — retrying after indexing wait"
+                )
+                continue
+            raise RuntimeError(f"predict_sell_http_{r.status_code}: {_err_txt}")
+        out = r.json()
+        if not out.get("success"):
+            _err_resp = str(out)
+            if _sell_attempt == 0 and "insufficient" in _err_resp.lower():
+                print(
+                    f"[TRADER]{_trace} predict_sell_optimistic_miss qty={sell_qty:.4f}"
+                    f" — retrying after indexing wait"
+                )
+                continue
+            raise RuntimeError(f"predict_sell_order_failed resp={out}")
+        break  # success
 
     create_data = out.get("data") if isinstance(out.get("data"), dict) else {}
     order_id = str(create_data.get("orderId") or "").strip() or None
