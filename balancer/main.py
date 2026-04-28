@@ -560,13 +560,22 @@ def _extract_deposit_evm_addr(resp: dict[str, Any]) -> str:
     return evm
 
 
-def _wait_bridge_status(*, deposit_addr: str, timeout_sec: float, poll_sec: float) -> str:
+def _wait_bridge_status(
+    *,
+    deposit_addr: str,
+    timeout_sec: float,
+    poll_sec: float,
+    amount_base_unit: int | None = None,
+) -> str:
     """Polls Polymarket bridge status endpoint for a deposit address.
 
     Returns last seen status:
       - COMPLETED
       - FAILED
       - or last intermediate value / "UNKNOWN" if timed out with no transactions.
+
+    If amount_base_unit is provided, finds the transaction with that exact amount
+    instead of always using txs[0] (which may be a different, older deposit).
     """
 
     deadline = time.time() + max(1.0, timeout_sec)
@@ -577,7 +586,17 @@ def _wait_bridge_status(*, deposit_addr: str, timeout_sec: float, poll_sec: floa
         if not txs:
             _sleep(poll_sec)
             continue
-        last_status = str(txs[0].get("status") or "UNKNOWN")
+        # Find the matching transaction by amount; fall back to txs[0]
+        tx = txs[0]
+        if amount_base_unit is not None:
+            for t in txs:
+                try:
+                    if int(t.get("fromAmountBaseUnit") or "0") == amount_base_unit:
+                        tx = t
+                        break
+                except (ValueError, TypeError):
+                    pass
+        last_status = str(tx.get("status") or "UNKNOWN")
         if last_status in {"COMPLETED", "FAILED"}:
             return last_status
         _sleep(poll_sec)
@@ -1530,6 +1549,7 @@ def main() -> None:
                     deposit_addr=deposit_addr,
                     timeout_sec=status_timeout_sec,
                     poll_sec=status_poll_sec,
+                    amount_base_unit=amt_bu,
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
@@ -1539,6 +1559,17 @@ def main() -> None:
                         f"poly → predict  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
+                if st != "COMPLETED":
+                    _notify(
+                        f"⚠️ <b>BRIDGE PENDING (timeout)</b>\n"
+                        f"\n"
+                        f"poly → predict  ${amt:.2f}\n"
+                        f"Bridge status: {st}\n"
+                        f"Повтор через 1 час\n"
+                    )
+                    last_action_ts = time.time() + 3600  # не повторять 1 час
+                    _sleep(interval_sec)
+                    continue
                 try:
                     _proxy = proxy_url or None
                     _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
