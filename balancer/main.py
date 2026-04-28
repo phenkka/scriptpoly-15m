@@ -25,6 +25,7 @@ except ImportError:
 
 _USDT_BSC = "0x55d398326f99059fF775485246999027B3197955"
 _USDCE_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_PUSD_POLYGON = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"  # Polymarket USD (pUSD) — new Polymarket collateral token
 
 _DEFAULT_BSC_RPCS = [
     "https://bsc-dataseed.binance.org",
@@ -1040,7 +1041,9 @@ def main() -> None:
         print("[BALANCER] polygon_rpc_candidates " + " ".join(polygon_rpcs))
 
     bsc_usdt = os.environ.get("BSC_USDT_ADDRESS", "").strip() or _USDT_BSC
-    polygon_usdce = os.environ.get("POLYGON_USDCE_ADDRESS", "").strip() or _USDCE_POLYGON
+    polygon_usdce = os.environ.get("POLYGON_PUSD_ADDRESS", "").strip() \
+        or os.environ.get("POLYGON_USDCE_ADDRESS", "").strip() \
+        or _PUSD_POLYGON
 
     pred_pk = os.environ.get("PREDICT_PRIVATE_KEY", "")
     # BALANCER_POLY_PRIVATE_KEY — dedicated key for BALANCER_POLY_WALLET on Polygon.
@@ -1092,7 +1095,7 @@ def main() -> None:
         chain_id=137,
         rpc_url=polygon_rpc,
         token_address=polygon_usdce,
-        token_symbol="USDC.e",
+        token_symbol="pUSD",
         token_decimals_hint=6,
         wallet_address=poly_wallet,
         private_key_env="POLY_PRIVATE_KEY",
