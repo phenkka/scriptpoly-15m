@@ -422,6 +422,10 @@ def _startup_warmup() -> None:
 
 # In-memory cooldown to prevent repeated buys during testing.
 _predict_market_last_buy_ts: dict[int, float] = {}
+# Cumulative confirmed Predict fills per market_id (in-memory, reset on restart).
+# Used as a floor for pre_balance in late_watch delta checks to avoid false positives
+# when the Predict API lags and pre_balance=0 despite prior legitimate fills.
+_predict_mkt_confirmed_shares: dict[int, float] = {}
 # Набор market_id которые сейчас в процессе исполнения — блокирует параллельные трейды
 _predict_market_in_flight: set[int] = set()
 _predict_market_in_flight_lock = _threading.Lock()
@@ -1434,18 +1438,25 @@ def _late_fill_watcher() -> None:
                         _saved_pre_bal = entry.get("pre_balance")
                         if _saved_pre_bal is not None and str(mkt_id).isdigit():
                             try:
-                                _tid_entry = entry.get("token_id") or None
+                                # token_id in late_watch is the Polymarket hedge token, not a
+                                # Predict token — passing it would never match Predict positions.
+                                # Use token_id=None to get the max position across all outcomes.
                                 _cur_bal = _predict_max_shares_for_market(
                                     session, int(mkt_id),
-                                    token_id=str(_tid_entry) if _tid_entry else None,
+                                    token_id=None,
                                 )
-                                _bal_delta = max(0.0, _cur_bal - float(_saved_pre_bal))
+                                # Floor pre_balance with in-memory confirmed fills for this market
+                                # to avoid false positives when the Predict API lagged at snapshot
+                                # time (returning 0 despite prior legitimate fills).
+                                _known_floor = _predict_mkt_confirmed_shares.get(int(mkt_id), 0.0)
+                                _effective_pre = max(float(_saved_pre_bal), _known_floor)
+                                _bal_delta = max(0.0, _cur_bal - _effective_pre)
                                 if _bal_delta >= 0.005:
                                     notify(
                                         f"⚠️ <b>[ТЕСТ] Возможная незахеджированная позиция</b>\n"
                                         f"\nMarket: <code>{mkt_id}</code>\n"
                                         f"Order: <code>{oh[:20]}…</code>\n"
-                                        f"Баланс до ордера: {float(_saved_pre_bal):.4f}\n"
+                                        f"Баланс до ордера: {_effective_pre:.4f}\n"
                                         f"Баланс сейчас: {_cur_bal:.4f}\n"
                                         f"Дельта: <b>{_bal_delta:.4f}</b> шейров\n"
                                         f"\n<i>Авто-хедж не выполнен (тестовый режим)</i>"
@@ -1453,15 +1464,17 @@ def _late_fill_watcher() -> None:
                                     print(
                                         f"[TRADER][LATE_WATCH] ⚠️ TEST_UNHEDGED_DELTA "
                                         f"hash={oh[:14]}... market_id={mkt_id} "
-                                        f"pre={float(_saved_pre_bal):.4f} cur={_cur_bal:.4f} "
-                                        f"delta={_bal_delta:.4f}"
+                                        f"effective_pre={_effective_pre:.4f} "
+                                        f"(saved={float(_saved_pre_bal):.4f} floor={_known_floor:.4f}) "
+                                        f"cur={_cur_bal:.4f} delta={_bal_delta:.4f}"
                                     )
                                 else:
                                     print(
                                         f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
                                         f"hash={oh[:14]}... market_id={mkt_id} "
-                                        f"pre={float(_saved_pre_bal):.4f} cur={_cur_bal:.4f} "
-                                        f"delta={_bal_delta:.4f} age={age:.0f}s"
+                                        f"effective_pre={_effective_pre:.4f} "
+                                        f"(saved={float(_saved_pre_bal):.4f} floor={_known_floor:.4f}) "
+                                        f"cur={_cur_bal:.4f} delta={_bal_delta:.4f} age={age:.0f}s"
                                     )
                             except Exception as _bd_e:
                                 print(f"[TRADER][LATE_WATCH] balance_delta_err hash={oh[:14]} err={_bd_e}")
@@ -3489,6 +3502,11 @@ def _place_predict_limit_buy(
                             f"[PREDICT_LIMIT]{_trace} bsc_fill_on_new_head hash={order_hash} "
                             f"shares={_poll_bsc:.4f}"
                         )
+                        if leg.market_id is not None:
+                            _mid = int(leg.market_id)
+                            _predict_mkt_confirmed_shares[_mid] = (
+                                _predict_mkt_confirmed_shares.get(_mid, 0.0) + _poll_bsc
+                            )
                         break
                 except Exception:
                     pass
@@ -3567,6 +3585,11 @@ def _place_predict_limit_buy(
                             f"api_ok={_api_ok} hash={order_hash} "
                             f"bsc_shares={_bsc_shares:.4f} attempt={_attempt}"
                         )
+                        if leg.market_id is not None:
+                            _mid = int(leg.market_id)
+                            _predict_mkt_confirmed_shares[_mid] = (
+                                _predict_mkt_confirmed_shares.get(_mid, 0.0) + _bsc_shares
+                            )
                         filled = True
                         break
                 except Exception:
@@ -3600,6 +3623,11 @@ def _place_predict_limit_buy(
                                 f"[PREDICT_LIMIT]{_trace} ghost_fill_watch_bsc_on_head "
                                 f"hash={order_hash} bsc_shares={_gf_bsc:.4f}"
                             )
+                            if leg.market_id is not None:
+                                _mid = int(leg.market_id)
+                                _predict_mkt_confirmed_shares[_mid] = (
+                                    _predict_mkt_confirmed_shares.get(_mid, 0.0) + _gf_bsc
+                                )
                             filled = True
                             break
                     except Exception:
