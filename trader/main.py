@@ -33,17 +33,17 @@ from predict_sdk import (
     OrderBuilderOptions,
     Side,
 )
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL as POLY_SELL
+from py_clob_client_v2 import ClobClient, ApiCreds
+from py_clob_client_v2 import MarketOrderArgs, OrderArgs, OrderType
+BUY = "BUY"
+POLY_SELL = "SELL"
 
 from trader.config import CONFIG as CFG
 
-# Патч глобального httpx клиента py_clob_client для поддержки прокси
+# Патч глобального httpx клиента py_clob_client_v2 для поддержки прокси
 _proxy_url = os.environ.get("PROXY_URL", "").strip()
 if _proxy_url:
-    import py_clob_client.http_helpers.helpers as _clob_helpers
+    import py_clob_client_v2.http_helpers.helpers as _clob_helpers
     _clob_helpers._http_client = httpx.Client(
         http2=True,
         timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
@@ -53,7 +53,7 @@ if _proxy_url:
         },
     )
 else:
-    import py_clob_client.http_helpers.helpers as _clob_helpers
+    import py_clob_client_v2.http_helpers.helpers as _clob_helpers
     _clob_helpers._http_client = httpx.Client(
         http2=True,
         timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
@@ -2341,7 +2341,7 @@ def _place_polymarket_fok_market_buy(leg: OpportunityLeg, fak_fallback: bool = F
         if poly_api_key and poly_secret and poly_passphrase:
             c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
         else:
-            c.set_api_creds(c.create_or_derive_api_creds())
+            c.set_api_creds(c.create_or_derive_api_key())
         return c
 
     try:
@@ -2431,7 +2431,7 @@ def _place_poly_limit_sell(token_id: str, qty: float, price: float) -> dict[str,
     if poly_api_key and poly_secret and poly_passphrase:
         cli.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
     else:
-        cli.set_api_creds(cli.create_or_derive_api_creds())
+        cli.set_api_creds(cli.create_or_derive_api_key())
 
     signed = cli.create_order(OrderArgs(
         token_id=token_id,
@@ -2534,7 +2534,7 @@ def _close_poly_temp_hedge(poly_token_id: str, qty: float) -> dict[str, Any]:
             c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret,
                                      api_passphrase=poly_passphrase))
         else:
-            c.set_api_creds(c.create_or_derive_api_creds())
+            c.set_api_creds(c.create_or_derive_api_key())
         return c
 
     def _fetch_best_bid() -> float:
@@ -2602,7 +2602,7 @@ def _close_poly_temp_hedge(poly_token_id: str, qty: float) -> dict[str, Any]:
                     }
                 # Still not filled — cancel and try next attempt
                 try:
-                    cli.cancel(order_id)
+                    cli.cancel_orders([order_id])
                 except Exception:
                     pass
                 time.sleep(0.5)
@@ -2618,7 +2618,7 @@ def _close_poly_temp_hedge(poly_token_id: str, qty: float) -> dict[str, Any]:
             if best_bid >= 0.02:
                 stake_for_sell = remaining * best_bid * 0.98  # ~2% below mid
                 cli_fak = _build_cli()
-                from py_clob_client.clob_types import MarketOrderArgs as _MOA
+                from py_clob_client_v2 import MarketOrderArgs as _MOA
                 mo = _MOA(
                     token_id=poly_token_id,
                     amount=stake_for_sell,
@@ -2681,7 +2681,7 @@ def _place_polymarket_limit_buy_exact_shares(
         if poly_api_key and poly_secret and poly_passphrase:
             c.set_api_creds(ApiCreds(api_key=poly_api_key, api_secret=poly_secret, api_passphrase=poly_passphrase))
         else:
-            c.set_api_creds(c.create_or_derive_api_creds())
+            c.set_api_creds(c.create_or_derive_api_key())
         return c
 
     import math as _math
@@ -2753,7 +2753,7 @@ def _place_polymarket_limit_buy_exact_shares(
             # We MUST verify before declaring failure to avoid phantom unwinds.
             if order_id:
                 try:
-                    client.cancel(order_id)
+                    client.cancel_orders([order_id])
                     print(f"[TRADER][POLY][GTC_CANCEL] cancelled live order order_id={order_id}")
                 except Exception as _ce:
                     print(f"[TRADER][POLY][GTC_CANCEL_ERR] order_id={order_id} err={_ce}")
@@ -2787,7 +2787,7 @@ def _place_polymarket_limit_buy_exact_shares(
                     print(f"[TRADER][POLY][GTC_GET_ORDER_ERR] order_id={order_id} err={_goe}")
                 # 2) Fallback: check trade history for any fill from this order
                 try:
-                    from py_clob_client.clob_types import TradeParams as _TradeParams
+                    from py_clob_client_v2 import TradeParams as _TradeParams
                     _recent_trades = client.get_trades(
                         _TradeParams(id=order_id, asset_id=token_id), next_cursor="MA=="
                     )
@@ -6219,13 +6219,13 @@ def opportunity(opp: Opportunity) -> dict:
                                     _mm_gp_ak = os.environ.get("POLY_API_KEY", "").strip()
                                     _mm_gp_sec = os.environ.get("POLY_SECRET", "").strip()
                                     _mm_gp_pp = os.environ.get("POLY_PASSPHRASE", "").strip()
-                                    from py_clob_client.order_builder.constants import SELL as _MM_SELL
+                                    _MM_SELL = "SELL"
                                     _mm_gp_cli = ClobClient("https://clob.polymarket.com", chain_id=137,
                                                              key=_mm_gp_pk, signature_type=_mm_gp_sig, funder=_mm_gp_funder)
                                     if _mm_gp_ak and _mm_gp_sec and _mm_gp_pp:
                                         _mm_gp_cli.set_api_creds(ApiCreds(api_key=_mm_gp_ak, api_secret=_mm_gp_sec, api_passphrase=_mm_gp_pp))
                                     else:
-                                        _mm_gp_cli.set_api_creds(_mm_gp_cli.create_or_derive_api_creds())
+                                        _mm_gp_cli.set_api_creds(_mm_gp_cli.create_or_derive_api_key())
                                     _mm_gp_ord = _mm_gp_cli.create_order(OrderArgs(
                                         token_id=str(poly_leg.token_id),
                                         price=_mm_poly_sell_price,
@@ -6523,7 +6523,7 @@ def opportunity(opp: Opportunity) -> dict:
                             _gp_api_key = os.environ.get("POLY_API_KEY", "").strip()
                             _gp_secret = os.environ.get("POLY_SECRET", "").strip()
                             _gp_pass = os.environ.get("POLY_PASSPHRASE", "").strip()
-                            from py_clob_client.order_builder.constants import SELL as _POLY_SELL
+                            _POLY_SELL = "SELL"
                             _gp_client = ClobClient(
                                 "https://clob.polymarket.com",
                                 chain_id=137,
@@ -6534,7 +6534,7 @@ def opportunity(opp: Opportunity) -> dict:
                             if _gp_api_key and _gp_secret and _gp_pass:
                                 _gp_client.set_api_creds(ApiCreds(api_key=_gp_api_key, api_secret=_gp_secret, api_passphrase=_gp_pass))
                             else:
-                                _gp_client.set_api_creds(_gp_client.create_or_derive_api_creds())
+                                _gp_client.set_api_creds(_gp_client.create_or_derive_api_key())
                             _gp_order = _gp_client.create_order(OrderArgs(
                                 token_id=str(poly_leg.token_id),
                                 price=_gp_sell_price,
