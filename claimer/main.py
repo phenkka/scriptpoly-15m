@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 
 # ── Contract addresses ──────────────────────────────────────────────────────
 POLY_CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens Polygon
-POLY_USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e Polygon
+POLY_USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD (Polymarket USD) — current collateral since 2026-04
 BSC_CTF_ADDRESS   = "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"  # ConditionalTokens BSC
 
 POLY_POSITIONS_URL  = "https://data-api.polymarket.com/positions"
