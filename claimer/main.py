@@ -53,6 +53,12 @@ POLY_CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalT
 POLY_USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD (Polymarket USD) — current collateral since 2026-04
 BSC_CTF_ADDRESS   = "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"  # ConditionalTokens BSC
 
+# Polymarket V1 Exchange contracts — need pUSD approval to suppress "Activate Funds" UI popup
+# (bot trades via V2 which already has max approval, but V1 approval is required by Polymarket UI)
+_CTF_EXCHANGE_V1      = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+_NEG_RISK_EXCHANGE_V1 = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+_MAX_UINT256 = 2**256 - 1
+
 POLY_POSITIONS_URL  = "https://data-api.polymarket.com/positions"
 PREDICT_MARKETS_URL = "https://api.predict.fun/v1/markets"
 
@@ -195,7 +201,21 @@ _ERC20_ABI = [
         "inputs": [{"name": "account", "type": "address"}],
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
-    }
+    },
+    {
+        "name": "allowance",
+        "type": "function",
+        "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "approve",
+        "type": "function",
+        "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+    },
 ]
 
 
@@ -338,6 +358,51 @@ def _gnosis_safe_execute(
 
 
 # ── Polymarket claiming ─────────────────────────────────────────────────────
+
+def _ensure_poly_exchange_approvals(
+    *,
+    w3: Web3,
+    chain_id: int,
+    safe_address: str,
+    owner_pk: str,
+) -> None:
+    """Set max pUSD allowance for V1 Polymarket Exchange contracts if not already set.
+
+    This is a one-time setup per wallet. After running, Polymarket UI will no longer
+    show the 'Activate Funds' popup after claiming/bridging.
+    V2 exchanges (0xE111..., 0xe222...) typically already have max approval.
+    """
+    pusd = w3.eth.contract(
+        address=Web3.to_checksum_address(POLY_USDC_ADDRESS),
+        abi=_ERC20_ABI,
+    )
+    safe_cs = Web3.to_checksum_address(safe_address)
+    for name, exchange_addr in [
+        ("ctf_exchange_v1", _CTF_EXCHANGE_V1),
+        ("neg_risk_exchange_v1", _NEG_RISK_EXCHANGE_V1),
+    ]:
+        try:
+            allowance = pusd.functions.allowance(safe_cs, Web3.to_checksum_address(exchange_addr)).call()
+            if allowance >= _MAX_UINT256 // 2:
+                log.info(f"poly_exchange_approve_skip {name} already=max")
+                continue
+            log.info(f"poly_exchange_approve {name} current={allowance/1e6:.2f} → setting max")
+            calldata = _encode_abi_bytes(
+                pusd.encode_abi("approve", [Web3.to_checksum_address(exchange_addr), _MAX_UINT256])
+            )
+            txh = _gnosis_safe_execute(
+                w3=w3,
+                chain_id=chain_id,
+                safe_address=safe_address,
+                to_address=POLY_USDC_ADDRESS,
+                calldata=calldata,
+                owner_private_key=owner_pk,
+            )
+            log.info(f"poly_exchange_approved {name} tx={txh}")
+            time.sleep(4)
+        except Exception as e:
+            log.warning(f"poly_exchange_approve_failed {name} err={e}")
+
 
 def _fetch_poly_positions(session: requests.Session, safe_address: str) -> list[dict]:
     """Return all redeemable Polymarket positions for the given address."""
@@ -749,6 +814,7 @@ def main() -> None:
     session.headers.update({"x-api-key": predict_api_key})
 
     jwt_ts: float = 0.0
+    _exchange_approvals_done: bool = False
 
     while True:
         try:
@@ -761,6 +827,16 @@ def main() -> None:
                 try:
                     w3_poly = _get_web3(poly_rpc_urls)
                     chain_id = int(w3_poly.eth.chain_id)
+                    # One-time: ensure V1 Exchange contracts have max pUSD approval
+                    # (suppresses Polymarket "Activate Funds" popup after claims/bridges)
+                    if not _exchange_approvals_done:
+                        _ensure_poly_exchange_approvals(
+                            w3=w3_poly,
+                            chain_id=chain_id,
+                            safe_address=safe_address,
+                            owner_pk=owner_pk,
+                        )
+                        _exchange_approvals_done = True
                     n, _poly_pending_usd = _claim_polymarket(
                         w3=w3_poly,
                         chain_id=chain_id,
