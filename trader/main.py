@@ -4455,18 +4455,18 @@ def opportunity(opp: Opportunity) -> dict:
         raise HTTPException(status_code=400, detail="Expected both polymarket and predict legs")
 
     # Guard: не торговать если до закрытия рынка недостаточно времени.
-    # Минимальный буфер = PREDICT_SELL_INDEX_WAIT_SEC (90s, индексер) +
-    # fill_timeout_sec unwind (60s) × 3 retry + задержки (~300s итого).
     # Самый опасный сценарий: Predict-fill уже произошёл, а продать обратно
     # некуда — рынок закрылся, позиция висит без хеджа до экспайри.
+    # Для 15-мин рынков: PREDICT_MIN_EXPIRY_BUFFER_SEC=120 PREDICT_UNWIND_BUDGET_SEC=120
     if opp.end_date:
         try:
             _end_dt = datetime.fromisoformat(opp.end_date.rstrip("Z")).replace(tzinfo=timezone.utc)
             _secs_to_end = (_end_dt - datetime.now(timezone.utc)).total_seconds()
             _static_buf = float(os.environ.get("PREDICT_MIN_EXPIRY_BUFFER_SEC", "300") or "300")
             _p99_lag = _positions_lag_p99()
-            # unwind budget: fill_timeout_sec=60 × up to 5 retries + 60s safety margin
-            _unwind_budget_sec = 60.0 * 5 + 60.0
+            # unwind budget: настраивается через PREDICT_UNWIND_BUDGET_SEC
+            # 1h рынки: 60×5+60=360s  |  15min рынки: 120s
+            _unwind_budget_sec = float(os.environ.get("PREDICT_UNWIND_BUDGET_SEC", "360") or "360")
             _dynamic_buf = (_p99_lag * 1.5 + _unwind_budget_sec) if _p99_lag is not None else None
             _min_expiry_buf = max(_static_buf, _dynamic_buf) if _dynamic_buf is not None else _static_buf
             if _secs_to_end < _min_expiry_buf:

@@ -27,7 +27,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
-SLOT_SEC  = 3600  # 1 час в секундах
+SLOT_SEC  = 900   # 15 минут в секундах
 _ET_ZONE  = ZoneInfo("America/New_York")
 
 SESSION = requests.Session()
@@ -62,14 +62,8 @@ def _fetch_poly_fee_rate(token_id: str) -> float:
 
 
 def _slot_ts_to_poly_slug(slot_ts: int) -> str:
-    """bitcoin-up-or-down-april-3-2026-2pm-et"""
-    dt_et  = datetime.fromtimestamp(slot_ts, tz=timezone.utc).astimezone(_ET_ZONE)
-    month  = dt_et.strftime("%B").lower()
-    day    = dt_et.day
-    year   = dt_et.year
-    hour12 = dt_et.hour % 12 or 12
-    ampm   = "am" if dt_et.hour < 12 else "pm"
-    return f"bitcoin-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
+    """btc-updown-15m-{unix_timestamp}"""
+    return f"btc-updown-15m-{slot_ts}"
 
 
 def post_tick(
@@ -155,7 +149,7 @@ def fetch_market_tokens(slot_ts: int) -> tuple[str, dict[str, str]] | tuple[None
 
 
 def current_slot() -> int:
-    """Возвращает Unix-метку начала текущего 15-минутного окна."""
+    """Возвращает Unix-метку начала текущего 15-минутного слота."""
     return (int(time.time()) // SLOT_SEC) * SLOT_SEC
 
 
