@@ -28,8 +28,6 @@ _USDCE_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _PUSD_POLYGON = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"   # Polymarket USD (pUSD) — current Polymarket collateral
 _USDC_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # native USDC (future)
 _ONRAMP_POLYGON = "0x93070a847efEf7F70739046A929D47a521F5B8ee"  # CollateralOnramp — wraps USDC.e → pUSD
-_CTF_EXCHANGE_POLY = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # CTFExchange on Polygon (pUSD deposit balance)
-_CTF_EXCHANGE_BAL_ABI = [{"inputs": [{"name": "user", "type": "address"}], "name": "getBalance", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
 
 _DEFAULT_BSC_RPCS = [
     "https://bsc-dataseed.binance.org",
@@ -819,18 +817,6 @@ def _fetch_hourly_balance_snapshot(
         poly_display = _from_base_unit(poly_funder_bal_bu, poly_dec)
     else:
         poly_display = poly_bal
-
-    # Also include pUSD deposited into CTFExchange (claimer auto-deposits after claims)
-    try:
-        _ctf_ex = w3_poly.eth.contract(
-            address=Web3.to_checksum_address(_CTF_EXCHANGE_POLY),
-            abi=_CTF_EXCHANGE_BAL_ABI,
-        )
-        _ex_addr = Web3.to_checksum_address((poly_funder or poly_wallet) or "0x0000000000000000000000000000000000000000")
-        _ex_bal_bu = _ctf_ex.functions.getBalance(_ex_addr).call()
-        poly_display += _ex_bal_bu / 10**poly_dec
-    except Exception as _exc:
-        print(f"[BALANCER][WARN] hourly_ctf_exchange_balance_error err={_exc}")
     predict_acct_bal = 0.0
     if predict_account:
         try:
@@ -1459,18 +1445,6 @@ def main() -> None:
                 poly_display = _from_base_unit(poly_funder_bal_bu, poly_dec)
             else:
                 poly_display = poly_bal
-
-            # Also include pUSD deposited into CTFExchange (claimer auto-deposits after claims)
-            try:
-                _ctf_ex = w3_poly.eth.contract(
-                    address=Web3.to_checksum_address(_CTF_EXCHANGE_POLY),
-                    abi=_CTF_EXCHANGE_BAL_ABI,
-                )
-                _ex_addr = Web3.to_checksum_address(poly_funder or poly_wallet)
-                _ex_bal_bu = _ctf_ex.functions.getBalance(_ex_addr).call()
-                poly_display += _ex_bal_bu / 10**poly_dec
-            except Exception as _exc:
-                print(f"[BALANCER][WARN] ctf_exchange_balance_error err={_exc}")
 
             # Predict.fun trading account balance (separate from the EOA funder wallet)
             predict_acct_bal: float | None = None

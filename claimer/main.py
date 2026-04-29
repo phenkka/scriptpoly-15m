@@ -53,27 +53,10 @@ POLY_CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalT
 POLY_USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD (Polymarket USD) — current collateral since 2026-04
 BSC_CTF_ADDRESS   = "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"  # ConditionalTokens BSC
 
-# Polymarket Exchange contracts
-_CTF_EXCHANGE_V1      = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # CTFExchange (main, deposit here)
-_NEG_RISK_EXCHANGE_V1 = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # NegRiskCTFExchange
+# Polymarket Exchange contracts — need pUSD approval to enable trading
+_CTF_EXCHANGE_V1      = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # CTFExchange V1
+_NEG_RISK_EXCHANGE_V1 = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # NegRiskCTFExchange V1
 _MAX_UINT256 = 2**256 - 1
-
-_CTF_EXCHANGE_DEPOSIT_ABI = [
-    {
-        "inputs": [{"name": "amount", "type": "uint256"}],
-        "name": "deposit",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "user", "type": "address"}],
-        "name": "getBalance",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
 
 POLY_POSITIONS_URL  = "https://data-api.polymarket.com/positions"
 PREDICT_MARKETS_URL = "https://api.predict.fun/v1/markets"
@@ -420,48 +403,52 @@ def _ensure_poly_exchange_approvals(
             log.warning(f"poly_exchange_approve_failed {name} err={e}")
 
 
-def _poly_deposit_to_exchange(
+def _poly_update_balance_allowance(
     *,
-    w3: Web3,
-    chain_id: int,
+    session: requests.Session,
     safe_address: str,
-    owner_pk: str,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
 ) -> None:
-    """Deposit any pUSD sitting in the Safe into CTFExchange.
+    """Tell the Polymarket CLOB to re-scan on-chain balance/allowance.
 
-    After redeemPositions, pUSD lands in Safe. For the CLOB to use it for new
-    orders (and to suppress the Polymarket 'Activate Funds' popup), it needs
-    to be deposited into CTFExchange via deposit(amount).
+    After redeemPositions, pUSD lands in the Gnosis Safe. The CLOB needs to
+    be notified via GET /balance-allowance/update (L2 HMAC auth) to see the
+    new balance and stop showing the 'Activate Funds' popup.
     """
+    if not all([api_key, api_secret, api_passphrase]):
+        log.info("poly_update_balance_skip no_api_creds")
+        return
     try:
-        pusd = w3.eth.contract(
-            address=Web3.to_checksum_address(POLY_USDC_ADDRESS),
-            abi=_ERC20_ABI,
+        import hmac as _hmac
+        import hashlib as _hashlib
+        import base64 as _base64
+        ts = int(datetime.now().timestamp())
+        path = "/balance-allowance/update"
+        method = "GET"
+        raw_secret = _base64.urlsafe_b64decode(api_secret)
+        msg = str(ts) + method + path
+        h = _hmac.new(raw_secret, msg.encode("utf-8"), _hashlib.sha256)
+        sig = _base64.urlsafe_b64encode(h.digest()).decode("utf-8")
+        headers = {
+            "POLY_ADDRESS": safe_address,
+            "POLY_SIGNATURE": sig,
+            "POLY_TIMESTAMP": str(ts),
+            "POLY_API_KEY": api_key,
+            "POLY_PASSPHRASE": api_passphrase,
+        }
+        # asset_type=COLLATERAL refreshes pUSD balance visible to the CLOB
+        params = {"signature_type": 2, "asset_type": "COLLATERAL"}
+        r = session.get(
+            f"https://clob.polymarket.com{path}",
+            headers=headers,
+            params=params,
+            timeout=10,
         )
-        safe_cs = Web3.to_checksum_address(safe_address)
-        balance = pusd.functions.balanceOf(safe_cs).call()
-        if balance < 1_000:  # < $0.001 — skip dust
-            return
-        exchange = w3.eth.contract(
-            address=Web3.to_checksum_address(_CTF_EXCHANGE_V1),
-            abi=_CTF_EXCHANGE_DEPOSIT_ABI,
-        )
-        log.info(f"poly_deposit_to_exchange amount={balance/1e6:.4f} pUSD")
-        calldata = _encode_abi_bytes(
-            exchange.encode_abi("deposit", [balance])
-        )
-        txh = _gnosis_safe_execute(
-            w3=w3,
-            chain_id=chain_id,
-            safe_address=safe_address,
-            to_address=_CTF_EXCHANGE_V1,
-            calldata=calldata,
-            owner_private_key=owner_pk,
-        )
-        log.info(f"poly_deposited_to_exchange tx={txh} amount={balance/1e6:.4f}")
-        _notify(f"✅ <b>POLY DEPOSIT TO EXCHANGE</b>\n+{balance/1e6:.2f}$ → CTFExchange\n")
+        log.info(f"poly_update_balance_allowance status={r.status_code} body={r.text[:100]}")
     except Exception as e:
-        log.warning(f"poly_deposit_to_exchange_failed err={e}")
+        log.warning(f"poly_update_balance_allowance_failed err={e}")
 
 
 def _fetch_poly_positions(session: requests.Session, safe_address: str) -> list[dict]:
@@ -907,12 +894,13 @@ def main() -> None:
                         dry_run=dry_run,
                     )
                     log.info(f"poly_claimed count={n}")
-                    # Move any pUSD in Safe → CTFExchange (activates funds for trading)
-                    _poly_deposit_to_exchange(
-                        w3=w3_poly,
-                        chain_id=chain_id,
+                    # Notify CLOB to re-scan balance — suppresses 'Activate Funds' popup
+                    _poly_update_balance_allowance(
+                        session=session,
                         safe_address=safe_address,
-                        owner_pk=owner_pk,
+                        api_key=os.environ.get("POLY_API_KEY", "").strip(),
+                        api_secret=os.environ.get("POLY_SECRET", "").strip(),
+                        api_passphrase=os.environ.get("POLY_PASSPHRASE", "").strip(),
                     )
                 except Exception as e:
                     log.error(f"poly_claim_cycle_error err={e}")
