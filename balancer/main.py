@@ -27,6 +27,7 @@ _USDT_BSC = "0x55d398326f99059fF775485246999027B3197955"
 _USDCE_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _PUSD_POLYGON = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"   # Polymarket USD (pUSD) — current Polymarket collateral
 _USDC_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # native USDC (future)
+_ONRAMP_POLYGON = "0x93070a847efEf7F70739046A929D47a521F5B8ee"  # CollateralOnramp — wraps USDC.e → pUSD
 
 _DEFAULT_BSC_RPCS = [
     "https://bsc-dataseed.binance.org",
@@ -447,6 +448,50 @@ def _gnosis_safe_transfer(
     return tx_hash.hex()
 
 
+def _gnosis_safe_exec(
+    *,
+    w3: Web3,
+    chain_id: int,
+    safe_address: str,
+    to_address: str,
+    calldata: bytes,
+    owner_private_key: str,
+) -> str:
+    """Execute arbitrary calldata from a Gnosis Safe — generalised _gnosis_safe_transfer."""
+    pk = _normalize_hex_key(owner_private_key)
+    if not pk:
+        raise RuntimeError("missing_private_key")
+    acct = Account.from_key(pk)
+    safe = w3.eth.contract(address=Web3.to_checksum_address(safe_address), abi=_SAFE_ABI)
+    safe_nonce = safe.functions.nonce().call()
+    zero_addr = "0x0000000000000000000000000000000000000000"
+    tx_hash_bytes = safe.functions.getTransactionHash(
+        Web3.to_checksum_address(to_address),
+        0, calldata, 0, 0, 0, 0, zero_addr, zero_addr, safe_nonce,
+    ).call()
+    _sign_fn = getattr(Account, "unsafe_sign_hash", None) or Account._sign_hash
+    signed_hash = _sign_fn(tx_hash_bytes, private_key=pk)
+    signature = bytes(signed_hash.signature)
+    eoa_nonce = w3.eth.get_transaction_count(acct.address)
+    tx = safe.functions.execTransaction(
+        Web3.to_checksum_address(to_address),
+        0, calldata, 0, 0, 0, 0, zero_addr, zero_addr, signature,
+    ).build_transaction({
+        "from": acct.address, "nonce": eoa_nonce, "chainId": int(chain_id), "value": 0,
+    })
+    try:
+        tx.setdefault("gas", int(w3.eth.estimate_gas(tx) * 12 // 10))
+    except Exception:
+        tx.setdefault("gas", 300000)
+    tx.pop("maxFeePerGas", None)
+    tx.pop("maxPriorityFeePerGas", None)
+    tx.setdefault("gasPrice", int(w3.eth.gas_price))
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+    raw_tx = signed_tx.raw_transaction if hasattr(signed_tx, "raw_transaction") else signed_tx.rawTransaction
+    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+    return tx_hash.hex()
+
+
 def _send_erc20(
     *,
     w3: Web3,
@@ -816,6 +861,25 @@ def _sleep_until_local_minute(
             time.sleep(min(1.0, max(0.05, wait)))
 
 
+def _sleep_until_next_quarter() -> None:
+    """Block until the clock enters the next 15-minute boundary (:00, :15, :30, :45)."""
+    _QUARTER_MINUTES = {0, 15, 30, 45}
+    while True:
+        now = datetime.now()
+        if now.minute in _QUARTER_MINUTES:
+            return
+        next_min = ((now.minute // 15) + 1) * 15
+        if next_min >= 60:
+            cand = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:
+            cand = now.replace(minute=next_min, second=0, microsecond=0)
+        wait = (cand - now).total_seconds()
+        if wait > 1.5:
+            time.sleep(min(30.0, max(0.2, wait * 0.4)))
+        else:
+            time.sleep(min(1.0, max(0.05, wait)))
+
+
 def _json_ts_to_unix(raw: object) -> float | None:
     """Event time as Unix sec. Strips Z and applies UTC; numeric ts allowed."""
     if raw is None:
@@ -925,6 +989,19 @@ def _local_prev_full_hour_bounds(now: float) -> tuple[float, float, str]:
         label = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
     else:
         label = f"{start_dt.strftime('%d.%m %H:%M')}–{end_dt.strftime('%d.%m %H:%M')}"
+    return start_dt.timestamp(), end_dt.timestamp(), label
+
+
+def _local_prev_full_15min_bounds(now: float) -> tuple[float, float, str]:
+    """Previous full 15-minute slot [start, end) as Unix times + short label.
+
+    e.g. if now is 13:17 → [13:00, 13:15). If now is 13:00 → [12:45, 13:00).
+    """
+    dt = datetime.fromtimestamp(now)
+    cur_quarter = (dt.minute // 15) * 15
+    end_dt = dt.replace(minute=cur_quarter, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(minutes=15)
+    label = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
     return start_dt.timestamp(), end_dt.timestamp(), label
 
 
@@ -1185,18 +1262,15 @@ def main() -> None:
         while True:
             try:
                 try:
-                    _stats_min = int(
-                        float(os.environ.get("BALANCER_HOURLY_STATS_MIN", "0") or "0")
-                    )
+                    _sleep_until_next_quarter()
                 except Exception:
-                    _stats_min = 0
-                _stats_min = max(0, min(59, _stats_min))
-                _sleep_until_local_minute(_stats_min, poll_max_sec=30.0)
+                    _sleep(15.0)
+                    continue
                 # Fast in-memory check — only skip if WE already sent in this process
                 # session.  A fresh restart always falls through to attempt the send.
-                _since_pre, _, _ = _local_prev_full_hour_bounds(time.time())
-                _slot_pre = time.localtime(int(_since_pre))
-                _fkey_pre = (_slot_pre.tm_year, _slot_pre.tm_yday, _slot_pre.tm_hour, _stats_min)
+                _since_pre, _, _ = _local_prev_full_15min_bounds(time.time())
+                _slot_pre = datetime.fromtimestamp(_since_pre)
+                _fkey_pre = (_slot_pre.year, _slot_pre.timetuple().tm_yday, _slot_pre.hour, _slot_pre.minute // 15)
                 if _fkey_pre == _last_sent_this_session:
                     # Already sent this slot — sleep until we're well into the next minute
                     # so _sleep_until_local_minute won't return again for the same slot.
@@ -1204,15 +1278,14 @@ def main() -> None:
                     continue
                 _lock_fh = _hourly_send_lock_acquire()
                 try:
-                    _tm = time.localtime()
-                    _since_slot, _, _ = _local_prev_full_hour_bounds(time.time())
-                    _slot_tm = time.localtime(int(_since_slot))
-                    _fkey = (_slot_tm.tm_year, _slot_tm.tm_yday, _slot_tm.tm_hour, _stats_min)
+                    _since_slot, _, _ = _local_prev_full_15min_bounds(time.time())
+                    _slot_dt = datetime.fromtimestamp(_since_slot)
+                    _fkey = (_slot_dt.year, _slot_dt.timetuple().tm_yday, _slot_dt.hour, _slot_dt.minute // 15)
                     _disk_now = _load_hourly_last_fired()
                     if _fkey == _disk_now:
                         print(
-                            f"[BALANCER] hourly_notify_skip_duplicate fkey={_fkey} "
-                            f"(flock+dedup, already sent for this local hour slot)"
+                            f"[BALANCER] stats_notify_skip_duplicate fkey={_fkey} "
+                            f"(flock+dedup, already sent for this 15-min slot)"
                         )
                         _last_sent_this_session = _fkey
                         time.sleep(65.0)  # avoid tight loop: sleep past the current minute
@@ -1235,7 +1308,7 @@ def main() -> None:
                     _total_cash = _poly_cash + _pred_cash
                     _total_with_pos = _poly_total + _pred_total
                     _now = time.time()
-                    _since_ts, _until_ts, _prev_hour_label = _local_prev_full_hour_bounds(
+                    _since_ts, _until_ts, _prev_15min_label = _local_prev_full_15min_bounds(
                         _now
                     )
                     _h1_pnl, _, _, _ = _hourly_pnl(
@@ -1283,8 +1356,8 @@ def main() -> None:
                     )
                     _tz_hint = (time.tzname[0] or "local")
                     _notify(
-                        f"📊 <b>HOURLY STATS</b>\n"
-                        f"<i>Trades &amp; PnL — previous full local hour: <b>{_prev_hour_label}</b> "
+                        f"📊 <b>15-MIN STATS</b>\n"
+                        f"<i>Trades &amp; PnL — prev 15 min: <b>{_prev_15min_label}</b> "
                         f"({_tz_hint}, server time)</i>\n"
                         f"<i>Balances — on-chain + venue APIs, snapshot: <b>{_snap_lbl}</b> ({_tz_hint})</i>\n"
                         f"\n"
@@ -1293,14 +1366,14 @@ def main() -> None:
                         + _pred_line
                         + _total_line
                         + f"\n"
-                        + f"{_pnl_emoji} PnL (that hour): <b>{_h1_pnl:+.2f}$</b>\n"
+                        + f"{_pnl_emoji} PnL (15 min): <b>{_h1_pnl:+.2f}$</b>\n"
                         + f"\n"
                         + "\n".join(_tlines) + "\n"
                         + _halt_line
                     )
                     print(
-                        f"[BALANCER] hourly_notify_sent local_hour={_tm.tm_hour} "
-                        f"prev_window={_prev_hour_label} total_with_pos={_total_with_pos:.2f} "
+                        f"[BALANCER] stats_notify_sent "
+                        f"prev_window={_prev_15min_label} total_with_pos={_total_with_pos:.2f} "
                         f"snap={_snap_lbl}"
                     )
                     _save_hourly_last_fired(_fkey)
@@ -1308,19 +1381,12 @@ def main() -> None:
                 finally:
                     _hourly_send_lock_release(_lock_fh)
             except Exception as _e:
-                print(f"[BALANCER][WARN] hourly_notify_failed err={_e}")
+                print(f"[BALANCER][WARN] stats_notify_failed err={_e}")
             time.sleep(12.0)
 
     _hn_thread = threading.Thread(target=_hourly_notify_worker, daemon=True)
     _hn_thread.start()
-    try:
-        _hsm = int(float(os.environ.get("BALANCER_HOURLY_STATS_MIN", "0") or "0"))
-    except Exception:
-        _hsm = 0
-    print(
-        f"[BALANCER] hourly_notify_thread_started "
-        f"at_minute={_hsm} window=prev_full_local_hour fresh_snapshot=rpc+api"
-    )
+    print("[BALANCER] stats_notify_thread_started interval=15min window=prev_15min fresh_snapshot=rpc+api")
 
     while True:
         now = time.time()
@@ -1701,6 +1767,49 @@ def main() -> None:
                         f"predict → poly  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
+                # Auto-wrap USDC.e → pUSD on Polygon after bridge delivers USDC.e
+                try:
+                    usdce_bal_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
+                    if usdce_bal_bu > 0:
+                        print(f"[BALANCER] wrapping_usdce_to_pusd amount_base_unit={usdce_bal_bu}")
+                        # Step 1: approve CollateralOnramp to spend USDC.e
+                        _approve_raw = _erc20(w3_poly, _USDCE_POLYGON).encode_abi(
+                            "approve", [Web3.to_checksum_address(_ONRAMP_POLYGON), usdce_bal_bu]
+                        )
+                        _approve_bytes = bytes.fromhex(_approve_raw[2:]) if isinstance(_approve_raw, str) else bytes(_approve_raw)
+                        _gnosis_safe_exec(
+                            w3=w3_poly, chain_id=polygon.chain_id,
+                            safe_address=polygon.wallet_address,
+                            to_address=_USDCE_POLYGON,
+                            calldata=_approve_bytes,
+                            owner_private_key=poly_pk,
+                        )
+                        _sleep(4.0)
+                        # Step 2: wrap USDC.e → pUSD via CollateralOnramp.wrap(_asset, _to, _amount)
+                        _onramp_abi = [{"name": "wrap", "type": "function", "inputs": [
+                            {"name": "_asset", "type": "address"},
+                            {"name": "_to", "type": "address"},
+                            {"name": "_amount", "type": "uint256"},
+                        ], "outputs": [], "stateMutability": "nonpayable"}]
+                        _onramp_c = w3_poly.eth.contract(
+                            address=Web3.to_checksum_address(_ONRAMP_POLYGON), abi=_onramp_abi
+                        )
+                        _wrap_raw = _onramp_c.encode_abi("wrap", [
+                            Web3.to_checksum_address(_USDCE_POLYGON),
+                            Web3.to_checksum_address(polygon.wallet_address),
+                            usdce_bal_bu,
+                        ])
+                        _wrap_bytes = bytes.fromhex(_wrap_raw[2:]) if isinstance(_wrap_raw, str) else bytes(_wrap_raw)
+                        _gnosis_safe_exec(
+                            w3=w3_poly, chain_id=polygon.chain_id,
+                            safe_address=polygon.wallet_address,
+                            to_address=_ONRAMP_POLYGON,
+                            calldata=_wrap_bytes,
+                            owner_private_key=poly_pk,
+                        )
+                        print(f"[BALANCER] wrapped_usdce_to_pusd amount_base_unit={usdce_bal_bu}")
+                except Exception as _wrap_e:
+                    print(f"[BALANCER][WARN] usdce_to_pusd_wrap_failed err={_wrap_e}")
                 try:
                     _proxy = proxy_url or None
                     _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
