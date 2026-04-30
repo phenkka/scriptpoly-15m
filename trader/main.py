@@ -5674,16 +5674,11 @@ def opportunity(opp: Opportunity) -> dict:
 
             _ba_hedge_vwap = _live_vwap_ba if _live_vwap_ba else float(poly_leg.ask)
             _ba_final_hedge_qty = _ba_net_sell_qty
-            # Polymarket charges fee IN SHARES (taker asset), not in USDC.
-            # takingAmount in API response = gross shares before fee deduction.
-            # To receive exactly pred_fill net shares on Poly, we must order gross = net / (1 - fee_factor).
-            # Actual Poly fee formula: feeRate * (1 - price) per share
-            # (verified: at p=0.345 → 4.71%, at p=0.90 → 0.72%).
-            # Note: p*(1-p) proxy used in edge-check is correct for USDC cost per net share;
-            # (1-p) is the correct formula for SHARE deduction rate.
-            _ba_taker_fee_factor = _ba_fee_rate * (1.0 - _ba_hedge_vwap)
-            _ba_final_hedge_qty_gross = _ba_final_hedge_qty / max(1e-6, 1.0 - _ba_taker_fee_factor)
-            _ba_hedge_cost_usd = _ba_final_hedge_qty_gross * _ba_hedge_vwap
+            # Polymarket fee is charged in USDC: fee = C * feeRate * p * (1-p).
+            # Shares received = exactly C (no deduction from shares).
+            # Therefore no gross inflation needed — order exactly net shares.
+            _ba_final_hedge_qty_gross = _ba_final_hedge_qty
+            _ba_hedge_cost_usd = _ba_final_hedge_qty_gross * _ba_hedge_vwap * (1.0 + _ba_fee_rate * (1.0 - _ba_hedge_vwap))
             _poly_min_hedge = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
             # Zone $0.80-$1.00 → over-hedge up to $1.00; below $0.80 → unwind on Predict
             _poly_over_hedge_threshold = float(os.environ.get("POLY_OVER_HEDGE_MIN_USD", "0.80") or "0.80")
