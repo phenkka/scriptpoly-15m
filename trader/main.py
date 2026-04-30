@@ -1452,22 +1452,22 @@ def _late_fill_watcher() -> None:
                                 _effective_pre = max(float(_saved_pre_bal), _known_floor)
                                 _bal_delta = max(0.0, _cur_bal - _effective_pre)
                                 if _bal_delta >= 0.005:
-                                    notify(
-                                        f"⚠️ <b>[ТЕСТ] Возможная незахеджированная позиция</b>\n"
-                                        f"\nMarket: <code>{mkt_id}</code>\n"
-                                        f"Order: <code>{oh[:20]}…</code>\n"
-                                        f"Баланс до ордера: {_effective_pre:.4f}\n"
-                                        f"Баланс сейчас: {_cur_bal:.4f}\n"
-                                        f"Дельта: <b>{_bal_delta:.4f}</b> шейров\n"
-                                        f"\n<i>Авто-хедж не выполнен (тестовый режим)</i>"
-                                    )
                                     print(
-                                        f"[TRADER][LATE_WATCH] ⚠️ TEST_UNHEDGED_DELTA "
+                                        f"[TRADER][LATE_WATCH] ℹ️ BAL_DELTA_ON_EXPIRY "
                                         f"hash={oh[:14]}... market_id={mkt_id} "
                                         f"effective_pre={_effective_pre:.4f} "
                                         f"(saved={float(_saved_pre_bal):.4f} floor={_known_floor:.4f}) "
-                                        f"cur={_cur_bal:.4f} delta={_bal_delta:.4f}"
+                                        f"cur={_cur_bal:.4f} delta={_bal_delta:.4f} — saved to incidents"
                                     )
+                                    _append_jsonl(_inc_path, {
+                                        "ts": datetime.utcnow().isoformat() + "Z",
+                                        "type": "balance_delta_expiry",
+                                        "order_hash": oh,
+                                        "market_id": mkt_id,
+                                        "pre_balance": round(_effective_pre, 6),
+                                        "cur_balance": round(_cur_bal, 6),
+                                        "delta": round(_bal_delta, 6),
+                                    })
                                 else:
                                     print(
                                         f"[TRADER][LATE_WATCH] ℹ️ WATCH_EXPIRED_BSC_EMPTY "
@@ -3960,8 +3960,32 @@ def _place_predict_limit_sell(
                     except Exception:
                         pass
                 if _predict_resp_is_filled(last_get):
-                    filled = True
-                    break
+                    if filled_wei == 0:
+                        # API says filled/matched but amountFilled=0 (BSC not yet confirmed).
+                        # Verify on-chain before declaring success to avoid false "sold" reports.
+                        try:
+                            _bsc_confirm = _bsc_check_order_filled(
+                                _active_order_hash, sell_qty
+                            )
+                            if _bsc_confirm > 0:
+                                filled = True
+                                filled_wei = int(_bsc_confirm * 10**18)
+                                print(
+                                    f"[TRADER]{_trace} sell_api_matched_bsc_confirmed "
+                                    f"hash={_active_order_hash} qty={_bsc_confirm:.4f}"
+                                )
+                            else:
+                                print(
+                                    f"[TRADER]{_trace} sell_api_matched_bsc_pending "
+                                    f"hash={_active_order_hash} — waiting for BSC"
+                                )
+                        except Exception as _bsc_e:
+                            print(f"[TRADER]{_trace} sell_bsc_confirm_err err={_bsc_e} — trusting API")
+                            filled = True
+                    else:
+                        filled = True
+                    if filled:
+                        break
             except Exception:
                 pass
             time.sleep(0.5)
