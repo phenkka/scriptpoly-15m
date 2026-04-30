@@ -418,7 +418,7 @@ def _ensure_poly_exchange_approvals(
 def _poly_update_balance_allowance(
     *,
     session: requests.Session,
-    safe_address: str,
+    owner_pk: str,
     api_key: str,
     api_secret: str,
     api_passphrase: str,
@@ -428,14 +428,20 @@ def _poly_update_balance_allowance(
     After redeemPositions, pUSD lands in the Gnosis Safe. The CLOB needs to
     be notified via GET /balance-allowance/update (L2 HMAC auth) to see the
     new balance and stop showing the 'Activate Funds' popup.
+
+    POLY_ADDRESS must be the EOA address (from POLY_PRIVATE_KEY), not the Safe
+    address — the API key is keyed to the EOA, same as py-clob-client-v2's
+    create_level_2_headers(signer, ...) which uses signer.address() = EOA.
+    signature_type=2 in params tells the CLOB to scan the associated Safe's balance.
     """
-    if not all([api_key, api_secret, api_passphrase]):
+    if not all([owner_pk, api_key, api_secret, api_passphrase]):
         log.info("poly_update_balance_skip no_api_creds")
         return
     try:
         import hmac as _hmac
         import hashlib as _hashlib
         import base64 as _base64
+        eoa_address = Account.from_key(_normalize_hex_key(owner_pk)).address
         ts = int(datetime.now().timestamp())
         path = "/balance-allowance/update"
         method = "GET"
@@ -444,13 +450,14 @@ def _poly_update_balance_allowance(
         h = _hmac.new(raw_secret, msg.encode("utf-8"), _hashlib.sha256)
         sig = _base64.urlsafe_b64encode(h.digest()).decode("utf-8")
         headers = {
-            "POLY_ADDRESS": safe_address,
+            "POLY_ADDRESS": eoa_address,
             "POLY_SIGNATURE": sig,
             "POLY_TIMESTAMP": str(ts),
             "POLY_API_KEY": api_key,
             "POLY_PASSPHRASE": api_passphrase,
         }
-        # asset_type=COLLATERAL refreshes pUSD balance visible to the CLOB
+        # asset_type=COLLATERAL refreshes pUSD balance visible to the CLOB;
+        # signature_type=2 tells the CLOB to scan the Safe's on-chain balance
         params = {"signature_type": 2, "asset_type": "COLLATERAL"}
         r = session.get(
             f"https://clob.polymarket.com{path}",
@@ -951,7 +958,7 @@ def main() -> None:
                     # Notify CLOB to re-scan balance — suppresses 'Activate Funds' popup
                     _poly_update_balance_allowance(
                         session=session,
-                        safe_address=safe_address,
+                        owner_pk=owner_pk,
                         api_key=os.environ.get("POLY_API_KEY", "").strip(),
                         api_secret=os.environ.get("POLY_SECRET", "").strip(),
                         api_passphrase=os.environ.get("POLY_PASSPHRASE", "").strip(),
