@@ -3,7 +3,8 @@
 Планировщик: запускается в :01 каждого часа (маркеты разрешаются на :00).
 
 Polymarket (Polygon, Gnosis Safe):
-  • GET data-api.polymarket.com/positions → позиции с redeemable=True + curPrice>0.95
+  • GET data-api.polymarket.com/positions → позиции с redeemable=True (пагинация)
+  • Фильтр победителей: on-chain payoutNumerators(conditionId, outcomeIndex) > 0
   • Вызывает ConditionalTokens.redeemPositions через Gnosis Safe execTransaction
 
 Predict.fun (BSC, Kernel wallet):
@@ -19,6 +20,7 @@ import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -129,6 +131,16 @@ _CTF_ABI = [
         "name": "redeemPositions",
         "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "index", "type": "uint256"},
+        ],
+        "name": "payoutNumerators",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
         "type": "function",
     },
 ]
@@ -452,21 +464,35 @@ def _poly_update_balance_allowance(
 
 
 def _fetch_poly_positions(session: requests.Session, safe_address: str) -> list[dict]:
-    """Return all redeemable Polymarket positions for the given address."""
-    r = session.get(
-        f"{POLY_POSITIONS_URL}?user={safe_address}&sizeThreshold=0.01&limit=100",
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict):
-        data = data.get("positions", data.get("data", []))
-    # Include positions that are either flagged redeemable OR have curPrice > 0.95
-    # (Polymarket API sometimes lags updating redeemable=True after resolution)
-    return [
-        p for p in (data or [])
-        if p.get("redeemable") or float(p.get("curPrice") or 0) > 0.95
-    ]
+    """Return all redeemable Polymarket positions for the given address.
+
+    Paginates through all pages (limit=100 per page) so positions beyond
+    the first 100 are not missed when the wallet has a large position history.
+    """
+    all_positions: list[dict] = []
+    limit = 100
+    offset = 0
+    while True:
+        r = session.get(
+            f"{POLY_POSITIONS_URL}?user={safe_address}&sizeThreshold=0.01"
+            f"&limit={limit}&offset={offset}",
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data = data.get("positions", data.get("data", []))
+        page = data or []
+        # Include positions that are either flagged redeemable OR have curPrice > 0.95
+        # (Polymarket API sometimes lags updating redeemable=True after resolution)
+        all_positions.extend(
+            p for p in page
+            if p.get("redeemable") or float(p.get("curPrice") or 0) > 0.95
+        )
+        if len(page) < limit:
+            break  # last page
+        offset += limit
+    return all_positions
 
 
 def _claim_polymarket(
@@ -477,26 +503,54 @@ def _claim_polymarket(
     owner_pk: str,
     session: requests.Session,
     claimed: set[str],
+    known_losers: set[str],
     dry_run: bool,
 ) -> int:
     """Redeem winning Polymarket positions via Gnosis Safe. Returns count redeemed."""
     positions = _fetch_poly_positions(session, safe_address)
-    winning = [p for p in positions if float(p.get("curPrice", 0)) > 0.95]
-    log.info(f"poly_positions total={len(positions)} winning={len(winning)}")
-
     ctf = w3.eth.contract(address=Web3.to_checksum_address(POLY_CTF_ADDRESS), abi=_CTF_ABI)
-    total_usd = sum(float(p.get("size", 0)) for p in winning)
+
+    # Pass 1: parallel payoutNumerators checks (read-only, safe to parallelise).
+    # curPrice from the API is unreliable for resolved markets (shows 0 for all
+    # outcomes regardless of who won), so we check on-chain instead.
+    to_check = [
+        p for p in positions
+        if p["conditionId"] not in claimed
+        and f"{p['conditionId']}:{int(p.get('outcomeIndex', 0))}" not in known_losers
+    ]
+
+    def _check_payout(pos: dict) -> tuple[dict | None, str | None]:
+        cid = pos["conditionId"]
+        idx = int(pos.get("outcomeIndex", 0))
+        cid_bytes = bytes.fromhex(cid[2:] if cid.startswith("0x") else cid)
+        try:
+            payout = ctf.functions.payoutNumerators(cid_bytes, idx).call()
+            return (pos, None) if payout > 0 else (None, f"{cid}:{idx}")
+        except Exception as e:
+            log.warning(f"poly_payout_check_failed condition={cid[:14]}... err={e}")
+            return None, None
+
+    winners: list[dict] = []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for pos, loser_key in pool.map(_check_payout, to_check):
+            if loser_key:
+                known_losers.add(loser_key)
+            elif pos is not None:
+                winners.append(pos)
+
+    log.info(f"poly_positions total={len(positions)} unchecked={len(to_check)} winners={len(winners)}")
+
+    # Pass 2: sequential redemption for winners (Safe nonce must be serial).
+    total_usd = 0.0
     redeemed = 0
-
-    for pos in winning:
+    for pos in winners:
         condition_id: str = pos["conditionId"]
-        if condition_id in claimed:
-            log.info(f"poly_skip already_claimed condition={condition_id[:14]}...")
-            continue
-
         outcome_index = int(pos.get("outcomeIndex", 0))
         index_set = 1 << outcome_index  # outcomeIndex=0 → 1, outcomeIndex=1 → 2
         size = float(pos.get("size", 0))
+        cid_bytes = bytes.fromhex(
+            condition_id[2:] if condition_id.startswith("0x") else condition_id
+        )
 
         # Verify on-chain balance before submitting tx (asset = ERC1155 token ID)
         asset_id = pos.get("asset")
@@ -513,9 +567,7 @@ def _claim_polymarket(
             except Exception as e:
                 log.warning(f"poly_balance_check_failed condition={condition_id[:14]}... err={e}")
 
-        cid_bytes = bytes.fromhex(
-            condition_id[2:] if condition_id.startswith("0x") else condition_id
-        )
+        total_usd += size
         calldata = _encode_abi_bytes(
             ctf.encode_abi(
                 "redeemPositions",
@@ -558,7 +610,7 @@ def _claim_polymarket(
                 "size": size,
                 "tx_hash": txh,
             })
-            _notify(                
+            _notify(
                 f"💰 <b>CLAIM FROM POLYMARKET</b>\n"
                 f"+{size:.2f}$\n"
             )
@@ -855,8 +907,9 @@ def main() -> None:
         f"predict_account={predict_account} interval={_interval}s"
     )
 
-    # In-memory claimed set — idempotent (on-chain balance check предотвращает двойной клейм)
+    # In-memory sets — idempotent (on-chain balance check предотвращает двойной клейм)
     claimed: set[str] = set()
+    known_losers: set[str] = set()  # confirmed losers cached to avoid repeat RPC calls
     session = _make_session()
     session.headers.update({"x-api-key": predict_api_key})
 
@@ -891,6 +944,7 @@ def main() -> None:
                         owner_pk=owner_pk,
                         session=session,
                         claimed=claimed,
+                        known_losers=known_losers,
                         dry_run=dry_run,
                     )
                     log.info(f"poly_claimed count={n}")

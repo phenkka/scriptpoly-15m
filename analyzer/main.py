@@ -248,6 +248,10 @@ def _check_arbitrage() -> None:
             (max(0.0, pred_bankroll_usd - pred_reserve_usd) / target_bid) if pred_bankroll_usd > 0 else depth_poly_ask,
             (trader_max_trade_usd / (target_bid + poly_ask_top)) if trader_max_trade_usd > 0 else depth_poly_ask,
         )
+        # Floor to 2 decimal places: keeps order sizes clean on both exchanges.
+        # Non-round q_ba causes Predict bid to be filled in fragments and Poly hedge
+        # to be an odd number of shares (e.g. 10.3401 instead of 10.34).
+        q_ba = int(q_ba * 100) / 100
         if q_ba <= 0.0:
             continue
 
