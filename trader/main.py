@@ -6206,8 +6206,8 @@ def opportunity(opp: Opportunity) -> dict:
                 # Store authoritative net_pnl so downstream code doesn't need to recalculate
                 row["net_pnl"] = round(_ba_net_pnl, 6)
                 # Update live_hedge_recheck with actual executed prices so stored PnL is accurate
-                # Fee rate as share deduction fraction: feeRate * (1-price)
-                _actual_poly_fee = _ba_fee_rate * (1.0 - _ba_poly_price)
+                # Polymarket taker fee in USDC per share: feeRate * p * (1-p)
+                _actual_poly_fee = _ba_fee_rate * _ba_poly_price * (1.0 - _ba_poly_price)
                 _actual_net_edge = (_ba_net_pnl / _ba_hedge_qty) if _ba_hedge_qty > 0 else 0.0
                 if "live_hedge_recheck" in row:
                     row["live_hedge_recheck"]["live_poly_vwap"] = round(_ba_poly_price, 6)
@@ -6296,7 +6296,8 @@ def opportunity(opp: Opportunity) -> dict:
                             print(f"[TRADER][MISMATCH] rebuy_recheck_failed err={_mm_rc_e}")
 
                     if _mm_poly_bought:
-                        _mm_status = f"✅ bought {_ba_mismatch_shares:.3f} shares @ {_mm_poly_price:.2f} on Poly"
+                        _mm_poly_eff_price = _mm_poly_price * (1.0 + _ba_fee_rate * (1.0 - _mm_poly_price))
+                        _mm_status = f"✅ bought {_ba_mismatch_shares:.3f} shares @ {_mm_poly_eff_price:.2f} on Poly"
                         notify(
                             f"⚠️ <b>POLY PARTIAL FILL — rebuying on Poly</b>\n"
                             f"<i>Poly filled {_ba_poly_qty_actual:.3f} of {_ba_net_sell_qty:.3f} shares</i>\n"
@@ -6512,9 +6513,11 @@ def opportunity(opp: Opportunity) -> dict:
                 else:
                     _pnl_suffix = " — in the red"
                 _pnl_emoji = "📈" if _ba_net_pnl >= 0 else "📉"
-                # Recalculate ROI based on corrected PnL and actual net stake
+                # Recalculate ROI based on corrected PnL and actual net stake.
+                # For Polymarket display/cost use effective price including taker fee.
                 _net_pred_cost = _notif_pred_qty * _ba_pred_price
-                _net_poly_cost = _notif_poly_qty * _ba_poly_price
+                _ba_poly_price_eff = _ba_poly_price * (1.0 + _ba_fee_rate * (1.0 - _ba_poly_price))
+                _net_poly_cost = _notif_poly_qty * _ba_poly_price_eff
                 _total_stake_corrected = _net_poly_cost + _net_pred_cost
                 _roi_pct = (_ba_net_pnl / _total_stake_corrected * 100) if _total_stake_corrected > 0 else 0.0
                 _cum_line = f"<i>total ×{_fill_n}: {_cum_pnl:+.2f}$</i>\n" if _fill_n > 1 else ""
@@ -6541,7 +6544,7 @@ def opportunity(opp: Opportunity) -> dict:
                     f"<b>{opp.label}</b>\n"
                     f"\n"
                     f"<b>Polymarket</b>  {poly_leg.side.upper()}\n"
-                    f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price:.2f}</code>  =  <b>${_net_poly_cost:.2f}</b>\n"
+                    f"  {_notif_poly_qty:.3f} shares  @  <code>{_ba_poly_price_eff:.2f}</code>  =  <b>${_net_poly_cost:.2f}</b>\n"
                     f"<b>Predict</b>  {pred_leg.side.upper()}\n"
                     f"  {_notif_pred_qty:.3f} shares  @  <code>{_ba_pred_price:.2f}</code>  =  <b>${_net_pred_cost:.2f}</b>\n"
                     + f"\n"
@@ -6554,9 +6557,10 @@ def opportunity(opp: Opportunity) -> dict:
                 # Second CLOB order (mismatch top-up) → reply in thread so 2nd buy is visible
                 if _mm_poly_bought and _msg_id is not None and _ba_mismatch_shares > _ba_mismatch_threshold:
                     _mm_p2 = _mm_poly_price if _mm_poly_price is not None else _ba_poly_price
+                    _mm_p2_eff = _mm_p2 * (1.0 + _ba_fee_rate * (1.0 - _mm_p2))
                     notify(
                         f"➕ <b>Polymarket top-up (2nd order)</b>\n"
-                        f"+{_ba_mismatch_shares:.3f} sh  @  <code>{_mm_p2:.2f}</code>\n"
+                        f"+{_ba_mismatch_shares:.3f} sh  @  <code>{_mm_p2_eff:.2f}</code>\n"
                         f"<i>First hedge was short vs Predict — 2nd buy to match</i>\n",
                         reply_to_message_id=_msg_id,
                     )
