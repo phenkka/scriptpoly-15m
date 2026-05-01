@@ -6237,63 +6237,66 @@ def opportunity(opp: Opportunity) -> dict:
                 _mm_poly_price: float | None = None
 
                 if _ba_mismatch_shares > _ba_mismatch_threshold:
-                    # First try: buy the missing shares on Poly at current market price.
-                    # Cheaper than selling excess on Predict (avoids bid-ask spread loss).
+                    # By default prefer selling excess on Predict to avoid a second Poly taker fee.
+                    # Enable Poly rebuy only explicitly via env for aggressive re-hedging.
+                    _mm_rebuy_env = (os.environ.get("MISMATCH_REBUY_ON_POLY", "0") or "0").strip().lower()
+                    _mm_allow_poly_rebuy = _mm_rebuy_env in ("1", "true", "yes", "on")
                     _mm_action = "sell_predict"
-                    try:
-                        _mm_book = _polymarket_book(str(poly_leg.token_id))
-                        _mm_vwap_worst = _vwap_and_worst_from_poly_book(_mm_book, _ba_mismatch_shares)
-                        if _mm_vwap_worst:
-                            _mm_vwap, _mm_worst = _mm_vwap_worst
-                            # Only buy if arb edge still holds AND price hasn't drifted too far
-                            _mm_edge = 1.0 - _ba_actual_pred_bid - _mm_vwap - _ba_fee_rate * _mm_vwap * (1.0 - _mm_vwap)
-                            _mm_price_drift = _mm_vwap - _ba_poly_price
-                            _mm_max_drift = float(os.environ.get("MISMATCH_MAX_POLY_DRIFT", "0.1") or "0.1")
-                            if _mm_edge > 0 and _mm_price_drift <= _mm_max_drift:
-                                _mm_limit = min(0.99, _math.ceil(_mm_worst * 1000) / 1000)
-                                _mm_poly_result = _place_polymarket_limit_buy_exact_shares(
-                                    str(poly_leg.token_id),
-                                    shares=_ba_mismatch_shares,
-                                    price=_mm_limit,
-                                    private_key=_poly_pk,
-                                    funder=_poly_funder,
-                                    signature_type=_poly_sig_type,
-                                    poly_api_key=_poly_api_key,
-                                    poly_secret=_poly_secret,
-                                    poly_passphrase=_poly_passphrase,
-                                )
-                                _mm_poly_bought = _mm_poly_result.get("filled", False)
-                                _mm_poly_price = _mm_vwap
-                                _mm_action = "buy_poly"
-                    except Exception as _mm_poly_e:
-                        print(f"[TRADER][MISMATCH] poly_rebuy failed: {_mm_poly_e}")
-                        # The request may have been received by Polymarket before the timeout
-                        # (classic "sent but response lost"). Re-read actual Poly balance before
-                        # deciding the rebuy failed — avoids selling excess Predict when Poly
-                        # actually executed.
+                    if _mm_allow_poly_rebuy:
                         try:
-                            time.sleep(2.5)
-                            _mm_recheck_sh, _, _ = _poly_ba_reconcile_shares(
-                                str(poly_leg.token_id), _poly_funder
-                            )
-                            _mm_expected = _ba_poly_qty_actual + _ba_mismatch_shares
-                            if _mm_recheck_sh >= _mm_expected * 0.95:
-                                _mm_poly_bought = True
-                                _mm_poly_price = _mm_poly_price or _ba_poly_price
-                                _mm_action = "buy_poly"
-                                print(
-                                    f"[TRADER][MISMATCH] rebuy_timeout_but_reconcile_ok "
-                                    f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
-                                    f"— treating rebuy as filled"
+                            _mm_book = _polymarket_book(str(poly_leg.token_id))
+                            _mm_vwap_worst = _vwap_and_worst_from_poly_book(_mm_book, _ba_mismatch_shares)
+                            if _mm_vwap_worst:
+                                _mm_vwap, _mm_worst = _mm_vwap_worst
+                                # Only buy if arb edge still holds AND price hasn't drifted too far
+                                _mm_edge = 1.0 - _ba_actual_pred_bid - _mm_vwap - _ba_fee_rate * _mm_vwap * (1.0 - _mm_vwap)
+                                _mm_price_drift = _mm_vwap - _ba_poly_price
+                                _mm_max_drift = float(os.environ.get("MISMATCH_MAX_POLY_DRIFT", "0.1") or "0.1")
+                                if _mm_edge > 0 and _mm_price_drift <= _mm_max_drift:
+                                    _mm_limit = min(0.99, _math.ceil(_mm_worst * 1000) / 1000)
+                                    _mm_poly_result = _place_polymarket_limit_buy_exact_shares(
+                                        str(poly_leg.token_id),
+                                        shares=_ba_mismatch_shares,
+                                        price=_mm_limit,
+                                        private_key=_poly_pk,
+                                        funder=_poly_funder,
+                                        signature_type=_poly_sig_type,
+                                        poly_api_key=_poly_api_key,
+                                        poly_secret=_poly_secret,
+                                        poly_passphrase=_poly_passphrase,
+                                    )
+                                    _mm_poly_bought = _mm_poly_result.get("filled", False)
+                                    _mm_poly_price = _mm_vwap
+                                    _mm_action = "buy_poly"
+                        except Exception as _mm_poly_e:
+                            print(f"[TRADER][MISMATCH] poly_rebuy failed: {_mm_poly_e}")
+                            # The request may have been received by Polymarket before the timeout
+                            # (classic "sent but response lost"). Re-read actual Poly balance before
+                            # deciding the rebuy failed — avoids selling excess Predict when Poly
+                            # actually executed.
+                            try:
+                                time.sleep(2.5)
+                                _mm_recheck_sh, _, _ = _poly_ba_reconcile_shares(
+                                    str(poly_leg.token_id), _poly_funder
                                 )
-                            else:
-                                print(
-                                    f"[TRADER][MISMATCH] rebuy_timeout_reconcile_fail "
-                                    f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
-                                    f"err={_mm_poly_e}"
-                                )
-                        except Exception as _mm_rc_e:
-                            print(f"[TRADER][MISMATCH] rebuy_recheck_failed err={_mm_rc_e}")
+                                _mm_expected = _ba_poly_qty_actual + _ba_mismatch_shares
+                                if _mm_recheck_sh >= _mm_expected * 0.95:
+                                    _mm_poly_bought = True
+                                    _mm_poly_price = _mm_poly_price or _ba_poly_price
+                                    _mm_action = "buy_poly"
+                                    print(
+                                        f"[TRADER][MISMATCH] rebuy_timeout_but_reconcile_ok "
+                                        f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
+                                        f"— treating rebuy as filled"
+                                    )
+                                else:
+                                    print(
+                                        f"[TRADER][MISMATCH] rebuy_timeout_reconcile_fail "
+                                        f"expected={_mm_expected:.4f} actual={_mm_recheck_sh:.4f} "
+                                        f"err={_mm_poly_e}"
+                                    )
+                            except Exception as _mm_rc_e:
+                                print(f"[TRADER][MISMATCH] rebuy_recheck_failed err={_mm_rc_e}")
 
                     if _mm_poly_bought:
                         _mm_poly_eff_price = _mm_poly_price * (1.0 + _ba_fee_rate * (1.0 - _mm_poly_price))
