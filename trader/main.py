@@ -6128,17 +6128,9 @@ def opportunity(opp: Opportunity) -> dict:
             # cancel (auth_order path) — that response has size_matched but no takingAmount.
             if _ba_poly_qty == 0 and _ba_poly_size_matched > 0:
                 _ba_poly_qty = _ba_poly_size_matched
-            # takingAmount = gross shares BEFORE Poly fee deduction from shares.
-            # Net shares actually credited = gross * (1 - feeRate * max(fill_price, 1-fill_price)).
+            # takingAmount/size_matched are already shares filled on Polymarket.
+            # Taker fee is charged in USDC, not deducted from shares.
             _ba_poly_qty_actual = _ba_poly_qty
-            try:
-                _ba_poly_making_val = float(_ba_poly_resp.get("makingAmount") or 0)
-                if _ba_poly_making_val > 0 and _ba_poly_qty > 0:
-                    _ba_poly_fill_price = _ba_poly_making_val / _ba_poly_qty
-                    _ba_poly_net_fee_factor = _ba_fee_rate * (1.0 - _ba_poly_fill_price)
-                    _ba_poly_qty_actual = _ba_poly_qty * (1.0 - _ba_poly_net_fee_factor)
-            except Exception:
-                pass
             _ba_residual = abs(_ba_hedge_qty - _ba_poly_qty_actual)
 
             row["fill_analysis"] = {
@@ -6478,7 +6470,7 @@ def opportunity(opp: Opportunity) -> dict:
                 _append_jsonl(success_trades_file, row)
 
                 # Effective quantities for notification: adjust for mismatch correction (no extra lines in TG)
-                _notif_poly_qty = _ba_poly_qty_actual  # net shares after Poly fee (≈gross at high prices)
+                _notif_poly_qty = _ba_poly_qty_actual  # actual shares filled on Polymarket
                 _notif_pred_qty = _ba_hedge_qty
                 if _ba_mismatch_shares > _ba_mismatch_threshold and _ba_mismatch_corrected:
                     _mm_action_final = locals().get("_mm_action", "sell_predict")
