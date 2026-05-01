@@ -741,14 +741,21 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
         positions = s.get("https://api.predict.fun/v1/positions?limit=500", timeout=12).json().get("data") or []
         total = 0.0
         for pos in positions:
-            # Prefer explicit USD valuation fields if present
-            try:
-                val = pos.get("valueUsd") or pos.get("currentValue") or pos.get("value")
-                if val is not None:
-                    total += float(val)
-                    continue
-            except Exception:
-                pass
+            # NOTE: use explicit None checks — valueUsd may be integer 0 (falsy) even for live positions
+            val = pos.get("valueUsd")
+            if val is None:
+                val = pos.get("currentValue")
+            if val is None:
+                val = pos.get("value")
+            if val is not None:
+                try:
+                    fv = float(val)
+                    if fv > 0:
+                        total += fv
+                        continue
+                    # API returns 0 → fall through to estimation
+                except Exception:
+                    pass
 
             market = pos.get("market") or {}
             outcome = pos.get("outcome") or {}
@@ -760,18 +767,35 @@ def _fetch_predict_portfolio_usd(predict_account: str, pred_pk: str, proxy: str 
             if shares <= 0:
                 continue
             # For resolved WON positions: worth full $1/share until claimed
-            if market.get("status") == "RESOLVED":
+            mkt_status = (market.get("status") or "").upper()
+            if mkt_status == "RESOLVED":
                 if (outcome.get("status") or "").upper() == "WON":
                     total += shares
                 # LOST positions are worth $0 — skip
                 continue
-            try:
-                cur_yes = float(market.get("curYesPrice", 0) or 0)
-            except Exception:
-                cur_yes = 0.0
-            side = (outcome.get("side") or "YES").upper()
-            price = cur_yes if side == "YES" else (1.0 - cur_yes)
-            total += shares * price
+            # Try various field names for current yes price
+            cur_yes = 0.0
+            for _pk in ("curYesPrice", "currentYesPrice", "yes_price", "yesPrice"):
+                _raw = market.get(_pk)
+                if _raw is not None:
+                    try:
+                        cur_yes = float(_raw)
+                        break
+                    except Exception:
+                        pass
+            if cur_yes > 0:
+                side = (outcome.get("side") or "YES").upper()
+                price = cur_yes if side == "YES" else (1.0 - cur_yes)
+                total += shares * price
+            else:
+                # Fallback: cost basis (averageBuyPriceUsd × shares).
+                # API does not return curYesPrice in positions endpoint → use what
+                # was paid as a conservative proxy for locked capital.
+                try:
+                    avg_price = float(pos.get("averageBuyPriceUsd") or 0)
+                    total += shares * avg_price
+                except Exception:
+                    pass
         return total
     except Exception as e:
         print(f"[BALANCER][WARN] predict_portfolio_fetch_failed err={e}")
