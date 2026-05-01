@@ -204,57 +204,129 @@ async def cmd_settings(message: Message) -> None:
 async def cmd_balance(message: Message) -> None:
     if message.chat.id != _allowed_chat_id:
         return
-    url = os.environ.get("BALANCER_STATUS_URL", "http://balancer:8081/status")
+    wait_msg = await message.answer("⏳ Fetching live on-chain balance…")
+    live_url = os.environ.get("BALANCER_LIVE_URL", "http://balancer:8081/balance/live")
     try:
         import aiohttp
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, timeout=6) as resp:
+            async with sess.get(live_url, timeout=30) as resp:
                 data = await resp.json()
     except Exception as e:
-        await message.answer(f"❌ Failed to fetch balance: {e}")
+        await wait_msg.edit_text(f"❌ Failed to fetch balance: {e}")
         return
 
-    poly_cash = data.get("poly_cash")
-    poly_portfolio = data.get("poly_portfolio")
-    poly_total = data.get("poly_total")
-    bsc_cash = data.get("bsc_cash")
-    predict_account_cash = data.get("predict_account_cash")
-    predict_portfolio = data.get("predict_portfolio")
-    pred_trigger_bal = data.get("pred_trigger_bal")
-    total_cash = data.get("total_cash")
-    total_with_pos = data.get("total_with_pos")
-
-    def _fmt(v):
+    def _fmt(v) -> str:
         try:
             return f"${float(v):.2f}"
         except Exception:
-            return "unknown"
+            return "—"
 
-    # Polymarket: show Portfolio (positions) and Funds (liquid)
-    poly_portfolio_str = _fmt(poly_portfolio) if poly_portfolio is not None else "unknown"
-    poly_funds_str = _fmt(poly_cash) if poly_cash is not None else "unknown"
-    poly_total_str = _fmt(poly_total) if poly_total is not None else "unknown"
+    def _fmt_delta(v) -> str:
+        try:
+            f = float(v)
+            sign = "+" if f >= 0 else ""
+            return f"{sign}${f:.2f}"
+        except Exception:
+            return "—"
 
-    pred_portfolio_str = _fmt(predict_portfolio) if predict_portfolio is not None else "unknown"
-    pred_funds_str = _fmt(pred_trigger_bal) if pred_trigger_bal is not None else "unknown"
-    pred_total_str = _fmt((predict_portfolio or 0.0) + (pred_trigger_bal or 0.0)) if (predict_portfolio is not None or pred_trigger_bal is not None) else "unknown"
+    poly_cash = data.get("poly_cash")
+    poly_port = data.get("poly_portfolio")
+    poly_total = data.get("poly_total")
+    pred_cash = data.get("pred_cash")
+    pred_port = data.get("predict_portfolio")
+    pred_total = data.get("pred_total")
+    total = data.get("total_with_pos")
+    pnl = data.get("pnl_from_trades")
+    trade_count = data.get("trade_count", 0)
+    balance_delta = data.get("balance_delta")
+    baseline_total = data.get("baseline_total")
+    baseline_ts = data.get("baseline_ts", "")
+    fetched_at = data.get("fetched_at", "")[:19].replace("T", " ")
 
-    overall_total_str = _fmt(total_with_pos) if total_with_pos is not None else (_fmt(total_cash) if total_cash is not None else "unknown")
+    poly_pos = (poly_port or 0) - 0
+    pred_pos = (pred_port or 0) - 0
+
+    def _side_line(name: str, cash, portfolio, total_v) -> str:
+        if portfolio and float(portfolio) > 0.01:
+            return f"{name}: <b>{_fmt(total_v)}</b>  <i>(cash {_fmt(cash)} + pos {_fmt(portfolio)})</i>\n"
+        return f"{name}: <b>{_fmt(cash)}</b>\n"
 
     text = (
-        "<b>📊 CURRENT BALANCE</b>\n\n"
-        "<b>Polymarket</b>\n"
-        f"Portfolio: <b>{poly_portfolio_str}</b>\n"
-        f"Funds: <b>{poly_funds_str}</b>\n"
-        f"Subtotal: <b>{poly_total_str}</b>\n\n"
-        "<b>Predict</b>\n"
-        f"Portfolio: <b>{pred_portfolio_str}</b>\n"
-        f"Funds: <b>{pred_funds_str}</b>\n"
-        f"Subtotal: <b>{pred_total_str}</b>\n\n"
-        f"<b>TOTAL (incl. positions): {overall_total_str}</b>\n"
+        f"<b>📊 LIVE BALANCE</b>  <i>{fetched_at} UTC</i>\n\n"
+        + _side_line("Polymarket", poly_cash, poly_port, poly_total)
+        + _side_line("Predict", pred_cash, pred_port, pred_total)
+        + f"\n<b>TOTAL: {_fmt(total)}</b>\n"
     )
 
-    await message.answer(text, parse_mode="HTML")
+    if baseline_total is not None:
+        bl_date = (baseline_ts or "")[:10]
+        delta_emoji = "📈" if (balance_delta or 0) >= 0 else "📉"
+        text += f"\n{delta_emoji} vs baseline ({bl_date}): <b>{_fmt_delta(balance_delta)}</b>  <i>(was {_fmt(baseline_total)})</i>\n"
+
+    if pnl is not None:
+        pnl_emoji = "📈" if float(pnl) >= 0 else "📉"
+        text += f"{pnl_emoji} PnL from trades ({trade_count} trades): <b>{_fmt_delta(pnl)}</b>\n"
+
+    if baseline_total is None:
+        text += "\n<i>💡 Use /setbaseline to set current balance as reference point for PnL tracking</i>\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📍 Set as baseline", callback_data="balance:set_baseline"),
+    ]])
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(Command("setbaseline"))
+async def cmd_setbaseline(message: Message) -> None:
+    if message.chat.id != _allowed_chat_id:
+        return
+    wait_msg = await message.answer("⏳ Fetching live balance to set baseline…")
+    baseline_url = os.environ.get("BALANCER_BASELINE_URL", "http://balancer:8081/balance/baseline")
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(baseline_url, timeout=30) as resp:
+                data = await resp.json()
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Failed: {e}")
+        return
+    if data.get("ok"):
+        ts = (data.get("ts") or "")[:19].replace("T", " ")
+        await wait_msg.edit_text(
+            f"✅ Baseline set: <b>${float(data['baseline']):.2f}</b>  <i>({ts} UTC)</i>\n\n"
+            f"Future /balance will show balance change relative to this point.",
+            parse_mode="HTML",
+        )
+    else:
+        await wait_msg.edit_text(f"❌ Error: {data.get('error')}")
+
+
+@router.callback_query(F.data == "balance:set_baseline")
+async def cb_set_baseline(callback: CallbackQuery) -> None:
+    if callback.message.chat.id != _allowed_chat_id:
+        await callback.answer()
+        return
+    await callback.answer("Setting baseline…")
+    baseline_url = os.environ.get("BALANCER_BASELINE_URL", "http://balancer:8081/balance/baseline")
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(baseline_url, timeout=30) as resp:
+                data = await resp.json()
+        if data.get("ok"):
+            ts = (data.get("ts") or "")[:19].replace("T", " ")
+            await callback.message.answer(
+                f"✅ Baseline set: <b>${float(data['baseline']):.2f}</b>  <i>({ts} UTC)</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await callback.message.answer(f"❌ Error: {data.get('error')}")
+    except Exception as e:
+        await callback.message.answer(f"❌ Failed: {e}")
 
 
 @router.message(Command("cancel"))

@@ -1214,22 +1214,137 @@ def main() -> None:
     BALANCER_STATUS: dict = {}
     BALANCER_STATUS_LOCK = threading.Lock()
 
+    _BASELINE_FILE = Path(os.environ.get("BALANCE_BASELINE_FILE", "/data/balance_baseline.json"))
+
+    def _load_baseline() -> dict | None:
+        try:
+            return json.loads(_BASELINE_FILE.read_text())
+        except Exception:
+            return None
+
+    def _save_baseline(data: dict) -> None:
+        try:
+            _BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _BASELINE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(_BASELINE_FILE)
+        except Exception as e:
+            print(f"[BALANCER][WARN] save_baseline err={e}")
+
+    def _total_pnl_all_time() -> tuple[float, int]:
+        """Sum net_pnl from all successful trades ever. Returns (total_pnl, trade_count)."""
+        p = Path(os.environ.get("TRADER_SUCCESS_TRADES_FILE", "/data/trades_success.jsonl"))
+        if not p.exists():
+            return 0.0, 0
+        total, count = 0.0, 0
+        pred_fee_bps = float(os.environ.get("PREDICT_FEE_BPS", "0") or "0")
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                if not row.get("ok"):
+                    continue
+                if "net_pnl" in row:
+                    total += float(row["net_pnl"])
+                else:
+                    lr = row.get("live_hedge_recheck") or {}
+                    hq = float(lr.get("hedge_qty") or 0)
+                    pb = float(lr.get("pred_bid") or 0)
+                    vwap = float(lr.get("live_poly_vwap") or 0)
+                    lf = float(lr.get("live_poly_fee") or 0)
+                    gross = hq * (1.0 - pb - vwap)
+                    total += gross - lf * hq - pred_fee_bps / 10_000 * pb * hq
+                count += 1
+            except Exception:
+                pass
+        return total, count
+
+    def _fetch_live_balance() -> dict:
+        """Fetch fresh on-chain + venue API balances. Blocks ~5-15s."""
+        _proxy = proxy_url or None
+        poly_cash, pred_cash, poly_port, pred_port = _fetch_hourly_balance_snapshot(
+            bsc_rpcs=bsc_rpcs,
+            polygon_rpcs=polygon_rpcs,
+            bsc_token=bsc_usdt,
+            poly_token=polygon_usdce,
+            pred_wallet=pred_wallet,
+            poly_wallet=poly_wallet,
+            poly_funder=poly_funder,
+            predict_account=predict_account_addr,
+            pred_pk=pred_pk,
+            proxy=_proxy,
+        )
+        total = poly_cash + poly_port + pred_cash + pred_port
+        pnl_total, trade_count = _total_pnl_all_time()
+        baseline = _load_baseline()
+        balance_delta: float | None = None
+        baseline_total: float | None = None
+        baseline_ts: str | None = None
+        if baseline:
+            baseline_total = float(baseline.get("total", 0))
+            baseline_ts = baseline.get("ts")
+            balance_delta = round(total - baseline_total, 4)
+        return {
+            "poly_cash": round(poly_cash, 4),
+            "poly_portfolio": round(poly_port, 4),
+            "poly_total": round(poly_cash + poly_port, 4),
+            "pred_cash": round(pred_cash, 4),
+            "predict_portfolio": round(pred_port, 4),
+            "pred_total": round(pred_cash + pred_port, 4),
+            "total_with_pos": round(total, 4),
+            "pnl_from_trades": round(pnl_total, 4),
+            "trade_count": trade_count,
+            "balance_delta": balance_delta,
+            "baseline_total": baseline_total,
+            "baseline_ts": baseline_ts,
+            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+
     class _StatusHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # suppress access logs
+            pass
+
+        def _send_json(self, data: dict, status: int = 200) -> None:
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
-            if self.path != "/status":
+            if self.path == "/status":
+                try:
+                    with BALANCER_STATUS_LOCK:
+                        self._send_json(BALANCER_STATUS)
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+            elif self.path == "/balance/live":
+                try:
+                    self._send_json(_fetch_live_balance())
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+            else:
                 self.send_response(404)
                 self.end_headers()
-                return
-            try:
-                with BALANCER_STATUS_LOCK:
-                    body = json.dumps(BALANCER_STATUS).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                self.send_response(500)
+
+        def do_POST(self):
+            if self.path == "/balance/baseline":
+                try:
+                    data = _fetch_live_balance()
+                    _save_baseline({
+                        "total": data["total_with_pos"],
+                        "ts": data["fetched_at"],
+                        "detail": data,
+                    })
+                    self._send_json({"ok": True, "baseline": data["total_with_pos"], "ts": data["fetched_at"]})
+                except Exception as e:
+                    self._send_json({"ok": False, "error": str(e)}, 500)
+            else:
+                self.send_response(404)
                 self.end_headers()
 
     def _start_status_server(port: int) -> None:
