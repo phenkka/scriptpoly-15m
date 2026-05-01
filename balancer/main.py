@@ -1676,10 +1676,17 @@ def main() -> None:
                 continue
 
             # Equalization strategy:
-            #   trigger: если у любого из кошельков баланс < threshold_usd → выравниваем
+            #   trigger: если у любого из кошельков СУММАРНАЯ стоимость (cash + portfolio) < threshold → выравниваем
             #   send half the imbalance → both sides end up at total/2
-            need_bsc = pred_trigger_bal < threshold_usd and imbalance > 0   # predict мало, poly даёт
-            need_poly = poly_display < threshold_usd and imbalance < 0      # poly мало, predict даёт
+            # NOTE: используем total (cash + locked positions) чтобы не бриджить зря когда деньги
+            # заблокированы в активных ставках (free cash низкий, но позиции ещё не разрешились)
+            with BALANCER_STATUS_LOCK:
+                _cached_pred_port = BALANCER_STATUS.get("predict_portfolio", 0.0)
+                _cached_poly_port = BALANCER_STATUS.get("poly_portfolio", 0.0)
+            _pred_total = pred_trigger_bal + _cached_pred_port
+            _poly_total = poly_display + _cached_poly_port
+            need_bsc = pred_trigger_bal < threshold_usd and imbalance > 0 and _pred_total < _poly_total - threshold_usd
+            need_poly = poly_display < threshold_usd and imbalance < 0 and _poly_total < _pred_total - threshold_usd
 
             if need_bsc and not need_poly:
                 amt = imbalance / 2.0  # half the excess from poly side
@@ -1727,6 +1734,9 @@ def main() -> None:
                     "[BALANCER] sent_poly_usdc_via_safe "
                     f"to={deposit_addr} amount_base_unit={amt_bu} tx_hash={txh}"
                 )
+                # Сразу после отправки Polygon tx ставим cooldown —
+                # даже если _wait_bridge_status бросит ReadTimeout, мы не запустим второй бридж.
+                last_action_ts = time.time()
 
                 st = _wait_bridge_status(
                     deposit_addr=deposit_addr,
@@ -1868,6 +1878,9 @@ def main() -> None:
                     "[BALANCER] sent_bsc_usdt "
                     f"to={deposit_addr} amount_base_unit={amt_bu} tx_hash={txh}"
                 )
+                # Сразу после отправки BSC tx ставим cooldown —
+                # даже если _wait_bridge_status бросит ReadTimeout, второй бридж не запустится.
+                last_action_ts = time.time()
 
                 st = _wait_bridge_status(
                     deposit_addr=deposit_addr,
