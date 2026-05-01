@@ -5087,13 +5087,80 @@ def opportunity(opp: Opportunity) -> dict:
             _live_worst_ba: float | None = None
             _live_poly_fee_ba: float | None = None
 
-            try:
-                _live_book_ba = _polymarket_book(str(poly_leg.token_id))
-                _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
-                if _vwap_worst:
-                    _live_vwap_ba, _live_worst_ba = _vwap_worst
-            except Exception as _e_ba_live:
-                print(f"[TRADER] bid_ask_hedge_live_check failed (non-fatal): {_e_ba_live}")
+            for _lbc_attempt in range(2):
+                try:
+                    _live_book_ba = _polymarket_book(str(poly_leg.token_id))
+                    _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
+                    if _vwap_worst:
+                        _live_vwap_ba, _live_worst_ba = _vwap_worst
+                    break
+                except Exception as _e_ba_live:
+                    print(
+                        f"[TRADER] bid_ask_hedge_live_check attempt={_lbc_attempt + 1}/2 "
+                        f"failed: {_e_ba_live}"
+                    )
+                    if _lbc_attempt == 0:
+                        time.sleep(1.0)
+
+            if _live_vwap_ba is None:
+                # Cannot verify net edge without live Poly book.
+                # Unwind Predict to avoid uncontrolled exposure.
+                _lbu_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                _lbu_sell_p = max(_lbu_tick, round(_ba_actual_pred_bid - _lbu_tick, 6))
+                _lbu_sold = 0.0
+                _lbu_err: str | None = None
+                try:
+                    _lbu_r = _place_predict_limit_sell(
+                        pred_leg,
+                        sell_qty=_ba_net_sell_qty,
+                        sell_price=_lbu_sell_p,
+                        fill_timeout_sec=60.0,
+                        trace_id=trace_id,
+                    )
+                    _lbu_sold = _lbu_r.get("filled_qty", 0.0)
+                except Exception as _lbu_exc:
+                    _lbu_err = str(_lbu_exc)
+                    print(
+                        f"[TRADER][INCIDENT] live_book_unwind_err "
+                        f"label={opp.label} err={_lbu_exc}"
+                    )
+                _lbu_status = (
+                    f"✅ sold {_lbu_sold:.2f} sh @ {_lbu_sell_p:.2f}"
+                    if _lbu_sold >= _ba_net_sell_qty * 0.99
+                    else f"⚠️ partial {_lbu_sold:.2f}/{_ba_net_sell_qty:.2f} sh — check manually"
+                )
+                print(
+                    f"[TRADER][INCIDENT] BID_ASK_LIVE_BOOK_UNAVAILABLE "
+                    f"label={opp.label} sold={_lbu_sold:.4f}/{_ba_net_sell_qty:.4f} "
+                    f"err={_lbu_err}"
+                )
+                notify(
+                    f"⚠️ <b>INCIDENT: LIVE BOOK UNAVAILABLE → UNWIND</b>\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Predict fill: {_ba_hedge_qty:.2f} sh @ {_ba_actual_pred_bid:.2f}\n"
+                    f"Poly live book fetch failed (2 attempts) — aborting hedge\n"
+                    f"\n"
+                    f"Predict sell @ {_lbu_sell_p:.2f}: {_lbu_status}\n"
+                )
+                _append_jsonl(
+                    incidents_file,
+                    {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "type": "live_book_unavailable",
+                        "label": opp.label,
+                        "pred_bid": _ba_actual_pred_bid,
+                        "pred_filled_qty": float(_ba_hedge_qty),
+                        "unwind_sold": _lbu_sold,
+                        "unwind_err": _lbu_err,
+                    },
+                )
+                row["ok"] = False
+                row["summary"]["status"] = "incident"
+                row["summary"]["reason_code"] = "live_book_unavailable"
+                _append_jsonl(trades_file, row)
+                return {"status": "incident", "reason": "live_book_unavailable"}
 
             if _live_vwap_ba is not None:
                 _live_poly_fee_ba = _ba_fee_rate * _live_vwap_ba * (1.0 - _live_vwap_ba)
