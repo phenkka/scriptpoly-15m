@@ -96,6 +96,8 @@ services:
     environment:
       ANALYZER_URL: http://analyzer:8000/ingest
     command: ["python", "-m", "collect.btc_orderbook"]
+    volumes:
+      - ./data:/data
 
   collect_predict:
     build:

@@ -15,8 +15,10 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -32,6 +34,40 @@ _ET_ZONE  = ZoneInfo("America/New_York")
 
 SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
+
+_POLY_BOOK_FILE = Path(os.environ.get("POLY_BOOK_FILE", "/data/poly_book_latest.json"))
+
+
+def _write_poly_book(up_payload: dict, down_payload: dict, up_token_id: str, down_token_id: str) -> None:
+    """Atomically write latest Poly book to shared file for the trader to read directly."""
+    def _to_clob(levels: list) -> list:
+        return [{"price": str(p), "size": str(s)} for p, s in levels]
+
+    data = {
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "up": {
+            "token_id": up_token_id,
+            "bids": _to_clob(up_payload.get("bids") or []),
+            "asks": _to_clob(up_payload.get("asks") or []),
+        },
+        "down": {
+            "token_id": down_token_id,
+            "bids": _to_clob(down_payload.get("bids") or []),
+            "asks": _to_clob(down_payload.get("asks") or []),
+        },
+    }
+    try:
+        _POLY_BOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=_POLY_BOOK_FILE.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, _POLY_BOOK_FILE)
+        except Exception:
+            os.unlink(tmp)
+            raise
+    except Exception:
+        pass  # never crash collector on file write
 
 # ── Dynamic fee rate cache (per token_id) ──
 _fee_rate_cache: dict[str, float] = {}
@@ -343,6 +379,7 @@ def run_loop() -> None:
                 token_ids={"up": up_token_id, "down": down_token_id},
                 poly_fee_rate=_fee_rate,
             )
+            _write_poly_book(up_payload, down_payload, up_token_id, down_token_id)
 
         # Пустая строка-разделитель между тиками, если токенов > 1
         if len(token_map) > 1:

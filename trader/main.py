@@ -1983,6 +1983,23 @@ def _polymarket_book(token_id: str) -> dict[str, Any]:
     return j
 
 
+_POLY_BOOK_FILE = os.environ.get("POLY_BOOK_FILE", "/data/poly_book_latest.json")
+
+
+def _polymarket_book_cached(token_id: str) -> dict[str, Any]:
+    """Read latest Poly book from collector's shared file (sub-ms), fallback to CLOB."""
+    try:
+        with open(_POLY_BOOK_FILE) as f:
+            data = json.load(f)
+        for side in ("up", "down"):
+            s = data.get(side) or {}
+            if s.get("token_id") == token_id:
+                return {"bids": s.get("bids") or [], "asks": s.get("asks") or []}
+    except Exception as _file_e:
+        print(f"[TRADER] poly_book_file_miss token={token_id[:10]}... err={_file_e} — fallback to CLOB")
+    return _polymarket_book(token_id)
+
+
 _poly_fee_rate_cache: dict[str, float] = {}
 _POLY_FEE_RATE_FALLBACK = 0.072  # Crypto category default
 
@@ -3325,7 +3342,7 @@ def _place_predict_limit_buy(
             # ── Live Poly hedge-viability check: cancel if hedge became unprofitable ──
             if poly_token_id and current_filled_wei <= 0:
                 try:
-                    _pb_live = _polymarket_book(poly_token_id)
+                    _pb_live = _polymarket_book_cached(poly_token_id)
                     _pa_live = _vwap_from_poly_book(_pb_live, float(leg.shares))
                     if _pa_live and 0 < _pa_live < 1:
                         _pdf_live = poly_fee_rate * _pa_live * (1.0 - _pa_live)
@@ -5089,7 +5106,7 @@ def opportunity(opp: Opportunity) -> dict:
 
             for _lbc_attempt in range(2):
                 try:
-                    _live_book_ba = _polymarket_book(str(poly_leg.token_id))
+                    _live_book_ba = _polymarket_book_cached(str(poly_leg.token_id))
                     _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
                     if _vwap_worst:
                         _live_vwap_ba, _live_worst_ba = _vwap_worst
