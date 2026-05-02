@@ -1160,6 +1160,8 @@ def main() -> None:
     cooldown_sec = _env_float("BALANCER_COOLDOWN_SEC", 300.0)
     status_timeout_sec = _env_float("BALANCER_STATUS_TIMEOUT_SEC", 420.0)
     status_poll_sec = _env_float("BALANCER_STATUS_POLL_SEC", 10.0)
+    # Extra stabilization pause after successful bridge to avoid ping-pong on stale balances.
+    post_bridge_settle_sec = _env_float("BALANCER_POST_BRIDGE_SETTLE_SEC", 120.0)
 
     bsc_rpcs = (
         _dedupe_keep_order(
@@ -1307,6 +1309,18 @@ def main() -> None:
             f"direction={_startup_inflight.get('direction')} "
             f"amount_base_unit={_startup_inflight.get('amount_base_unit')} "
             f"sent_at={_startup_inflight.get('sent_at')}"
+        )
+
+    def _activate_post_bridge_settle(*, direction: str, amount_usd: float, status: str) -> None:
+        nonlocal last_action_ts
+        if post_bridge_settle_sec <= 0:
+            return
+        hold_until = time.time() + post_bridge_settle_sec
+        if hold_until > last_action_ts:
+            last_action_ts = hold_until
+        print(
+            f"[BALANCER] post_bridge_settle_active direction={direction} "
+            f"amount={amount_usd:.2f}$ status={status} hold_sec={post_bridge_settle_sec:.0f}"
         )
 
     _BASELINE_FILE = Path(os.environ.get("BALANCE_BASELINE_FILE", "/data/balance_baseline.json"))
@@ -1995,6 +2009,9 @@ def main() -> None:
                     except Exception as _fwd_e:
                         print(f"[BALANCER][ERROR] forward_to_predict_account_failed err={_fwd_e}")
 
+                # Even after COMPELTED, give balances time to settle before next decision.
+                _activate_post_bridge_settle(direction="poly_to_bsc", amount_usd=amt, status=st)
+
                 # last_action_ts already set before _wait_bridge_status — do not reset here
 
             elif need_poly and not need_bsc:
@@ -2230,6 +2247,9 @@ def main() -> None:
                     f"🔄 <b>TRANSFER: PREDICT → POLY</b>\n"
                     f"${amt:.2f} bridged - status: {st}\n"
                 )
+
+                # Even after COMPELTED, give balances time to settle before next decision.
+                _activate_post_bridge_settle(direction="bsc_to_poly", amount_usd=amt, status=st)
 
                 # last_action_ts already set before _wait_bridge_status — do not reset here
 
