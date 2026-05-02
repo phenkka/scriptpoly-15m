@@ -1135,7 +1135,7 @@ def main() -> None:
     enable_poly_to_bsc = _env_bool("BALANCER_ENABLE_POLY_TO_BSC", enable_transfers)
     interval_sec = _env_float("BALANCER_INTERVAL_SEC", 30.0)
     cooldown_sec = _env_float("BALANCER_COOLDOWN_SEC", 300.0)
-    status_timeout_sec = _env_float("BALANCER_STATUS_TIMEOUT_SEC", 1200.0)
+    status_timeout_sec = _env_float("BALANCER_STATUS_TIMEOUT_SEC", 420.0)
     status_poll_sec = _env_float("BALANCER_STATUS_POLL_SEC", 10.0)
 
     bsc_rpcs = (
@@ -1787,9 +1787,9 @@ def main() -> None:
                         f"\n"
                         f"poly → predict  ${amt:.2f}\n"
                         f"Bridge status: {st}\n"
-                        f"Повтор через 1 час\n"
+                        f"Повтор через {int(cooldown_sec//60)} мин\n"
                     )
-                    last_action_ts = time.time() + 3600  # не повторять 1 час
+                    last_action_ts = time.time() + cooldown_sec
                     _sleep(interval_sec)
                     continue
                 try:
@@ -1886,11 +1886,32 @@ def main() -> None:
                             amount_base_unit=pull_bu,
                         )
                         print(f"[BALANCER] pulled_from_predict_account amount={shortfall:.2f}$ tx={pull_txh}")
-                        _sleep(4.0)  # wait for receipt
+                        # Wait for the BSC tx to confirm before reading funder balance
+                        _sleep(15.0)
+                        for _wait_attempt in range(12):  # up to ~60s
+                            funder_bal_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                            if funder_bal_bu >= amt_bu:
+                                break
+                            _sleep(5.0)
+                        funder_bal = _from_base_unit(funder_bal_bu, bsc_dec)
+                        print(f"[BALANCER] funder_after_pull bal={funder_bal:.2f}$ needed_bu={amt_bu}")
                     except Exception as _pull_e:
                         print(f"[BALANCER][ERROR] pull_from_predict_account_failed err={_pull_e}")
                         _sleep(interval_sec)
                         continue
+
+                # Re-read funder balance to get actual sendable amount
+                funder_bal_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                if funder_bal_bu < amt_bu:
+                    print(
+                        f"[BALANCER][WARN] funder_still_short after_pull "
+                        f"funder_bu={funder_bal_bu} amt_bu={amt_bu} — sending available"
+                    )
+                    amt_bu = funder_bal_bu
+                if amt_bu == 0:
+                    print("[BALANCER][ERROR] funder_empty cannot_bridge skip")
+                    _sleep(interval_sec)
+                    continue
 
                 dep = _bridge_deposit_address(polygon.wallet_address)
                 deposit_addr = _extract_deposit_evm_addr(dep)
