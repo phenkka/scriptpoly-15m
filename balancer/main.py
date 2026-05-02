@@ -612,6 +612,9 @@ def _wait_bridge_status(
     timeout_sec: float,
     poll_sec: float,
     amount_base_unit: int | None = None,
+    # On-chain confirmation callbacks — called each poll tick.
+    # If any returns True, we treat bridge as COMPLETED without waiting for API.
+    onchain_checks: "list[Any] | None" = None,
 ) -> str:
     """Polls Polymarket bridge status endpoint for a deposit address.
 
@@ -622,11 +625,31 @@ def _wait_bridge_status(
 
     If amount_base_unit is provided, finds the transaction with that exact amount
     instead of always using txs[0] (which may be a different, older deposit).
+
+    If onchain_checks is provided (list of callables returning bool), each is called
+    every poll tick. If any returns True the bridge is considered COMPLETED immediately
+    without waiting for the slow bridge API to update.
     """
 
     deadline = time.time() + max(1.0, timeout_sec)
     last_status = "UNKNOWN"
+    _onchain_check_interval = 15.0  # check on-chain every 15s
+    _last_onchain_check = 0.0
     while time.time() < deadline:
+        # On-chain check (runs every ~15s regardless of API poll cadence)
+        if onchain_checks and time.time() - _last_onchain_check >= _onchain_check_interval:
+            _last_onchain_check = time.time()
+            for _chk in onchain_checks:
+                try:
+                    if _chk():
+                        print(
+                            f"[BALANCER] bridge_onchain_confirmed "
+                            f"deposit_addr={deposit_addr} api_status={last_status} → COMPLETED"
+                        )
+                        return "COMPLETED"
+                except Exception as _ce:
+                    print(f"[BALANCER][WARN] bridge_onchain_check_err err={_ce}")
+
         try:
             st = _bridge_status(deposit_addr)
         except Exception as _poll_err:
@@ -1243,6 +1266,49 @@ def main() -> None:
     BALANCER_STATUS: dict = {}
     BALANCER_STATUS_LOCK = threading.Lock()
 
+    # ── In-flight bridge state ──────────────────────────────────────────────
+    # Persisted to disk so container restarts don't lose track of pending bridges.
+    # Format: {"direction": "poly_to_bsc"|"bsc_to_poly", "amount_base_unit": int,
+    #          "sent_at": float, "confirmed": bool}
+    _BRIDGE_INFLIGHT_FILE = Path(os.environ.get("BRIDGE_INFLIGHT_FILE", "/data/bridge_inflight.json"))
+
+    def _save_bridge_inflight(direction: str, amount_base_unit: int) -> None:
+        try:
+            _BRIDGE_INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _BRIDGE_INFLIGHT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "direction": direction,
+                "amount_base_unit": int(amount_base_unit),
+                "sent_at": time.time(),
+            }))
+            tmp.replace(_BRIDGE_INFLIGHT_FILE)
+        except Exception as _e:
+            print(f"[BALANCER][WARN] save_bridge_inflight err={_e}")
+
+    def _clear_bridge_inflight() -> None:
+        try:
+            _BRIDGE_INFLIGHT_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _load_bridge_inflight() -> dict | None:
+        try:
+            if _BRIDGE_INFLIGHT_FILE.exists():
+                return json.loads(_BRIDGE_INFLIGHT_FILE.read_text())
+        except Exception:
+            pass
+        return None
+
+    # On startup, warn if a bridge was left in flight (e.g. after container crash)
+    _startup_inflight = _load_bridge_inflight()
+    if _startup_inflight:
+        print(
+            f"[BALANCER][WARN] bridge_inflight_on_startup "
+            f"direction={_startup_inflight.get('direction')} "
+            f"amount_base_unit={_startup_inflight.get('amount_base_unit')} "
+            f"sent_at={_startup_inflight.get('sent_at')}"
+        )
+
     _BASELINE_FILE = Path(os.environ.get("BALANCE_BASELINE_FILE", "/data/balance_baseline.json"))
 
     def _load_baseline() -> dict | None:
@@ -1717,6 +1783,74 @@ def main() -> None:
             need_bsc = pred_trigger_bal < threshold_usd and imbalance > 0 and _pred_total < _poly_total - threshold_usd
             need_poly = poly_display < threshold_usd and imbalance < 0 and _poly_total < _pred_total - threshold_usd
 
+            # ── In-flight bridge guard ─────────────────────────────────────
+            # If a previous bridge timed out (PENDING), we persist the state to disk.
+            # On the next evaluation we verify on-chain whether money arrived before
+            # allowing another bridge in the same direction. This prevents double-bridging
+            # when the bridge API is slow to update (DEPOSIT_DETECTED for >7 min).
+            _inflight = _load_bridge_inflight()
+            if _inflight:
+                _inf_dir = _inflight.get("direction")
+                _inf_amt_bu = int(_inflight.get("amount_base_unit", 0))
+                _inf_sent_at = float(_inflight.get("sent_at", 0))
+                _inf_age_min = (time.time() - _inf_sent_at) / 60
+                # Check on-chain if the in-flight bridge delivered
+                _inflight_resolved = False
+                try:
+                    if _inf_dir == "poly_to_bsc":
+                        # Check BSC funder + predict_account for USDT arrival
+                        _funder_now_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                        _pred_now_bu = _balance_base_unit(w3_bsc, bsc.token_address, predict_account_addr) if predict_account_addr else 0
+                        _expected_bu = int(_inf_amt_bu * 0.85)  # accept ≥85% (slippage + fees)
+                        if _funder_now_bu >= _expected_bu or _pred_now_bu >= _expected_bu:
+                            print(
+                                f"[BALANCER] inflight_bridge_confirmed_on_chain "
+                                f"dir={_inf_dir} funder_bu={_funder_now_bu} pred_bu={_pred_now_bu} expected_bu={_expected_bu}"
+                            )
+                            _inflight_resolved = True
+                    elif _inf_dir == "bsc_to_poly":
+                        # Check Polygon for pUSD/USDC.e arrival
+                        _pusd_now_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                        _usdce_now_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
+                        _expected_bu = int(_inf_amt_bu * 0.85)
+                        if _pusd_now_bu >= _expected_bu or _usdce_now_bu >= _expected_bu:
+                            print(
+                                f"[BALANCER] inflight_bridge_confirmed_on_chain "
+                                f"dir={_inf_dir} pusd_bu={_pusd_now_bu} usdce_bu={_usdce_now_bu} expected_bu={_expected_bu}"
+                            )
+                            _inflight_resolved = True
+                except Exception as _inf_chk_e:
+                    print(f"[BALANCER][WARN] inflight_check_err err={_inf_chk_e}")
+
+                if _inflight_resolved:
+                    _clear_bridge_inflight()
+                    print(f"[BALANCER] inflight_cleared direction={_inf_dir}")
+                else:
+                    # Bridge still in transit — block equalization in SAME direction to prevent double-bridge
+                    _max_inflight_min = 60.0  # after 60 min, give up and clear (manual intervention)
+                    if _inf_age_min > _max_inflight_min:
+                        print(
+                            f"[BALANCER][WARN] inflight_expired age={_inf_age_min:.1f}min "
+                            f"dir={_inf_dir} clearing_state"
+                        )
+                        _notify(
+                            f"⚠️ <b>BRIDGE IN-FLIGHT EXPIRED</b>\n"
+                            f"direction={_inf_dir} age={_inf_age_min:.0f}min\n"
+                            f"Требуется ручная проверка!\n"
+                        )
+                        _clear_bridge_inflight()
+                    else:
+                        print(
+                            f"[BALANCER] inflight_bridge_pending dir={_inf_dir} "
+                            f"age={_inf_age_min:.1f}min — skipping equalization"
+                        )
+                        if _inf_dir == "poly_to_bsc":
+                            need_bsc = False
+                        elif _inf_dir == "bsc_to_poly":
+                            need_poly = False
+                        _sleep(interval_sec)
+                        continue
+
             if need_bsc and not need_poly:
                 amt = imbalance / 2.0  # half the excess from poly side
                 if amt <= 0:
@@ -1770,40 +1904,32 @@ def main() -> None:
                 # Сразу после отправки Polygon tx ставим cooldown —
                 # даже если _wait_bridge_status бросит ReadTimeout, мы не запустим второй бридж.
                 last_action_ts = time.time()
+                _save_bridge_inflight("poly_to_bsc", amt_bu)
+
+                def _bsc_arrived() -> bool:
+                    _funder_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                    if _funder_bu - _bsc_funder_before_bu >= _expected_bsc_bu:
+                        _usd = _from_base_unit(_funder_bu - _bsc_funder_before_bu, bsc_dec)
+                        print(f"[BALANCER] bsc_onchain_check funder_delta={_usd:.4f} USDT OK")
+                        return True
+                    if predict_account_addr:
+                        _pa_bu = _balance_base_unit(w3_bsc, bsc.token_address, predict_account_addr)
+                        if _pa_bu >= _expected_bsc_bu:
+                            _usd = _from_base_unit(_pa_bu, bsc_dec)
+                            print(f"[BALANCER] bsc_onchain_check predict_acct={_usd:.4f} USDT OK")
+                            return True
+                    return False
 
                 st = _wait_bridge_status(
                     deposit_addr=deposit_addr,
                     timeout_sec=status_timeout_sec,
                     poll_sec=status_poll_sec,
                     amount_base_unit=amt_bu,
+                    onchain_checks=[_bsc_arrived],
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
-                # BSC chain fallback: API может не успеть обновить статус, но деньги уже пришли
-                if st not in ("COMPLETED", "FAILED"):
-                    try:
-                        _bsc_funder_after_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
-                        _bsc_delta_bu = _bsc_funder_after_bu - _bsc_funder_before_bu
-                        _bsc_delta_usd = _from_base_unit(max(0, _bsc_delta_bu), bsc_dec)
-                        if _bsc_delta_bu >= _expected_bsc_bu:
-                            print(
-                                f"[BALANCER] bridge_confirmed_via_bsc_chain "
-                                f"delta={_bsc_delta_usd:.4f} USDT api_status={st} → override COMPLETED"
-                            )
-                            st = "COMPLETED"
-                        else:
-                            # Also check predict_account in case auto-forward already ran
-                            if predict_account_addr:
-                                _pred_acct_after_bu = _balance_base_unit(w3_bsc, bsc.token_address, predict_account_addr)
-                                _pred_delta_usd = _from_base_unit(max(0, _pred_acct_after_bu - 0), bsc_dec)
-                                if _pred_acct_after_bu >= _expected_bsc_bu:
-                                    print(
-                                        f"[BALANCER] bridge_confirmed_via_predict_account "
-                                        f"predict_bal={_pred_delta_usd:.4f} USDT api_status={st} → override COMPLETED"
-                                    )
-                                    st = "COMPLETED"
-                    except Exception as _bsc_chk_e:
-                        print(f"[BALANCER][WARN] bsc_chain_check_failed err={_bsc_chk_e}")
                 if st == "FAILED":
+                    _clear_bridge_inflight()
                     _notify(
                         f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
                         f"\n"
@@ -1816,11 +1942,12 @@ def main() -> None:
                         f"\n"
                         f"poly → predict  ${amt:.2f}\n"
                         f"Bridge status: {st}\n"
-                        f"Повтор через {int(cooldown_sec//60)} мин\n"
+                        f"Жду подтверждения on-chain перед следующим циклом\n"
                     )
                     last_action_ts = time.time() + cooldown_sec
                     _sleep(interval_sec)
                     continue
+                _clear_bridge_inflight()
                 try:
                     _proxy = proxy_url or None
                     _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
@@ -1960,42 +2087,34 @@ def main() -> None:
                 # Сразу после отправки BSC tx ставим cooldown —
                 # даже если _wait_bridge_status бросит ReadTimeout, второй бридж не запустится.
                 last_action_ts = time.time()
+                _save_bridge_inflight("bsc_to_poly", amt_bu)
 
-                # Capture Polygon pUSD balance before bridge — used as fallback confirmation
+                # Capture Polygon balances before bridge — baseline for on-chain confirmation
                 _poly_before_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
-                _expected_poly_delta_bu = _to_base_unit(amt * 0.90, poly_dec)  # accept ≥90%
+                _usdce_before_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
+                _expected_poly_delta_bu = _to_base_unit(amt * 0.85, poly_dec)  # accept >=85%
+
+                def _poly_arrived() -> bool:
+                    _pusd_now = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                    if _pusd_now - _poly_before_bu >= _expected_poly_delta_bu:
+                        _usd = _from_base_unit(_pusd_now - _poly_before_bu, poly_dec)
+                        print(f"[BALANCER] poly_onchain_check pusd_delta={_usd:.4f} pUSD OK")
+                        return True
+                    _usdce_now = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
+                    if _usdce_now - _usdce_before_bu >= _expected_poly_delta_bu:
+                        _usd = _from_base_unit(_usdce_now - _usdce_before_bu, poly_dec)
+                        print(f"[BALANCER] poly_onchain_check usdce_delta={_usd:.4f} USDC.e OK")
+                        return True
+                    return False
 
                 st = _wait_bridge_status(
                     deposit_addr=deposit_addr,
                     timeout_sec=status_timeout_sec,
                     poll_sec=status_poll_sec,
                     amount_base_unit=amt_bu,
+                    onchain_checks=[_poly_arrived],
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
-                # Polygon chain fallback: проверяем что USDC.e/pUSD реально пришёл
-                if st not in ("COMPLETED", "FAILED"):
-                    try:
-                        _poly_after_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
-                        _poly_delta_bu = _poly_after_bu - _poly_before_bu
-                        _poly_delta_usd = _from_base_unit(max(0, _poly_delta_bu), poly_dec)
-                        if _poly_delta_bu >= _expected_poly_delta_bu:
-                            print(
-                                f"[BALANCER] bridge_confirmed_via_polygon_chain "
-                                f"delta={_poly_delta_usd:.4f} pUSD api_status={st} → override COMPLETED"
-                            )
-                            st = "COMPLETED"
-                        else:
-                            # Also check USDC.e (bridge delivers USDC.e before wrap)
-                            _usdce_after_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
-                            _usdce_usd = _from_base_unit(_usdce_after_bu, poly_dec)
-                            if _usdce_after_bu >= _expected_poly_delta_bu:
-                                print(
-                                    f"[BALANCER] bridge_confirmed_via_usdce "
-                                    f"usdce={_usdce_usd:.4f} api_status={st} → override COMPLETED"
-                                )
-                                st = "COMPLETED"
-                    except Exception as _poly_chk_e:
-                        print(f"[BALANCER][WARN] polygon_chain_check_failed err={_poly_chk_e}")
                 if st == "FAILED":
                     _notify(
                         f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
@@ -2074,6 +2193,7 @@ def main() -> None:
                     # Extend cooldown by 1h to prevent draining predict further.
                     _extend_until = time.time() + 3600
                     last_action_ts = _extend_until
+                    # Keep inflight state — cleared manually or after on-chain confirm next cycle
                     print(
                         f"[BALANCER][ERROR] poly_balance_did_not_increase_after_bridge "
                         f"expected≈{amt:.2f}$ arrived_pusd={_pusd_delta_usd:.2f}$ wrap_ok={_wrap_ok} "
@@ -2089,6 +2209,7 @@ def main() -> None:
                         f"Бриджинг приостановлен на 1 час.\n"
                     )
                 else:
+                    _clear_bridge_inflight()
                     print(f"[BALANCER] poly_balance_confirmed_increase pusd_delta={_pusd_delta_usd:.2f}$")
 
                 try:
