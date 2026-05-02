@@ -1915,6 +1915,7 @@ def main() -> None:
                     deposit_addr=deposit_addr,
                     timeout_sec=status_timeout_sec,
                     poll_sec=status_poll_sec,
+                    amount_base_unit=amt_bu,
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
                 if st == "FAILED":
@@ -1924,7 +1925,12 @@ def main() -> None:
                         f"predict → poly  ${amt:.2f}\n"
                         f"Bridge status: FAILED\n"                    )
                     raise RuntimeError("bridge_failed")
+
+                # Snapshot pUSD balance before wrap to verify arrival later
+                _pusd_before_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+
                 # Auto-wrap USDC.e → pUSD on Polygon after bridge delivers USDC.e
+                _wrap_ok = False
                 try:
                     usdce_bal_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
                     if usdce_bal_bu > 0:
@@ -1965,8 +1971,48 @@ def main() -> None:
                             owner_private_key=poly_pk,
                         )
                         print(f"[BALANCER] wrapped_usdce_to_pusd amount_base_unit={usdce_bal_bu}")
+                        _wrap_ok = True
+                    else:
+                        # Bridge may deliver pUSD directly — check if pUSD arrived
+                        _pusd_now_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                        if _pusd_now_bu > _pusd_before_bu:
+                            print(f"[BALANCER] bridge_delivered_pusd_directly amount_base_unit={_pusd_now_bu - _pusd_before_bu}")
+                            _wrap_ok = True
+                        else:
+                            print(
+                                f"[BALANCER][WARN] bridge_completed_but_no_usdce_or_pusd_arrived "
+                                f"usdce_bal={usdce_bal_bu} pusd_before={_pusd_before_bu} pusd_now={_pusd_now_bu}"
+                            )
                 except Exception as _wrap_e:
                     print(f"[BALANCER][WARN] usdce_to_pusd_wrap_failed err={_wrap_e}")
+
+                # Verify pUSD actually increased after bridge + wrap
+                _sleep(3.0)
+                _pusd_after_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                _pusd_delta = _pusd_after_bu - _pusd_before_bu
+                _pusd_delta_usd = _from_base_unit(max(0, _pusd_delta), poly_dec)
+                if _pusd_delta_usd < amt * 0.5:
+                    # Less than half the bridged amount arrived as pUSD — something went wrong.
+                    # Extend cooldown by 1h to prevent draining predict further.
+                    _extend_until = time.time() + 3600
+                    last_action_ts = _extend_until
+                    print(
+                        f"[BALANCER][ERROR] poly_balance_did_not_increase_after_bridge "
+                        f"expected≈{amt:.2f}$ arrived_pusd={_pusd_delta_usd:.2f}$ wrap_ok={_wrap_ok} "
+                        f"extending_cooldown_1h"
+                    )
+                    _notify(
+                        f"⚠️ <b>BRIDGE DELIVERED BUT pUSD MISSING</b>\n"
+                        f"\n"
+                        f"predict → poly  ${amt:.2f} bridged (status: {st})\n"
+                        f"pUSD arrived: ${_pusd_delta_usd:.2f}\n"
+                        f"wrap_ok: {_wrap_ok}\n"
+                        f"Проверьте USDC.e/USDC баланс на Polygon кошельке вручную.\n"
+                        f"Бриджинг приостановлен на 1 час.\n"
+                    )
+                else:
+                    print(f"[BALANCER] poly_balance_confirmed_increase pusd_delta={_pusd_delta_usd:.2f}$")
+
                 try:
                     _proxy = proxy_url or None
                     _poly_portfolio_now = _fetch_poly_portfolio_usd(poly_funder or poly_wallet, proxy=_proxy)
