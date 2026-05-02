@@ -1834,7 +1834,7 @@ def main() -> None:
                     except Exception as _fwd_e:
                         print(f"[BALANCER][ERROR] forward_to_predict_account_failed err={_fwd_e}")
 
-                last_action_ts = time.time()
+                # last_action_ts already set before _wait_bridge_status — do not reset here
 
             elif need_poly and not need_bsc:
                 amt = (-imbalance) / 2.0  # half the excess from predict side
@@ -1981,7 +1981,7 @@ def main() -> None:
                     f"${amt:.2f} bridged - status: {st}\n"
                 )
 
-                last_action_ts = time.time()
+                # last_action_ts already set before _wait_bridge_status — do not reset here
 
             elif need_bsc and need_poly:
                 # Shouldn't happen with equalization logic, but guard just in case
