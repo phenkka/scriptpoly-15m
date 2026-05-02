@@ -1748,6 +1748,10 @@ def main() -> None:
                 deposit_addr = _extract_deposit_evm_addr(wd)
 
                 amt_bu = _to_base_unit(amt, poly_dec)
+                # Capture BSC funder balance before bridge — used as fallback confirmation
+                _bsc_funder_before_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                # Amount expected on BSC in 18-decimal units (USDT BSC)
+                _expected_bsc_bu = _to_base_unit(amt * 0.90, bsc_dec)  # accept ≥90% (slippage)
                 # BALANCER_POLY_WALLET is a Gnosis Safe (POLY_SIGNATURE_TYPE=2).
                 # POLY_PRIVATE_KEY is the Safe owner EOA — use execTransaction() to transfer.
                 txh = _gnosis_safe_transfer(
@@ -1774,6 +1778,31 @@ def main() -> None:
                     amount_base_unit=amt_bu,
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
+                # BSC chain fallback: API может не успеть обновить статус, но деньги уже пришли
+                if st not in ("COMPLETED", "FAILED"):
+                    try:
+                        _bsc_funder_after_bu = _balance_base_unit(w3_bsc, bsc.token_address, bsc.wallet_address)
+                        _bsc_delta_bu = _bsc_funder_after_bu - _bsc_funder_before_bu
+                        _bsc_delta_usd = _from_base_unit(max(0, _bsc_delta_bu), bsc_dec)
+                        if _bsc_delta_bu >= _expected_bsc_bu:
+                            print(
+                                f"[BALANCER] bridge_confirmed_via_bsc_chain "
+                                f"delta={_bsc_delta_usd:.4f} USDT api_status={st} → override COMPLETED"
+                            )
+                            st = "COMPLETED"
+                        else:
+                            # Also check predict_account in case auto-forward already ran
+                            if predict_account_addr:
+                                _pred_acct_after_bu = _balance_base_unit(w3_bsc, bsc.token_address, predict_account_addr)
+                                _pred_delta_usd = _from_base_unit(max(0, _pred_acct_after_bu - 0), bsc_dec)
+                                if _pred_acct_after_bu >= _expected_bsc_bu:
+                                    print(
+                                        f"[BALANCER] bridge_confirmed_via_predict_account "
+                                        f"predict_bal={_pred_delta_usd:.4f} USDT api_status={st} → override COMPLETED"
+                                    )
+                                    st = "COMPLETED"
+                    except Exception as _bsc_chk_e:
+                        print(f"[BALANCER][WARN] bsc_chain_check_failed err={_bsc_chk_e}")
                 if st == "FAILED":
                     _notify(
                         f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
@@ -1932,6 +1961,10 @@ def main() -> None:
                 # даже если _wait_bridge_status бросит ReadTimeout, второй бридж не запустится.
                 last_action_ts = time.time()
 
+                # Capture Polygon pUSD balance before bridge — used as fallback confirmation
+                _poly_before_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                _expected_poly_delta_bu = _to_base_unit(amt * 0.90, poly_dec)  # accept ≥90%
+
                 st = _wait_bridge_status(
                     deposit_addr=deposit_addr,
                     timeout_sec=status_timeout_sec,
@@ -1939,6 +1972,30 @@ def main() -> None:
                     amount_base_unit=amt_bu,
                 )
                 print(f"[BALANCER] bridge_status deposit_addr={deposit_addr} status={st}")
+                # Polygon chain fallback: проверяем что USDC.e/pUSD реально пришёл
+                if st not in ("COMPLETED", "FAILED"):
+                    try:
+                        _poly_after_bu = _balance_base_unit(w3_poly, polygon.token_address, polygon.wallet_address)
+                        _poly_delta_bu = _poly_after_bu - _poly_before_bu
+                        _poly_delta_usd = _from_base_unit(max(0, _poly_delta_bu), poly_dec)
+                        if _poly_delta_bu >= _expected_poly_delta_bu:
+                            print(
+                                f"[BALANCER] bridge_confirmed_via_polygon_chain "
+                                f"delta={_poly_delta_usd:.4f} pUSD api_status={st} → override COMPLETED"
+                            )
+                            st = "COMPLETED"
+                        else:
+                            # Also check USDC.e (bridge delivers USDC.e before wrap)
+                            _usdce_after_bu = _balance_base_unit(w3_poly, _USDCE_POLYGON, polygon.wallet_address)
+                            _usdce_usd = _from_base_unit(_usdce_after_bu, poly_dec)
+                            if _usdce_after_bu >= _expected_poly_delta_bu:
+                                print(
+                                    f"[BALANCER] bridge_confirmed_via_usdce "
+                                    f"usdce={_usdce_usd:.4f} api_status={st} → override COMPLETED"
+                                )
+                                st = "COMPLETED"
+                    except Exception as _poly_chk_e:
+                        print(f"[BALANCER][WARN] polygon_chain_check_failed err={_poly_chk_e}")
                 if st == "FAILED":
                     _notify(
                         f"🔴🔴🔴 <b>TRANSFER FAILED</b>\n"
