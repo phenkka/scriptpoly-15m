@@ -627,7 +627,12 @@ def _wait_bridge_status(
     deadline = time.time() + max(1.0, timeout_sec)
     last_status = "UNKNOWN"
     while time.time() < deadline:
-        st = _bridge_status(deposit_addr)
+        try:
+            st = _bridge_status(deposit_addr)
+        except Exception as _poll_err:
+            print(f"[BALANCER][WARN] bridge_status_poll_error err={_poll_err} retrying in {poll_sec}s")
+            _sleep(poll_sec)
+            continue
         txs = (st or {}).get("transactions") or []
         if not txs:
             _sleep(poll_sec)
@@ -1995,6 +2000,12 @@ def main() -> None:
 
         except Exception as e:
             print(f"[BALANCER][ERROR] err_type={type(e).__name__} err={e}")
+            # If a bridge was in-flight when the exception occurred, extend cooldown to
+            # prevent a duplicate bridge from firing after the normal cooldown expires.
+            if (time.time() - last_action_ts) < cooldown_sec:
+                extended = time.time() + cooldown_sec
+                last_action_ts = extended
+                print(f"[BALANCER][WARN] bridge_inflight_on_error extended_cooldown_until={extended:.0f}")
             _sleep(max(5.0, interval_sec))
 
 
