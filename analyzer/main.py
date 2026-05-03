@@ -390,6 +390,21 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/predict_book")
+def predict_book() -> dict:
+    """Return latest Predict.fun book state (cached from collector, updated ~every 100ms)."""
+    with _state_lock:
+        pred = _last.get("predict")
+    if pred is None:
+        return {"status": "no_data"}
+    return {
+        "status": "ok",
+        "ts": pred.ts.isoformat(),
+        "up": pred.up.model_dump(),
+        "down": pred.down.model_dump(),
+    }
+
+
 @app.post("/ingest")
 def ingest(tick: Tick) -> dict[str, str]:
     with _state_lock:

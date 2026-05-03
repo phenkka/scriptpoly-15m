@@ -3068,6 +3068,24 @@ def _place_predict_limit_buy(
         bb, sz, _ = _check_predict_book()
         return bb, sz
 
+    def _get_analyzer_predict_book(side: str) -> dict | None:
+        """Fetch current Predict book state from analyzer cache (~100ms fresh). Non-blocking, non-fatal."""
+        try:
+            _aurl = os.environ.get("ANALYZER_URL", "http://analyzer:8000").rstrip("/")
+            import urllib.request as _ur
+            with _ur.urlopen(f"{_aurl}/predict_book", timeout=0.3) as _r:
+                _data = json.loads(_r.read())
+            if _data.get("status") != "ok":
+                return None
+            _side_data = _data.get(side) or {}
+            return {
+                "best_bid": _side_data.get("bid"),
+                "best_bid_sz": float(_side_data.get("bid_sz") or 0.0),
+                "ts": _data.get("ts"),
+            }
+        except Exception:
+            return None
+
     # ── Queue-aware bid pricing ──
     tick_size = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
     queue_threshold_usd = float(os.environ.get("PREDICT_QUEUE_THRESHOLD_USD", "20.0") or "20.0")
@@ -3103,9 +3121,13 @@ def _place_predict_limit_buy(
             if _ticks_behind >= _passive_ticks_miss:
                 q_meta["decision"] = "skip_best_bid_exceeds_max"
                 return None, q_meta
-            # Within passive threshold: place at max_bid and wait.
-            # cancel_poly_no_edge will kill it if Poly moves against us;
-            # replace logic will bump it up if Poly gets cheaper.
+            # Someone is above our max_bid — only enter if their queue is small (<$20).
+            # A large queue above us means we're unlikely to fill before the market moves.
+            _passive_queue_usd = best_bid * best_bid_sz
+            q_meta["queue_ahead_usd"] = round(_passive_queue_usd, 2)
+            if _passive_queue_usd >= queue_threshold_usd:
+                q_meta["decision"] = "skip_passive_outbid_queue"
+                return None, q_meta
             q_meta["decision"] = "bid_passive"
             q_meta["ticks_behind"] = _ticks_behind
             return round(max_bid, 6), q_meta
@@ -3121,8 +3143,8 @@ def _place_predict_limit_buy(
             return target_bid, q_meta
         # target_bid == best_bid (max_bid == best_bid, no room to step above)
         queue_usd = best_bid * best_bid_sz
-        if queue_usd > hard_max_queue_usd:
-            q_meta["decision"] = "skip_hard_max_queue"
+        if queue_usd >= queue_threshold_usd:
+            q_meta["decision"] = "skip_queue_too_large"
             return None, q_meta
         q_meta["decision"] = "join"
         return best_bid, q_meta
@@ -3276,8 +3298,36 @@ def _place_predict_limit_buy(
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     filled = False
 
+    _book_check_interval = float(os.environ.get("PREDICT_BOOK_CHECK_INTERVAL_SEC", "0.1") or "0.1")
+    _last_book_check_ts = 0.0
+
     if order_hash:
         while time.time() < t_deadline:
+            # ── Fast book check via analyzer every 0.1s: cancel if outbid with large queue ──
+            _loop_now = time.time()
+            if prev_filled_wei <= 0 and _loop_now - _last_book_check_ts >= _book_check_interval:
+                _last_book_check_ts = _loop_now
+                _ab = _get_analyzer_predict_book(leg.side)
+                if _ab is not None:
+                    _ab_bb = _ab.get("best_bid")
+                    _ab_bb_sz = float(_ab.get("best_bid_sz") or 0.0)
+                    if _ab_bb is not None and float(_ab_bb) > current_bid_price + 1e-6:
+                        _ab_queue = float(_ab_bb) * _ab_bb_sz
+                        if _ab_queue >= queue_threshold_usd:
+                            cancel_reason = f"outbid_large_queue:{_ab_queue:.1f}"
+                            print(
+                                f"[PREDICT_LIMIT]{_trace} cancel_outbid_queue hash={order_hash} "
+                                f"our_bid={current_bid_price:.4f} best_bid={float(_ab_bb):.4f} "
+                                f"queue=${_ab_queue:.1f} threshold=${queue_threshold_usd:.0f}"
+                            )
+                            try:
+                                if order_id:
+                                    _predict_remove_orders(session, [order_id])
+                            except Exception as _bce:
+                                print(f"[PREDICT_LIMIT]{_trace} cancel_outbid_queue_err err={_bce}")
+                            need_final_get_check = True
+                            break
+
             # ── Poll fill status ──
             try:
                 last_get = _predict_get_order_by_hash(session, order_hash)
@@ -3491,7 +3541,8 @@ def _place_predict_limit_buy(
                     continue  # skip sleep, immediately poll new order
 
             _poll_prev = _bsc_head_gen_snapshot()
-            _poll_new = _bsc_wait_new_head_or_timeout(_poll_prev, max(0.05, poll_interval_sec))
+            # Cap wait at 0.1s so the book check loop (above) runs every ~0.1s.
+            _poll_new = _bsc_wait_new_head_or_timeout(_poll_prev, min(0.1, max(0.05, poll_interval_sec)))
             if order_hash and not filled and _poll_new > _poll_prev:
                 try:
                     _pm, _pt = _limit_buy_mktk()
