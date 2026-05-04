@@ -272,7 +272,9 @@ def _check_arbitrage() -> None:
         vwap_pred_bid = target_bid
         eff_pred_bid = vwap_pred_bid * pred_fee_mult
 
-        ba_s_eff = eff_pred_bid + eff_poly_ask + safety_frac
+        # Safety buffer уже вычтен из max_bid (снижает нашу ставку на Predict).
+        # Здесь НЕ добавляем его снова — иначе двойной счёт и edge всегда = 0.
+        ba_s_eff = eff_pred_bid + eff_poly_ask
         ba_edge = 1.0 - ba_s_eff
         ba_net_edge_bps = ba_edge * 10000.0
 
