@@ -3705,11 +3705,20 @@ def _place_predict_limit_buy(
     if not filled and prev_filled_wei > 0:
         filled = True  # partial fill → still hedge what we got
 
+    # Detect if the order is API-confirmed fully filled — in that case we skip cancel and
+    # post-cancel sweep entirely to reduce predict_fill_to_poly_submit_ms by ~800ms.
+    # cancel() on a FILLED order is a no-op on-chain; the poll would also immediately break.
+    _api_confirmed_filled = (
+        filled
+        and last_get is not None
+        and _predict_resp_is_filled(last_get)
+    )
+
     # ── Cleanup: cancel unfilled remainder ──
     remove_resp: dict[str, Any] | None = None
-    if order_id:
+    if order_id and not _api_confirmed_filled:
         try:
-            # Always try to cancel — if fully filled, API will just ignore it
+            # Skip cancel if API already confirmed FILLED — saves ~200–300ms round-trip
             remove_resp = _predict_remove_orders(session, [order_id])
         except Exception as _re:
             remove_resp = {"success": False, "error": str(_re)}
@@ -3718,7 +3727,8 @@ def _place_predict_limit_buy(
     # BSC block confirmation lag: fills can land AFTER the cancel API call returns.
     # Poll until terminal state to capture ALL fills and size the hedge correctly.
     # Without this, partially-filled orders that cancel slowly leave unhedged positions.
-    if order_hash:
+    # Skip entirely when the API has already confirmed FILLED — saves 500ms+ (sleep) + HTTP.
+    if order_hash and not _api_confirmed_filled:
         _PC_MAX_SEC = float(os.environ.get("PREDICT_POSTCANCEL_SWEEP_SEC", "5.0") or "5.0")
         _PC_POLL_SEC = 0.5
         _pc_deadline = time.time() + _PC_MAX_SEC
@@ -3764,7 +3774,10 @@ def _place_predict_limit_buy(
         if not _rh:
             continue
         _rh_best = 0
-        for _ri in range(6):
+        # Reduced retries: 2 quick checks (0.1s sleep) instead of 6×0.25s.
+        # Saves ~1.3s per replaced hash on the critical path to poly hedge.
+        # Any residual fills missed here are caught by late_watch / reconcile.
+        for _ri in range(2):
             try:
                 _rh_get = _predict_get_order_by_hash(session, str(_rh))
                 _rh_w = _get_filled_wei(_rh_get)
@@ -3772,8 +3785,8 @@ def _place_predict_limit_buy(
                     _rh_best = _rh_w
             except Exception:
                 pass
-            if _ri < 5:
-                time.sleep(0.25)
+            if _ri < 1:
+                time.sleep(0.1)
         replaced_filled_wei_total += _rh_best
         if _rh_best > 0:
             print(
@@ -3812,6 +3825,7 @@ def _place_predict_limit_buy(
             "replace_count": replace_count,
             "cancel_reason": cancel_reason,
             "first_fill_ts": first_fill_ts,
+            "quote_post_ts": quote_post_ts,
             "time_to_first_fill_ms": round((first_fill_ts - quote_post_ts) * 1000.0, 1) if first_fill_ts else None,
             "final_bid_price": current_bid_price,
             "initial_bid_price": float(leg.ask),
@@ -5126,6 +5140,58 @@ def opportunity(opp: Opportunity) -> dict:
             # meaning fee is charged in USDC (maker_amount), not deducted from shares.
             # The wallet receives exactly amountFilled shares, so sell the full amount.
             _ba_net_sell_qty = _ba_hedge_qty
+
+            # Ghost-fill age guard: if the fill was detected very late (order was cancelled
+            # long ago, BSC confirmed slowly), the Poly price has likely moved significantly.
+            # In that case skip the hedge and unwind on Predict instead of locking in a loss.
+            _ba_ghost_fill_max_age_sec = float(os.environ.get("BA_GHOST_FILL_MAX_AGE_SEC", "0") or "0")
+            _ba_first_fill_ts_v = _ba_quote_meta.get("first_fill_ts")
+            _ba_quote_post_ts_v = _ba_quote_meta.get("quote_post_ts") or _pred_timing_ba.get("submit_ts")
+            if (
+                _ba_ghost_fill_max_age_sec > 0
+                and _ba_first_fill_ts_v is not None
+                and _ba_quote_post_ts_v is not None
+                and (_ba_first_fill_ts_v - _ba_quote_post_ts_v) > _ba_ghost_fill_max_age_sec
+            ):
+                _ba_ghost_age = _ba_first_fill_ts_v - _ba_quote_post_ts_v
+                print(
+                    f"[TRADER]{_t}[GHOST_FILL_SKIP] label={opp.label} "
+                    f"fill_age={_ba_ghost_age:.1f}s > limit={_ba_ghost_fill_max_age_sec:.0f}s "
+                    f"— skipping hedge, unwinding on Predict"
+                )
+                _gf_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                _gf_sell_p = max(_gf_tick, round(float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask) - _gf_tick, 6))
+                _gf_sold = 0.0
+                try:
+                    _gf_r = _place_predict_limit_sell(
+                        pred_leg,
+                        sell_qty=_ba_net_sell_qty,
+                        sell_price=_gf_sell_p,
+                        fill_timeout_sec=60.0,
+                        trace_id=trace_id,
+                    )
+                    _gf_sold = _gf_r.get("filled_qty", 0.0)
+                except Exception as _gf_exc:
+                    print(f"[TRADER]{_t}[GHOST_FILL_SKIP] unwind_err={_gf_exc}")
+                _gf_status = (
+                    f"✅ sold {_gf_sold:.2f} sh"
+                    if _gf_sold >= _ba_net_sell_qty * 0.99
+                    else f"⚠️ partial {_gf_sold:.2f}/{_ba_net_sell_qty:.2f} sh"
+                )
+                notify(
+                    f"⚠️ <b>GHOST FILL SKIPPED (stale)</b>\n"
+                    f"\n"
+                    f"<b>{opp.label}</b>\n"
+                    f"\n"
+                    f"Fill detected {_ba_ghost_age:.0f}s after order (limit={_ba_ghost_fill_max_age_sec:.0f}s)\n"
+                    f"Poly price likely moved — unwinding Predict instead\n"
+                    f"Predict sell @ {_gf_sell_p:.2f}: {_gf_status}\n"
+                )
+                row["ok"] = False
+                row["summary"]["status"] = "skipped"
+                row["summary"]["reason_code"] = "ghost_fill_too_old"
+                _append_jsonl(trades_file, row)
+                return {"status": "skipped", "reason": "ghost_fill_too_old"}
 
             # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
             # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
