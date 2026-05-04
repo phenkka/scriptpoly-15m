@@ -133,6 +133,19 @@ class _PredictClient:
                 self._market_cache[market_id] = _predict_market(session, market_id)
             return self._market_cache[market_id]
 
+    def jwt(self) -> str | None:
+        """Return current JWT (refresh if expired). Thread-safe."""
+        with self._lock:
+            if self._session is None:
+                self._session = self._make_session()
+            if self._builder is None:
+                self._builder = self._make_builder()
+            now = time.time()
+            if self._jwt is None or (now - self._jwt_ts) > self._JWT_TTL_SEC:
+                self._jwt = self._refresh_jwt(self._session, self._builder)
+                self._jwt_ts = now
+            return self._jwt
+
     def invalidate_jwt(self) -> None:
         """Принудительное обновление JWT при следующем get()."""
         with self._lock:
@@ -288,6 +301,8 @@ def _startup_warmup() -> None:
     _start_bsc_ws_thread()
     # Polygon newHeads — same idea for Polymarket CTF / reconcile vs REST indexer lag
     _start_polygon_ws_thread()
+    # Predict Wallet WS — early risk detection: orderTransactionSubmitted fires before BSC (~60s faster)
+    _start_predict_wallet_ws()
 
     # VPN watchdog: проверяем доступность прокси каждые 60 секунд.
     # Если прокси недоступен — создаём /data/halt_vpn и уведомляем.
@@ -745,6 +760,160 @@ def _start_bsc_ws_thread() -> None:
     )
     _bsc_ws_thread.start()
     print("[TRADER][BSC_WS] background thread started")
+
+
+# ── Predict Wallet WebSocket — early risk detection ───────────────────────────
+# Subscribes to wss://api.predict.fun/predictWalletEvents/{jwt}.
+# Events: orderTransactionSubmitted (off-chain match sent to BSC — earliest risk signal),
+#         orderTransactionSuccess (fill confirmed on-chain),
+#         orderCancelled (cancel confirmed).
+# orderTransactionSubmitted fires BEFORE BSC block confirmation (~30-90s faster).
+_predict_ws_events: dict[str, list[dict[str, Any]]] = {}  # key: orderId or orderHash
+_predict_ws_events_lock = _threading.Lock()
+_predict_wallet_ws_thread: _threading.Thread | None = None
+_predict_wallet_ws_stop = _threading.Event()
+
+
+def _predict_ws_record_event(key: str, event: dict[str, Any]) -> None:
+    with _predict_ws_events_lock:
+        if key not in _predict_ws_events:
+            _predict_ws_events[key] = []
+        _predict_ws_events[key].append(event)
+        # Prune stale keys to avoid unbounded growth (keep most recent 300)
+        if len(_predict_ws_events) > 300:
+            oldest = list(_predict_ws_events.keys())[:50]
+            for k in oldest:
+                _predict_ws_events.pop(k, None)
+
+
+def _predict_ws_get_events(
+    order_id: str | None, order_hash: str | None
+) -> list[dict[str, Any]]:
+    with _predict_ws_events_lock:
+        result: list[dict[str, Any]] = []
+        for key in (str(order_id) if order_id else None, str(order_hash) if order_hash else None):
+            if key:
+                result.extend(_predict_ws_events.get(key, []))
+        return result
+
+
+def _predict_ws_had_tx_submitted(
+    order_id: str | None,
+    order_hash: str | None,
+    not_before_ts: float | None = None,
+) -> bool:
+    """True if orderTransactionSubmitted arrived for this order.
+    not_before_ts: only count events >= not_before_ts - 3.0s (grace window)."""
+    for ev in _predict_ws_get_events(order_id, order_hash):
+        if ev.get("type") == "orderTransactionSubmitted":
+            if not_before_ts is None or ev.get("ts", 0) >= not_before_ts - 3.0:
+                return True
+    return False
+
+
+def _predict_ws_had_tx_success(
+    order_id: str | None, order_hash: str | None
+) -> bool:
+    return any(
+        ev.get("type") == "orderTransactionSuccess"
+        for ev in _predict_ws_get_events(order_id, order_hash)
+    )
+
+
+def _predict_wallet_ws_loop() -> None:
+    """Connect to Predict wallet WS and record per-order fill events."""
+    try:
+        import websocket as _pwsmod  # type: ignore[import]
+    except ImportError:
+        print("[PREDICT_WS] websocket-client not installed — pip install websocket-client")
+        return
+    RECONNECT_DELAY = 5.0
+    backoff = RECONNECT_DELAY
+    while not _predict_wallet_ws_stop.is_set():
+        try:
+            jwt_token = _predict_client.jwt()
+            if not jwt_token:
+                _predict_wallet_ws_stop.wait(backoff)
+                continue
+            url = f"wss://api.predict.fun/predictWalletEvents/{jwt_token}"
+            ws = _pwsmod.create_connection(url, timeout=30, enable_multithread=True)
+            print("[PREDICT_WS] connected")
+            backoff = RECONNECT_DELAY  # reset on successful connect
+            ws.settimeout(35)
+            while not _predict_wallet_ws_stop.is_set():
+                try:
+                    raw = ws.recv()
+                    if not raw:
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    # Normalize field names (API may vary)
+                    event_type = str(
+                        msg.get("type") or msg.get("event") or msg.get("eventType") or
+                        (msg.get("data") or {}).get("type") or ""
+                    ).strip()
+                    data_obj = msg.get("data") or msg
+                    order_id_ws = str(
+                        data_obj.get("orderId") or data_obj.get("order_id") or
+                        msg.get("orderId") or msg.get("order_id") or ""
+                    ).strip()
+                    order_hash_ws = str(
+                        data_obj.get("orderHash") or data_obj.get("order_hash") or
+                        msg.get("orderHash") or msg.get("order_hash") or ""
+                    ).strip()
+                    ev_record: dict[str, Any] = {
+                        "type": event_type,
+                        "ts": time.time(),
+                        "raw": msg,
+                    }
+                    for key in (order_id_ws, order_hash_ws):
+                        if key:
+                            _predict_ws_record_event(key, ev_record)
+                    if event_type:
+                        print(
+                            f"[PREDICT_WS] event={event_type} "
+                            f"orderId={order_id_ws[:16] if order_id_ws else '-'}"
+                        )
+                    # Wake all fill-poll loops on tx events
+                    if event_type in ("orderTransactionSubmitted", "orderTransactionSuccess"):
+                        _bsc_signal_new_head()
+                except _pwsmod.WebSocketTimeoutException:
+                    try:
+                        ws.ping()
+                    except Exception:
+                        pass
+                    continue
+                except Exception as _recv_e:
+                    print(f"[PREDICT_WS] recv_err={_recv_e}")
+                    break
+            try:
+                ws.close()
+            except Exception:
+                pass
+        except Exception as _conn_e:
+            print(f"[PREDICT_WS] connect_err={_conn_e}")
+        if not _predict_wallet_ws_stop.is_set():
+            _predict_wallet_ws_stop.wait(backoff)
+            backoff = min(backoff * 1.4, 60.0)
+
+
+def _start_predict_wallet_ws() -> None:
+    global _predict_wallet_ws_thread
+    try:
+        import websocket  # noqa: F401
+    except ImportError:
+        print("[PREDICT_WS] websocket-client not available — WS disabled")
+        return
+    if _predict_wallet_ws_thread is not None and _predict_wallet_ws_thread.is_alive():
+        return
+    _predict_wallet_ws_stop.clear()
+    _predict_wallet_ws_thread = _threading.Thread(
+        target=_predict_wallet_ws_loop, daemon=True, name="predict_wallet_ws"
+    )
+    _predict_wallet_ws_thread.start()
+    print("[PREDICT_WS] background thread started")
 
 
 # ── Polygon (Polymarket CTF) — on-chain balance + WS newHeads (mirrors BSC+Predict pattern) ──
@@ -1968,6 +2137,158 @@ def _predict_cancel_all_open_orders(session: requests.Session) -> int:
     except Exception as _e:
         print(f"[TRADER] predict_cancel_all_open_orders error={_e}")
         return 0
+
+
+def _predict_reconcile_watcher(
+    session: requests.Session,
+    order_id: str | None,
+    order_hash: str | None,
+    market_id: int | None,
+    cancel_ts: float,
+    window_sec: float = 12.0,
+    quiet_window_sec: float = 6.0,
+) -> dict[str, Any]:
+    """After cancel, poll activity + matches to determine if cancel is practically final.
+
+    State flow: CANCEL_SENT → CANCEL_UNCERTAIN → CANCEL_FINAL (or TX_SUBMITTED_RISK).
+
+    WS  = primary risk signal (orderTransactionSubmitted)
+    activity = authoritative record of what happened and in what order
+    matches = backup fill detection
+    positions = not polled here (caller polls for sell-ready)
+
+    Rate limits: activity 1 req/s, matches 0.5 req/s (240 req/min budget).
+
+    Returns:
+      practically_final: True = no fill expected, cancel is done
+      filled_qty: shares matched during window (from activity/matches)
+      cancel_confirmed: cancel seen in activity
+      tx_submitted: WS saw orderTransactionSubmitted
+      tx_success: WS saw orderTransactionSuccess
+      match_count: number of distinct matches found
+    """
+    cancel_seen = False
+    filled_qty = 0.0
+    seen_match_ids: set[str] = set()
+    last_activity_poll = 0.0
+    last_matches_poll = 0.0
+    _ACTIVITY_INTERVAL = 1.0
+    _MATCHES_INTERVAL = 2.0
+    t_end = cancel_ts + window_sec
+
+    while time.time() < t_end:
+        # WS primary check — if tx_submitted detected, switch to TX_SUBMITTED_RISK immediately
+        if _predict_ws_had_tx_submitted(order_id, order_hash, not_before_ts=cancel_ts - 5.0):
+            break
+        if _predict_ws_had_tx_success(order_id, order_hash):
+            break
+
+        now = time.time()
+
+        # ── Poll account/activity ──────────────────────────────────────────────
+        if now - last_activity_poll >= _ACTIVITY_INTERVAL:
+            last_activity_poll = now
+            try:
+                r = session.get(
+                    "https://api.predict.fun/v1/account/activity",
+                    params={"limit": 30},
+                    timeout=5,
+                )
+                if r.ok:
+                    for item in (r.json().get("data") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        act_type = str(
+                            item.get("type") or item.get("activityType") or ""
+                        ).lower()
+                        act_oid = str(
+                            item.get("orderId") or item.get("order_id") or ""
+                        ).strip()
+                        if order_id and act_oid == str(order_id):
+                            if "cancel" in act_type:
+                                cancel_seen = True
+                            if any(kw in act_type for kw in ("match", "fill", "trade")):
+                                act_id = str(
+                                    item.get("id") or item.get("activityId") or ""
+                                ).strip()
+                                amt = float(
+                                    item.get("amount") or item.get("shares") or
+                                    item.get("quantity") or 0
+                                )
+                                if act_id and act_id not in seen_match_ids:
+                                    seen_match_ids.add(act_id)
+                                    filled_qty += amt
+                                    print(
+                                        f"[RECONCILE] activity_match "
+                                        f"order_id={order_id[:16] if order_id else '-'} "
+                                        f"type={act_type} qty={amt:.4f}"
+                                    )
+            except Exception:
+                pass
+
+        # ── Poll orders/matches (backup) ──────────────────────────────────────
+        if now - last_matches_poll >= _MATCHES_INTERVAL and market_id:
+            last_matches_poll = now
+            try:
+                r = session.get(
+                    "https://api.predict.fun/v1/orders/matches",
+                    params={"marketId": str(market_id), "limit": 30},
+                    timeout=5,
+                )
+                if r.ok:
+                    for m in (r.json().get("data") or []):
+                        if not isinstance(m, dict):
+                            continue
+                        m_oid = str(
+                            m.get("orderId") or m.get("order_id") or ""
+                        ).strip()
+                        if order_id and m_oid == str(order_id):
+                            m_id = str(
+                                m.get("id") or m.get("matchId") or ""
+                            ).strip()
+                            if m_id and m_id not in seen_match_ids:
+                                seen_match_ids.add(m_id)
+                                m_qty = float(
+                                    m.get("quantity") or m.get("shares") or
+                                    m.get("takerAmount") or 0
+                                )
+                                filled_qty += m_qty
+                                print(
+                                    f"[RECONCILE] matches_fill "
+                                    f"order_id={order_id[:16] if order_id else '-'} "
+                                    f"qty={m_qty:.4f}"
+                                )
+            except Exception:
+                pass
+
+        # ── Early exit: cancel confirmed + quiet window elapsed ───────────────
+        if cancel_seen and (time.time() - cancel_ts) >= quiet_window_sec:
+            break
+
+        time.sleep(0.5)
+
+    # Final WS state check
+    tx_submitted = _predict_ws_had_tx_submitted(
+        order_id, order_hash, not_before_ts=cancel_ts - 5.0
+    )
+    tx_success = _predict_ws_had_tx_success(order_id, order_hash)
+    elapsed = time.time() - cancel_ts
+    practically_final = (
+        not tx_submitted
+        and not tx_success
+        and cancel_seen
+        and len(seen_match_ids) == 0
+        and elapsed >= quiet_window_sec
+    )
+    return {
+        "practically_final": practically_final,
+        "filled_qty": filled_qty,
+        "cancel_confirmed": cancel_seen,
+        "tx_submitted": tx_submitted,
+        "tx_success": tx_success,
+        "match_count": len(seen_match_ids),
+        "elapsed_sec": round(elapsed, 2),
+    }
 
 
 def _polymarket_book(token_id: str) -> dict[str, Any]:
@@ -3287,6 +3608,7 @@ def _place_predict_limit_buy(
     last_get: dict[str, Any] | None = None
     all_creates: list[dict[str, Any]] = [out]
     need_final_get_check: bool = False
+    _first_cancel_sent_ts: float | None = None   # when first cancel was sent (for WS timing)
 
     def _limit_buy_mktk() -> tuple[int | None, int | None]:
         """On-chain taker-amount-from-BSC for BUY needs maker/taker in wei; prefer latest GET, else last create body."""
@@ -3321,6 +3643,8 @@ def _place_predict_limit_buy(
                                 f"queue=${_ab_queue:.1f} threshold=${queue_threshold_usd:.0f}"
                             )
                             # Retry cancel with verify — prevent ghost fills from dropped HTTP requests
+                            if _first_cancel_sent_ts is None:
+                                _first_cancel_sent_ts = time.time()
                             _OBQ_CANCEL_RETRIES = 5
                             _OBQ_VERIFY_SEC = 1.0
                             for _obq_ci in range(_OBQ_CANCEL_RETRIES):
@@ -3418,6 +3742,8 @@ def _place_predict_limit_buy(
                     # Retry cancel with verify — same pattern as poly_hedge_no_edge path.
                     # A single HTTP cancel can be silently dropped by the API → order stays open
                     # and gets filled later as a "ghost fill".
+                    if _first_cancel_sent_ts is None:
+                        _first_cancel_sent_ts = time.time()
                     _MQA_CANCEL_RETRIES = 5
                     _MQA_VERIFY_SEC = 1.0
                     for _mqa_ci in range(_MQA_CANCEL_RETRIES):
@@ -3479,6 +3805,8 @@ def _place_predict_limit_buy(
                             # Cancel + verify loop: retry cancel until status is no longer OPEN
                             # BSC можно подтвердить транзакцию до того как cancel API успел —
                             # поэтому проверяем что ордер реально отменился, иначе отменяем снова.
+                            if _first_cancel_sent_ts is None:
+                                _first_cancel_sent_ts = time.time()
                             _CANCEL_RETRIES = 5
                             _CANCEL_VERIFY_SEC = 2.0
                             for _ci in range(_CANCEL_RETRIES):
@@ -3654,6 +3982,68 @@ def _place_predict_limit_buy(
     if order_hash and not filled and cancel_reason is None:
         cancel_reason = "fill_timeout"
         need_final_get_check = True
+    if _first_cancel_sent_ts is None and cancel_reason is not None:
+        _first_cancel_sent_ts = time.time()
+
+    # ── WS / reconcile pre-check before 60s ghost_fill_watch ──────────────────
+    # orderTransactionSubmitted = off-chain match submitted to BSC → treat as in-flight fill.
+    # If WS saw tx_submitted → let ghost_fill_watch run (it'll confirm via BSC/REST).
+    # If no WS signal → run _predict_reconcile_watcher to check practically_final.
+    #   practically_final → skip the full 60s ghost_fill_watch (cancel is done, no fill).
+    #   tx_submitted during reconcile window → mark in-flight, fall through to ghost_fill_watch.
+    _ws_pre_cancel_ts = _first_cancel_sent_ts or time.time()
+    _ws_all_order_ids = [order_id] + [None]  # extend if we track all replaced order IDs
+    _ws_all_hashes = ([order_hash] if order_hash else []) + replaced_order_hashes
+    _ws_tx_sub_pre = any(
+        _predict_ws_had_tx_submitted(_oid, _oh, not_before_ts=quote_post_ts)
+        for _oid in _ws_all_order_ids
+        for _oh in (_ws_all_hashes or [None])
+    )
+    _ws_tx_ok_pre = any(
+        _predict_ws_had_tx_success(_oid, _oh)
+        for _oid in _ws_all_order_ids
+        for _oh in (_ws_all_hashes or [None])
+    )
+    _reconcile_result: dict[str, Any] = {}
+    if (order_hash and need_final_get_check and not filled
+            and not _ws_tx_sub_pre and not _ws_tx_ok_pre
+            and order_id and _first_cancel_sent_ts is not None):
+        # No WS risk signal — check if cancel is practically final via activity + matches.
+        # This can save 50+ seconds of unnecessary ghost_fill_watch polling.
+        _recon_quiet = float(os.environ.get("PREDICT_RECONCILE_QUIET_SEC", "6") or "6")
+        _recon_window = float(os.environ.get("PREDICT_RECONCILE_WINDOW_SEC", "12") or "12")
+        _reconcile_result = _predict_reconcile_watcher(
+            _predict_monitor.get(),
+            order_id, order_hash,
+            int(leg.market_id) if leg.market_id is not None else None,
+            cancel_ts=_first_cancel_sent_ts,
+            window_sec=_recon_window,
+            quiet_window_sec=_recon_quiet,
+        )
+        print(
+            f"[PREDICT_LIMIT]{_trace} reconcile order_id={order_id} "
+            f"practically_final={_reconcile_result.get('practically_final')} "
+            f"tx_submitted={_reconcile_result.get('tx_submitted')} "
+            f"cancel_confirmed={_reconcile_result.get('cancel_confirmed')} "
+            f"match_count={_reconcile_result.get('match_count')} "
+            f"elapsed={_reconcile_result.get('elapsed_sec', 0):.1f}s"
+        )
+        if _reconcile_result.get("tx_submitted") or _reconcile_result.get("tx_success"):
+            # WS signal arrived during reconcile window — in-flight fill
+            _ws_tx_sub_pre = True
+        elif _reconcile_result.get("practically_final"):
+            # Cancel confirmed, no fills seen, no WS risk — skip ghost_fill_watch
+            need_final_get_check = False
+            print(
+                f"[PREDICT_LIMIT]{_trace} reconcile_skip_ghost_fill_watch "
+                f"practically_final=True — cancel confirmed, no fills in activity/matches"
+            )
+    elif _ws_tx_sub_pre or _ws_tx_ok_pre:
+        print(
+            f"[PREDICT_LIMIT]{_trace} ws_tx_in_flight tx_submitted={_ws_tx_sub_pre} "
+            f"tx_success={_ws_tx_ok_pre} — skipping reconcile, running full ghost_fill_watch"
+        )
+    # ──────────────────────────────────────────────────────────────────────────
 
     if order_hash and need_final_get_check and not filled:
         # ANY cancel: on-chain fill can arrive up to ~30s after cancel (BSC block lag).
@@ -5516,9 +5906,35 @@ def opportunity(opp: Opportunity) -> dict:
                         os.environ.get("PREDICT_EMERGENCY_POLY_HEDGE", "1") not in ("0", "false", "no")
                         and poly_leg.token_id is not None
                     )
+                    # WS state: if orderTransactionSubmitted seen for the buy order but no
+                    # tx_success yet → BSC not confirmed → positions definitely unindexed.
+                    # Force emergency hedge immediately, skip the double-check.
+                    _ne_pred_order_id = str(_ba_pred_resp.get("orderId") or "").strip() or None
+                    _ne_pred_order_hash = str(pred_hash_ba or "").strip() or None
+                    _ne_ws_tx_submitted = _predict_ws_had_tx_submitted(
+                        _ne_pred_order_id, _ne_pred_order_hash
+                    )
+                    _ne_ws_tx_success = _predict_ws_had_tx_success(
+                        _ne_pred_order_id, _ne_pred_order_hash
+                    )
                     if _ne_use_temp_hedge:
-                        # Quick balance check (no blocking wait) — 0 means positions not indexed
-                        _ne_quick_bal = _predict_max_shares_for_market(None, int(pred_leg.market_id))
+                        # Quick balance check (no blocking wait) — 0 means positions not indexed.
+                        # Double-check with a second request to avoid false-positives from
+                        # transient/stale Predict API responses (inconsistent indexer state).
+                        if _ne_ws_tx_submitted and not _ne_ws_tx_success:
+                            # WS confirms fill in-flight but BSC not yet done → force unindexed
+                            _ne_quick_bal = 0.0
+                            print(
+                                f"[TRADER][EMERGENCY_HEDGE] ws_tx_submitted_unindexed "
+                                f"label={opp.label} — forcing temp hedge immediately"
+                            )
+                        else:
+                            _ne_quick_bal = _predict_max_shares_for_market(None, int(pred_leg.market_id))
+                            if _ne_quick_bal >= _ba_net_sell_qty * 0.5:
+                                # Looks indexed — verify with a fresh call (2s pause) to avoid stale read
+                                time.sleep(2.0)
+                                _ne_quick_bal2 = _predict_max_shares_for_market(None, int(pred_leg.market_id))
+                                _ne_quick_bal = min(_ne_quick_bal, _ne_quick_bal2)
                         if _ne_quick_bal < _ba_net_sell_qty * 0.5:
                             print(
                                 f"[TRADER][EMERGENCY_HEDGE] positions_not_indexed label={opp.label} "
