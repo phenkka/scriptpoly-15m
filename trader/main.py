@@ -3320,11 +3320,45 @@ def _place_predict_limit_buy(
                                 f"our_bid={current_bid_price:.4f} best_bid={float(_ab_bb):.4f} "
                                 f"queue=${_ab_queue:.1f} threshold=${queue_threshold_usd:.0f}"
                             )
-                            try:
-                                if order_id:
-                                    _predict_remove_orders(session, [order_id])
-                            except Exception as _bce:
-                                print(f"[PREDICT_LIMIT]{_trace} cancel_outbid_queue_err err={_bce}")
+                            # Retry cancel with verify — prevent ghost fills from dropped HTTP requests
+                            _OBQ_CANCEL_RETRIES = 5
+                            _OBQ_VERIFY_SEC = 1.0
+                            for _obq_ci in range(_OBQ_CANCEL_RETRIES):
+                                try:
+                                    if order_id:
+                                        _predict_remove_orders(session, [order_id])
+                                except Exception as _bce:
+                                    print(f"[PREDICT_LIMIT]{_trace} cancel_outbid_queue_err attempt={_obq_ci+1} err={_bce}")
+                                time.sleep(_OBQ_VERIFY_SEC)
+                                try:
+                                    _obq_cv = _predict_get_order_by_hash(session, order_hash)
+                                    _obq_status = _get_status(_obq_cv)
+                                    _obq_filled = _get_filled_wei(_obq_cv)
+                                    print(
+                                        f"[PREDICT_LIMIT]{_trace} cancel_obq_verify attempt={_obq_ci+1}/{_OBQ_CANCEL_RETRIES} "
+                                        f"status={_obq_status} filled_wei={_obq_filled}"
+                                    )
+                                    if _obq_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
+                                        if _obq_filled > prev_filled_wei:
+                                            delta_wei = _obq_filled - prev_filled_wei
+                                            now_ts = time.time()
+                                            if first_fill_ts is None:
+                                                first_fill_ts = now_ts
+                                            partial_fills.append({
+                                                "ts": now_ts,
+                                                "delta_wei": delta_wei,
+                                                "cumulative_wei": _obq_filled,
+                                                "delta_shares": delta_wei / 10**18,
+                                                "cumulative_shares": _obq_filled / 10**18,
+                                            })
+                                            prev_filled_wei = _obq_filled
+                                            print(
+                                                f"[PREDICT_LIMIT]{_trace} cancel_obq_fill_detected "
+                                                f"hash={order_hash} filled={_obq_filled / 10**18:.4f}"
+                                            )
+                                        break
+                                except Exception as _obq_cve:
+                                    print(f"[PREDICT_LIMIT]{_trace} cancel_obq_verify_err attempt={_obq_ci+1} err={_obq_cve}")
                             need_final_get_check = True
                             break
 
@@ -3381,11 +3415,47 @@ def _place_predict_limit_buy(
                         f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age hash={order_hash} "
                         f"age={_quote_age:.1f}s limit={_max_quote_age_sec:.0f}s"
                     )
-                    try:
-                        if order_id:
-                            _predict_remove_orders(session, [order_id])
-                    except Exception as _mqa_e:
-                        print(f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age_err err={_mqa_e}")
+                    # Retry cancel with verify — same pattern as poly_hedge_no_edge path.
+                    # A single HTTP cancel can be silently dropped by the API → order stays open
+                    # and gets filled later as a "ghost fill".
+                    _MQA_CANCEL_RETRIES = 5
+                    _MQA_VERIFY_SEC = 1.0
+                    for _mqa_ci in range(_MQA_CANCEL_RETRIES):
+                        try:
+                            if order_id:
+                                _predict_remove_orders(session, [order_id])
+                        except Exception as _mqa_e:
+                            print(f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age_err attempt={_mqa_ci+1} err={_mqa_e}")
+                        time.sleep(_MQA_VERIFY_SEC)
+                        try:
+                            _mqa_cv = _predict_get_order_by_hash(session, order_hash)
+                            _mqa_status = _get_status(_mqa_cv)
+                            _mqa_filled = _get_filled_wei(_mqa_cv)
+                            print(
+                                f"[PREDICT_LIMIT]{_trace} cancel_mqa_verify attempt={_mqa_ci+1}/{_MQA_CANCEL_RETRIES} "
+                                f"status={_mqa_status} filled_wei={_mqa_filled}"
+                            )
+                            if _mqa_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
+                                if _mqa_filled > prev_filled_wei:
+                                    delta_wei = _mqa_filled - prev_filled_wei
+                                    now_ts = time.time()
+                                    if first_fill_ts is None:
+                                        first_fill_ts = now_ts
+                                    partial_fills.append({
+                                        "ts": now_ts,
+                                        "delta_wei": delta_wei,
+                                        "cumulative_wei": _mqa_filled,
+                                        "delta_shares": delta_wei / 10**18,
+                                        "cumulative_shares": _mqa_filled / 10**18,
+                                    })
+                                    prev_filled_wei = _mqa_filled
+                                    print(
+                                        f"[PREDICT_LIMIT]{_trace} cancel_mqa_fill_detected "
+                                        f"hash={order_hash} filled={_mqa_filled / 10**18:.4f}"
+                                    )
+                                break  # terminal — stop retrying
+                        except Exception as _mqa_cve:
+                            print(f"[PREDICT_LIMIT]{_trace} cancel_mqa_verify_err attempt={_mqa_ci+1} err={_mqa_cve}")
                     need_final_get_check = True
                     break
 
