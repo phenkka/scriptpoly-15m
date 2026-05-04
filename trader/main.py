@@ -821,24 +821,43 @@ def _predict_ws_had_tx_success(
 
 
 def _predict_wallet_ws_loop() -> None:
-    """Connect to Predict wallet WS and record per-order fill events."""
+    """Connect to Predict wallet WS and record per-order fill events.
+
+    Protocol:
+      1. Connect to wss://ws.predict.fun/ws
+      2. Send subscribe: {"method":"subscribe","requestId":N,"params":["predictWalletEvents/<JWT>"]}
+      3. Respond to heartbeat frames: {"method":"heartbeat","data":<ts>}
+      4. Record wallet events by orderId/orderHash
+    """
     try:
         import websocket as _pwsmod  # type: ignore[import]
     except ImportError:
         print("[PREDICT_WS] websocket-client not installed — pip install websocket-client")
         return
+    _WALLET_EVENTS = frozenset({
+        "orderAccepted", "orderNotAccepted", "orderExpired", "orderCancelled",
+        "orderTransactionSubmitted", "orderTransactionSuccess", "orderTransactionFailed",
+    })
     RECONNECT_DELAY = 5.0
     backoff = RECONNECT_DELAY
+    _req_id = 0
     while not _predict_wallet_ws_stop.is_set():
         try:
             jwt_token = _predict_client.jwt()
             if not jwt_token:
                 _predict_wallet_ws_stop.wait(backoff)
                 continue
-            url = f"wss://api.predict.fun/predictWalletEvents/{jwt_token}"
+            url = "wss://ws.predict.fun/ws"
             ws = _pwsmod.create_connection(url, timeout=30, enable_multithread=True)
-            print("[PREDICT_WS] connected")
+            print("[PREDICT_WS] connected, subscribing wallet stream...")
             backoff = RECONNECT_DELAY  # reset on successful connect
+            # Subscribe to private wallet topic
+            _req_id += 1
+            ws.send(json.dumps({
+                "method": "subscribe",
+                "requestId": _req_id,
+                "params": [f"predictWalletEvents/{jwt_token}"],
+            }))
             ws.settimeout(35)
             while not _predict_wallet_ws_stop.is_set():
                 try:
@@ -849,12 +868,31 @@ def _predict_wallet_ws_loop() -> None:
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    # Normalize field names (API may vary)
+                    msg_outer_type = msg.get("type", "")
+                    topic = msg.get("topic", "")
+
+                    # ── Heartbeat: server → client, must pong immediately ──
+                    if topic == "heartbeat" or msg_outer_type == "heartbeat":
+                        try:
+                            ws.send(json.dumps({"method": "heartbeat", "data": msg.get("data")}))
+                        except Exception:
+                            pass
+                        continue
+
+                    # ── Wallet event messages ──
+                    # Frame format: {"type":"M","topic":"predictWalletEvents/<jwt>","data":{...}}
+                    is_wallet_topic = "predictWalletEvents" in topic
+                    data_obj = msg.get("data") if isinstance(msg.get("data"), dict) else msg
                     event_type = str(
-                        msg.get("type") or msg.get("event") or msg.get("eventType") or
-                        (msg.get("data") or {}).get("type") or ""
+                        data_obj.get("type") or data_obj.get("eventType") or
+                        data_obj.get("event") or msg_outer_type or ""
                     ).strip()
-                    data_obj = msg.get("data") or msg
+                    if not is_wallet_topic and event_type not in _WALLET_EVENTS:
+                        # Subscription ACK or unknown — log and skip
+                        if msg_outer_type not in ("", "M"):
+                            print(f"[PREDICT_WS] unhandled msg type={msg_outer_type!r} topic={topic!r}")
+                        continue
+
                     order_id_ws = str(
                         data_obj.get("orderId") or data_obj.get("order_id") or
                         msg.get("orderId") or msg.get("order_id") or ""
