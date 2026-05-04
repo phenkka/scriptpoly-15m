@@ -3857,12 +3857,19 @@ def _place_predict_limit_sell(
     fill_timeout_sec: float = 30.0,
     replace_interval_sec: float = 3.0,
     trace_id: int | None = None,
+    fast_exit: bool = False,
 ) -> dict[str, Any]:
     """Place a LIMIT SELL on Predict to unwind a partial position.
 
     Returns {"filled": bool, "filled_qty": float, "sell_price": float, "order_hash": str|None}.
     Always attempts to cancel remaining shares after timeout.
+
+    fast_exit=True: emergency mode — trust API MATCHED without waiting for BSC confirmation,
+    replace every 1s (not 3s), skip heavy BSC pre/post-cancel guards. Used for all unwind paths
+    where speed matters more than on-chain certainty (off-chain fill is reliable enough).
     """
+    if fast_exit:
+        replace_interval_sec = min(replace_interval_sec, 1.0)
     _trace = f"[{trace_id}]" if trace_id is not None else ""
     if leg.market_id is None:
         raise RuntimeError("predict_missing_market_id_for_sell")
@@ -4043,27 +4050,37 @@ def _place_predict_limit_sell(
                         pass
                 if _predict_resp_is_filled(last_get):
                     if filled_wei == 0:
-                        # API says filled/matched but amountFilled=0 (BSC not yet confirmed).
-                        # Verify on-chain before declaring success to avoid false "sold" reports.
-                        try:
-                            _bsc_confirm = _bsc_check_order_filled(
-                                _active_order_hash, sell_qty
-                            )
-                            if _bsc_confirm > 0:
-                                filled = True
-                                filled_wei = int(_bsc_confirm * 10**18)
-                                print(
-                                    f"[TRADER]{_trace} sell_api_matched_bsc_confirmed "
-                                    f"hash={_active_order_hash} qty={_bsc_confirm:.4f}"
-                                )
-                            else:
-                                print(
-                                    f"[TRADER]{_trace} sell_api_matched_bsc_pending "
-                                    f"hash={_active_order_hash} — waiting for BSC"
-                                )
-                        except Exception as _bsc_e:
-                            print(f"[TRADER]{_trace} sell_bsc_confirm_err err={_bsc_e} — trusting API")
+                        if fast_exit:
+                            # Emergency unwind: trust API MATCHED immediately — no BSC wait.
+                            # Off-chain engine match is authoritative; BSC batch confirms later.
                             filled = True
+                            filled_wei = int(sell_qty * 10**18)
+                            print(
+                                f"[TRADER]{_trace} sell_api_matched_fast_exit "
+                                f"hash={_active_order_hash} qty={sell_qty:.4f} (trusted, no BSC wait)"
+                            )
+                        else:
+                            # API says filled/matched but amountFilled=0 (BSC not yet confirmed).
+                            # Verify on-chain before declaring success to avoid false "sold" reports.
+                            try:
+                                _bsc_confirm = _bsc_check_order_filled(
+                                    _active_order_hash, sell_qty
+                                )
+                                if _bsc_confirm > 0:
+                                    filled = True
+                                    filled_wei = int(_bsc_confirm * 10**18)
+                                    print(
+                                        f"[TRADER]{_trace} sell_api_matched_bsc_confirmed "
+                                        f"hash={_active_order_hash} qty={_bsc_confirm:.4f}"
+                                    )
+                                else:
+                                    print(
+                                        f"[TRADER]{_trace} sell_api_matched_bsc_pending "
+                                        f"hash={_active_order_hash} — waiting for BSC"
+                                    )
+                            except Exception as _bsc_e:
+                                print(f"[TRADER]{_trace} sell_bsc_confirm_err err={_bsc_e} — trusting API")
+                                filled = True
                     else:
                         filled = True
                     if filled:
@@ -4107,7 +4124,8 @@ def _place_predict_limit_sell(
         # BSC block = 3s; replace_interval_sec = 3s → fills happen before API indexes them.
         # Without this check, the cancelled (ignored) filled order + new replacement BOTH execute,
         # causing a double-sell from the shared position balance.
-        if _active_order_hash:
+        # fast_exit skips this guard (save ~5s BSC RPC) — balance guard above already protects us.
+        if _active_order_hash and not fast_exit:
             try:
                 _bsc_pre = _bsc_check_order_filled(
                     _active_order_hash,
@@ -4134,7 +4152,8 @@ def _place_predict_limit_sell(
         # A fill can land on-chain in the window between the pre-cancel BSC check and
         # the actual cancel execution (BSC block = ~3s, replace_interval = 3s).
         # Re-check BSC after cancel; if the old order now shows filled, skip replacement.
-        if _active_order_hash:
+        # fast_exit skips this guard too (save another ~5s BSC RPC).
+        if _active_order_hash and not fast_exit:
             try:
                 _bsc_post = _bsc_check_order_filled(
                     _active_order_hash,
@@ -5167,7 +5186,9 @@ def opportunity(opp: Opportunity) -> dict:
                         pred_leg,
                         sell_qty=_ba_net_sell_qty,
                         sell_price=_gf_sell_p,
-                        fill_timeout_sec=60.0,
+                        fill_timeout_sec=20.0,
+                        replace_interval_sec=1.0,
+                        fast_exit=True,
                         trace_id=trace_id,
                     )
                     _gf_sold = _gf_r.get("filled_qty", 0.0)
@@ -5248,7 +5269,9 @@ def opportunity(opp: Opportunity) -> dict:
                         pred_leg,
                         sell_qty=_ba_net_sell_qty,
                         sell_price=_lbu_sell_p,
-                        fill_timeout_sec=60.0,
+                        fill_timeout_sec=20.0,
+                        replace_interval_sec=1.0,
+                        fast_exit=True,
                         trace_id=trace_id,
                     )
                     _lbu_sold = _lbu_r.get("filled_qty", 0.0)
@@ -5447,19 +5470,16 @@ def opportunity(opp: Opportunity) -> dict:
                     _ne_unwind_err: str | None = None
                     _ne_unwind_price = _ne_unwind_tick
                     _NE_UW_RETRIES = int(
-                        float(os.environ.get("PREDICT_NO_EDGE_UNWIND_RETRIES", "5") or "5")
+                        float(os.environ.get("PREDICT_NO_EDGE_UNWIND_RETRIES", "3") or "3")
                     )
-                    _NE_UW_DELAYS = [2.0, 4.0, 6.0, 8.0, 10.0]
+                    # fast_exit mode: no delays between retries — exit ASAP
                     _ne_fill_sec = float(
-                        os.environ.get("PREDICT_NO_EDGE_UNWIND_FILL_SEC", "90") or "90"
+                        os.environ.get("PREDICT_NO_EDGE_UNWIND_FILL_SEC", "15") or "15"
                     )
                     _ne_uw_sold = 0.0
                     if not _ba_no_edge_chose_hedge:
                         for _ne_attempt in range(_NE_UW_RETRIES):
-                            if _ne_attempt > 0:
-                                time.sleep(
-                                    _NE_UW_DELAYS[min(_ne_attempt - 1, len(_NE_UW_DELAYS) - 1)]
-                                )
+                            # No inter-retry sleep — speed is critical for unwind
                             _ne_remaining = max(0.01, _ba_net_sell_qty - _ne_uw_sold)
                             if _ne_remaining < 0.01:
                                 break
@@ -5470,14 +5490,14 @@ def opportunity(opp: Opportunity) -> dict:
                                 fallback=_ba_actual_pred_bid,
                                 tick=_ne_unwind_tick,
                             )
-                            # One tick more aggressive than top-of-book so we take priority over
-                            # a deep queue; still a limit order (not a market).
+                            # Cross the spread: start 2 ticks below best bid so we're a taker.
+                            # fast_exit ladder reduces 1 tick per second → fills in 1-3 steps.
                             _ne_unwind_price = max(
-                                _ne_unwind_tick, round(_live_sell - _ne_unwind_tick, 6)
+                                _ne_unwind_tick, round(_live_sell - 2 * _ne_unwind_tick, 6)
                             )
                             print(
                                 f"[TRADER] no_edge_unwind_pricing n={_ne_attempt + 1}/{_NE_UW_RETRIES} "
-                                f"label={opp.label} live_sell={_live_sell:.4f} limit={_ne_unwind_price:.4f}"
+                                f"label={opp.label} live_sell={_live_sell:.4f} limit={_ne_unwind_price:.4f} fast_exit=True"
                             )
                             _ne_unwind_result = {}
                             _ne_unwind_err = None
@@ -5487,6 +5507,8 @@ def opportunity(opp: Opportunity) -> dict:
                                     sell_qty=_ne_remaining,
                                     sell_price=_ne_unwind_price,
                                     fill_timeout_sec=_ne_fill_sec,
+                                    replace_interval_sec=1.0,
+                                    fast_exit=True,
                                     trace_id=trace_id,
                                 )
                                 _ne_uw_sold += _ne_unwind_result.get("filled_qty", 0.0)
@@ -5704,11 +5726,9 @@ def opportunity(opp: Opportunity) -> dict:
                 _pc_unwind_result: dict[str, Any] = {}
                 _pc_unwind_err: str | None = None
                 _PC_UW_RETRIES = 3
-                _PC_UW_DELAYS = [2.0, 5.0, 10.0]
                 _pc_uw_total_sold = 0.0
                 for _pc_attempt in range(_PC_UW_RETRIES):
-                    if _pc_attempt > 0:
-                        time.sleep(_PC_UW_DELAYS[_pc_attempt - 1])
+                    # No inter-retry sleep — speed critical
                     _pc_uw_remaining = max(0.01, _ba_net_sell_qty - _pc_uw_total_sold)
                     if _pc_uw_remaining < 0.01:
                         break
@@ -5719,7 +5739,9 @@ def opportunity(opp: Opportunity) -> dict:
                             pred_leg,
                             sell_qty=_pc_uw_remaining,
                             sell_price=_pc_unwind_price,
-                            fill_timeout_sec=60.0,
+                            fill_timeout_sec=20.0,
+                            replace_interval_sec=1.0,
+                            fast_exit=True,
                             trace_id=trace_id,
                         )
                         _pc_uw_total_sold += _pc_unwind_result.get("filled_qty", 0.0)
@@ -5804,10 +5826,8 @@ def opportunity(opp: Opportunity) -> dict:
                 _unwind_pre_qty = 0.0
                 if _pred_fill_usd >= _min_unwind_usd:
                     _PRE_UW_RETRIES = 3
-                    _PRE_UW_DELAYS = [2.0, 5.0, 10.0]
                     for _pre_attempt in range(_PRE_UW_RETRIES):
-                        if _pre_attempt > 0:
-                            time.sleep(_PRE_UW_DELAYS[_pre_attempt - 1])
+                        # No inter-retry sleep — speed critical
                         _pre_uw_remaining = max(0.01, _ba_net_sell_qty - _unwind_pre_qty)
                         if _pre_uw_remaining < 0.01:
                             break
@@ -5817,7 +5837,9 @@ def opportunity(opp: Opportunity) -> dict:
                                 pred_leg,
                                 sell_qty=_pre_uw_remaining,
                                 sell_price=_unwind_price_pre,
-                                fill_timeout_sec=60.0,
+                                fill_timeout_sec=20.0,
+                                replace_interval_sec=1.0,
+                                fast_exit=True,
                                 trace_id=trace_id,
                             )
                             _unwind_pre_qty += _unwind_pre_result.get("filled_qty", 0.0)
@@ -5944,11 +5966,9 @@ def opportunity(opp: Opportunity) -> dict:
                     _unwind_result: dict[str, Any] = {}
                     _unwind_err: str | None = None
                     _UW_RETRIES = 3
-                    _UW_DELAYS = [2.0, 5.0, 10.0]
                     _uw_total_sold = 0.0
                     for _uw_attempt in range(_UW_RETRIES):
-                        if _uw_attempt > 0:
-                            time.sleep(_UW_DELAYS[_uw_attempt - 1])
+                        # No inter-retry sleep — speed critical
                         _uw_remaining = max(0.01, _ba_net_sell_qty - _uw_total_sold)
                         if _uw_remaining < 0.01:
                             break
@@ -5959,7 +5979,9 @@ def opportunity(opp: Opportunity) -> dict:
                                 pred_leg,
                                 sell_qty=_uw_remaining,
                                 sell_price=_unwind_price,
-                                fill_timeout_sec=60.0,
+                                fill_timeout_sec=20.0,
+                                replace_interval_sec=1.0,
+                                fast_exit=True,
                                 trace_id=trace_id,
                             )
                             _uw_total_sold += _unwind_result.get("filled_qty", 0.0)
@@ -6436,7 +6458,9 @@ def opportunity(opp: Opportunity) -> dict:
                                 pred_leg,
                                 sell_qty=_mm_sell_qty,
                                 sell_price=_mm_unwind_price,
-                                fill_timeout_sec=60.0,
+                                fill_timeout_sec=20.0,
+                                replace_interval_sec=1.0,
+                                fast_exit=True,
                                 trace_id=trace_id,
                             )
                             _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
@@ -6699,8 +6723,7 @@ def opportunity(opp: Opportunity) -> dict:
                 # (not balance lag, since we already waited for it above).
                 _UW2_RETRIES = 3
                 for _uw2_attempt in range(_UW2_RETRIES):
-                    if _uw2_attempt > 0:
-                        time.sleep(3.0)
+                    # No inter-retry sleep — speed critical
                     _uw2_remaining = max(0.01, _ba_net_sell_qty - _uw2_total_sold)
                     if _uw2_remaining < 0.01:
                         break
@@ -6711,7 +6734,9 @@ def opportunity(opp: Opportunity) -> dict:
                             pred_leg,
                             sell_qty=_uw2_remaining,
                             sell_price=_unwind_sell_price,
-                            fill_timeout_sec=60.0,
+                            fill_timeout_sec=20.0,
+                            replace_interval_sec=1.0,
+                            fast_exit=True,
                             trace_id=trace_id,
                         )
                         _uw2_total_sold += _uw2_result.get("filled_qty", 0.0)
