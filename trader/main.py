@@ -5173,46 +5173,74 @@ def opportunity(opp: Opportunity) -> dict:
                 and (_ba_first_fill_ts_v - _ba_quote_post_ts_v) > _ba_ghost_fill_max_age_sec
             ):
                 _ba_ghost_age = _ba_first_fill_ts_v - _ba_quote_post_ts_v
-                print(
-                    f"[TRADER]{_t}[GHOST_FILL_SKIP] label={opp.label} "
-                    f"fill_age={_ba_ghost_age:.1f}s > limit={_ba_ghost_fill_max_age_sec:.0f}s "
-                    f"— skipping hedge, unwinding on Predict"
-                )
-                _gf_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
-                _gf_sell_p = max(_gf_tick, round(float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask) - _gf_tick, 6))
-                _gf_sold = 0.0
+                # Before unconditionally unwinding, check if Poly hedge is still profitable
+                # at current prices. If the market moved in our favor (fill price still < 1.0
+                # with current Poly ask), hedge instead of unwind — potentially more profitable.
+                _gf_can_hedge = False
+                _gf_live_poly_ask: float | None = None
                 try:
-                    _gf_r = _place_predict_limit_sell(
-                        pred_leg,
-                        sell_qty=_ba_net_sell_qty,
-                        sell_price=_gf_sell_p,
-                        fill_timeout_sec=20.0,
-                        replace_interval_sec=1.0,
-                        fast_exit=True,
-                        trace_id=trace_id,
+                    _gf_poly_book = _polymarket_book(str(poly_leg.token_id))
+                    _gf_poly_asks = _gf_poly_book.get("asks") or []
+                    if _gf_poly_asks:
+                        _gf_live_poly_ask = float(_gf_poly_asks[0]["price"])
+                        _gf_pred_fill_price = float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask)
+                        _gf_pred_fee = 1.0 + float(opp.predict_fee_bps or 0) / 10000.0
+                        _gf_poly_fee_rate = float(opp.poly_fee_rate or 0.072)
+                        _gf_poly_eff = _gf_live_poly_ask * (1.0 + 0.003) + _gf_poly_fee_rate * _gf_live_poly_ask * (1.0 - _gf_live_poly_ask)
+                        _gf_pred_eff = _gf_pred_fill_price * _gf_pred_fee
+                        _gf_sum = _gf_pred_eff + _gf_poly_eff
+                        if _gf_sum < 0.98:  # 2% margin to hedge even after ghost fill
+                            _gf_can_hedge = True
+                            print(
+                                f"[TRADER]{_t}[GHOST_FILL_HEDGE] label={opp.label} "
+                                f"fill_age={_ba_ghost_age:.1f}s — Poly still profitable "
+                                f"live_poly={_gf_live_poly_ask:.4f} sum={_gf_sum:.4f} → hedging"
+                            )
+                except Exception as _gf_check_e:
+                    print(f"[TRADER]{_t}[GHOST_FILL_SKIP] live_check_err={_gf_check_e}")
+
+                if not _gf_can_hedge:
+                    print(
+                        f"[TRADER]{_t}[GHOST_FILL_SKIP] label={opp.label} "
+                        f"fill_age={_ba_ghost_age:.1f}s > limit={_ba_ghost_fill_max_age_sec:.0f}s "
+                        f"live_poly={_gf_live_poly_ask} — skipping hedge, unwinding on Predict"
                     )
-                    _gf_sold = _gf_r.get("filled_qty", 0.0)
-                except Exception as _gf_exc:
-                    print(f"[TRADER]{_t}[GHOST_FILL_SKIP] unwind_err={_gf_exc}")
-                _gf_status = (
-                    f"✅ sold {_gf_sold:.2f} sh"
-                    if _gf_sold >= _ba_net_sell_qty * 0.99
-                    else f"⚠️ partial {_gf_sold:.2f}/{_ba_net_sell_qty:.2f} sh"
-                )
-                notify(
-                    f"⚠️ <b>GHOST FILL SKIPPED (stale)</b>\n"
-                    f"\n"
-                    f"<b>{opp.label}</b>\n"
-                    f"\n"
-                    f"Fill detected {_ba_ghost_age:.0f}s after order (limit={_ba_ghost_fill_max_age_sec:.0f}s)\n"
-                    f"Poly price likely moved — unwinding Predict instead\n"
-                    f"Predict sell @ {_gf_sell_p:.2f}: {_gf_status}\n"
-                )
-                row["ok"] = False
-                row["summary"]["status"] = "skipped"
-                row["summary"]["reason_code"] = "ghost_fill_too_old"
-                _append_jsonl(trades_file, row)
-                return {"status": "skipped", "reason": "ghost_fill_too_old"}
+                    _gf_tick = float(os.environ.get("PREDICT_TICK_SIZE", "0.01") or "0.01")
+                    _gf_sell_p = max(_gf_tick, round(float(_ba_quote_meta.get("final_bid_price") or pred_leg.ask) - _gf_tick, 6))
+                    _gf_sold = 0.0
+                    try:
+                        _gf_r = _place_predict_limit_sell(
+                            pred_leg,
+                            sell_qty=_ba_net_sell_qty,
+                            sell_price=_gf_sell_p,
+                            fill_timeout_sec=20.0,
+                            replace_interval_sec=1.0,
+                            fast_exit=True,
+                            trace_id=trace_id,
+                        )
+                        _gf_sold = _gf_r.get("filled_qty", 0.0)
+                    except Exception as _gf_exc:
+                        print(f"[TRADER]{_t}[GHOST_FILL_SKIP] unwind_err={_gf_exc}")
+                    _gf_status = (
+                        f"✅ sold {_gf_sold:.2f} sh"
+                        if _gf_sold >= _ba_net_sell_qty * 0.99
+                        else f"⚠️ partial {_gf_sold:.2f}/{_ba_net_sell_qty:.2f} sh"
+                    )
+                    notify(
+                        f"⚠️ <b>GHOST FILL SKIPPED (stale)</b>\n"
+                        f"\n"
+                        f"<b>{opp.label}</b>\n"
+                        f"\n"
+                        f"Fill detected {_ba_ghost_age:.0f}s after order (limit={_ba_ghost_fill_max_age_sec:.0f}s)\n"
+                        f"Poly price likely moved — unwinding Predict instead\n"
+                        f"Predict sell @ {_gf_sell_p:.2f}: {_gf_status}\n"
+                    )
+                    row["ok"] = False
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "ghost_fill_too_old"
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "ghost_fill_too_old"}
+                # else: _gf_can_hedge=True → fall through to normal hedge path
 
             # Step 2: Live net-edge recheck before hedging (poly quote may be stale)
             # Fetch live poly orderbook, calculate VWAP at hedge qty, recompute full net-edge
