@@ -5230,14 +5230,31 @@ def opportunity(opp: Opportunity) -> dict:
             # The wallet receives exactly amountFilled shares, so sell the full amount.
             _ba_net_sell_qty = _ba_hedge_qty
 
-            # Ghost-fill age guard: if the fill was detected very late (order was cancelled
-            # long ago, BSC confirmed slowly), the Poly price has likely moved significantly.
+            # Ghost-fill age guard: if the fill was detected very late AND the API reported
+            # CANCELLED (not FILLED), the Poly price has likely moved significantly.
             # In that case skip the hedge and unwind on Predict instead of locking in a loss.
+            #
+            # IMPORTANT: if API correctly reported FILLED (slow legitimate fill, not a ghost),
+            # we must NOT trigger this guard — the fill is real and we should hedge regardless
+            # of timing. Only trigger when fill came from BSC-direct and API shows CANCELLED.
             _ba_ghost_fill_max_age_sec = float(os.environ.get("BA_GHOST_FILL_MAX_AGE_SEC", "0") or "0")
             _ba_first_fill_ts_v = _ba_quote_meta.get("first_fill_ts")
             _ba_quote_post_ts_v = _ba_quote_meta.get("quote_post_ts") or _pred_timing_ba.get("submit_ts")
+            # Detect whether fill was confirmed by API (legitimate slow fill) or only by BSC
+            # (true ghost fill: API said CANCELLED but BSC showed on-chain settlement).
+            _ba_fill_api_confirmed = any(
+                p.get("source", "api") != "bsc_direct"
+                for p in _ba_partial_fills
+            ) if _ba_partial_fills else True  # default: assume API-confirmed if no partial_fills detail
+            # Also check get response: if API amountFilled > 0, the fill is API-confirmed.
+            _ba_get_resp = _ba_pred_resp.get("get") or {}
+            _ba_get_data = _ba_get_resp.get("data") or {} if isinstance(_ba_get_resp, dict) else {}
+            _ba_api_amount_filled = int(_ba_get_data.get("amountFilled") or 0) if isinstance(_ba_get_data, dict) else 0
+            if _ba_api_amount_filled > 0:
+                _ba_fill_api_confirmed = True
             if (
                 _ba_ghost_fill_max_age_sec > 0
+                and not _ba_fill_api_confirmed  # only ghost guard for BSC-only fills
                 and _ba_first_fill_ts_v is not None
                 and _ba_quote_post_ts_v is not None
                 and (_ba_first_fill_ts_v - _ba_quote_post_ts_v) > _ba_ghost_fill_max_age_sec
