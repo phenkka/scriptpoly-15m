@@ -6298,9 +6298,7 @@ def opportunity(opp: Opportunity) -> dict:
                         os.environ.get("PREDICT_EMERGENCY_POLY_HEDGE", "1") not in ("0", "false", "no")
                         and poly_leg.token_id is not None
                     )
-                    # WS state: if orderTransactionSubmitted seen for the buy order but no
-                    # tx_success yet → BSC not confirmed → positions definitely unindexed.
-                    # Force emergency hedge immediately, skip the double-check.
+                    # WS state: track whether BSC has confirmed the fill.
                     _ne_pred_order_id = str(_ba_pred_resp.get("orderId") or "").strip() or None
                     _ne_pred_order_hash = str(pred_hash_ba or "").strip() or None
                     _ne_ws_tx_submitted = _predict_ws_had_tx_submitted(
@@ -6310,28 +6308,58 @@ def opportunity(opp: Opportunity) -> dict:
                         _ne_pred_order_id, _ne_pred_order_hash
                     )
                     if _ne_use_temp_hedge:
-                        # Quick balance check (no blocking wait) — 0 means positions not indexed.
-                        # Double-check with a second request to avoid false-positives from
-                        # transient/stale Predict API responses (inconsistent indexer state).
+                        # ── Strategy: wait for indexer first, hedge only as last resort ──────
+                        # Temp Poly hedge (buy + sell) costs 2× slippage + rounding risk.
+                        # BSC block = ~3s; txSuccess typically arrives in 9-15s.
+                        # After txSuccess the Predict indexer is usually updated within 3-5s.
+                        # Waiting ≤30s is almost always cheaper than placing & closing a temp hedge.
+                        # Only fall back to temp hedge if BSC takes unusually long (tx stuck).
+                        #
+                        # Wait for txSuccess:
+                        _ne_wait_tx_sec = float(
+                            os.environ.get("BA_INDEXER_WAIT_TX_SEC", "22") or "22"
+                        )
                         if _ne_ws_tx_submitted and not _ne_ws_tx_success:
-                            # WS confirms fill in-flight but BSC not yet done → force unindexed
-                            _ne_quick_bal = 0.0
                             print(
-                                f"[TRADER][EMERGENCY_HEDGE] ws_tx_submitted_unindexed "
-                                f"label={opp.label} — forcing temp hedge immediately"
+                                f"[TRADER][INDEXER_WAIT] label={opp.label} "
+                                f"tx_submitted=True, waiting up to {_ne_wait_tx_sec:.0f}s for txSuccess"
                             )
-                        else:
+                            _ws_tx_deadline = time.time() + _ne_wait_tx_sec
+                            while time.time() < _ws_tx_deadline:
+                                if _predict_ws_had_tx_success(_ne_pred_order_id, _ne_pred_order_hash):
+                                    _ne_ws_tx_success = True
+                                    break
+                                time.sleep(0.5)
+                            print(
+                                f"[TRADER][INDEXER_WAIT] label={opp.label} "
+                                f"tx_success={_ne_ws_tx_success} after {_ne_wait_tx_sec - (_ws_tx_deadline - time.time()):.1f}s"
+                            )
+
+                        # After txSuccess (or if already confirmed), poll Predict balance:
+                        _ne_indexer_poll_sec = float(
+                            os.environ.get("BA_INDEXER_POLL_SEC", "4") or "4"
+                        )
+                        _ne_indexer_polls = int(
+                            os.environ.get("BA_INDEXER_POLLS", "4") or "4"
+                        )
+                        _ne_quick_bal = 0.0
+                        for _idx_poll in range(_ne_indexer_polls):
+                            if _idx_poll > 0:
+                                time.sleep(_ne_indexer_poll_sec)
                             _ne_quick_bal = _predict_max_shares_for_market(None, int(pred_leg.market_id))
                             if _ne_quick_bal >= _ba_net_sell_qty * 0.5:
-                                # Looks indexed — verify with a fresh call (2s pause) to avoid stale read
-                                time.sleep(2.0)
-                                _ne_quick_bal2 = _predict_max_shares_for_market(None, int(pred_leg.market_id))
-                                _ne_quick_bal = min(_ne_quick_bal, _ne_quick_bal2)
+                                break
+                            print(
+                                f"[TRADER][INDEXER_WAIT] label={opp.label} "
+                                f"poll={_idx_poll+1}/{_ne_indexer_polls} bal={_ne_quick_bal:.4f} "
+                                f"target={_ba_net_sell_qty:.4f} — not indexed yet"
+                            )
+
                         if _ne_quick_bal < _ba_net_sell_qty * 0.5:
                             print(
                                 f"[TRADER][EMERGENCY_HEDGE] positions_not_indexed label={opp.label} "
                                 f"quick_bal={_ne_quick_bal:.4f} target={_ba_net_sell_qty:.4f} "
-                                f"— placing temp Poly hedge"
+                                f"— placing temp Poly hedge (indexer did not respond in time)"
                             )
                             _ne_temp_hedge_result = _place_poly_temp_hedge(
                                 str(poly_leg.token_id), _ba_net_sell_qty
