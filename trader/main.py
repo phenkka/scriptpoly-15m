@@ -4939,6 +4939,53 @@ def _place_predict_limit_sell(
                     break
             except Exception:
                 pass
+        # ── WS in-flight guard (fast_exit path) ─────────────────────────────
+        # fast_exit skips BSC RPC checks to save ~10s, relying on balance guard.
+        # But balance guard fails under indexer lag (positions not yet indexed).
+        # WS events are near-real-time: if orderTransactionSubmitted fired for the
+        # current order but txSuccess hasn't arrived, BSC is still processing it.
+        # Cancelling now + placing new order → BOTH the old fill and the new order
+        # execute → double-sell (3 fills observed in production).
+        # Fix: wait up to 8s for txSuccess before cancelling. After txSuccess, check
+        # balance once more — if the order filled, stop the ladder immediately.
+        if fast_exit and _active_order_id and _active_order_hash:
+            if (_predict_ws_had_tx_submitted(_active_order_id, _active_order_hash)
+                    and not _predict_ws_had_tx_success(_active_order_id, _active_order_hash)):
+                _ws_inline_deadline = min(time.time() + 8.0, t_deadline - 0.5)
+                print(
+                    f"[TRADER]{_trace} predict_limit_sell replace_ws_wait "
+                    f"hash={_active_order_hash} — BSC tx pending, waiting"
+                )
+                while time.time() < _ws_inline_deadline:
+                    if _predict_ws_had_tx_success(_active_order_id, _active_order_hash):
+                        break
+                    time.sleep(0.3)
+            # After wait: if txSuccess arrived, the order's BSC fate is decided.
+            # Re-check balance immediately (may now be updated) — stop if filled.
+            if (_predict_ws_had_tx_success(_active_order_id, _active_order_hash)
+                    and _pre_sell_balance > 0 and leg.market_id is not None):
+                try:
+                    _cur_bal_ws = _predict_max_shares_for_market(
+                        session, int(leg.market_id),
+                        token_id=str(token_id) if token_id else None,
+                    )
+                    _filled_so_far_ws = filled_wei / 10**18 if filled_wei > 0 else 0.0
+                    _sold_ws = _pre_sell_balance - _cur_bal_ws - _filled_so_far_ws
+                    if _sold_ws >= sell_qty * 0.50:
+                        filled = True
+                        if filled_wei == 0:
+                            filled_wei = int(sell_qty * 10**18)
+                        print(
+                            f"[TRADER]{_trace} sell_ws_txsuccess_fill_guard "
+                            f"pre={_pre_sell_balance:.4f} cur={_cur_bal_ws:.4f} "
+                            f"sold_ws={_sold_ws:.4f} sell_qty={sell_qty:.4f} — stopping ladder"
+                        )
+                        break
+                except Exception:
+                    pass
+        if filled:
+            break
+        # ─────────────────────────────────────────────────────────────────────
         if _active_order_id:
             try:
                 _predict_remove_orders(session, [_active_order_id])
@@ -6454,13 +6501,48 @@ def opportunity(opp: Opportunity) -> dict:
                                 # _close_poly_temp_hedge already retries internally (GTC×2 + FAK).
                                 # If it still fails, retry the whole closer up to 2 more times
                                 # before declaring stuck.
+                                # IMPORTANT: before each outer retry, verify Poly balance to avoid
+                                # overselling. _close_poly_temp_hedge may fail to detect the fill
+                                # (API lag) yet still have sold shares. Selling again would create
+                                # extra short exposure (3× oversell observed in production).
                                 _CLOSE_OUTER_RETRIES = 3
+                                _close_total_sold = 0.0
+                                _close_pre_bal: float | None = None
+                                try:
+                                    _pp0 = _fetch_poly_position(str(poly_leg.token_id), timeout=4.0)
+                                    _close_pre_bal = float(_pp0[0]) if _pp0 is not None else None
+                                except Exception:
+                                    pass
                                 for _close_outer in range(_CLOSE_OUTER_RETRIES):
                                     if _close_outer > 0:
                                         time.sleep(3.0)
+                                        # Balance guard: if Poly balance already dropped by ≥ target
+                                        # the previous attempt DID fill despite reporting filled=0.
+                                        if _close_pre_bal is not None:
+                                            try:
+                                                _pp2 = _fetch_poly_position(
+                                                    str(poly_leg.token_id), timeout=4.0
+                                                )
+                                                _close_cur_bal = float(_pp2[0]) if _pp2 is not None else 0.0
+                                                _close_sold_so_far = _close_pre_bal - _close_cur_bal
+                                                if _close_sold_so_far >= _ne_close_qty * 0.80:
+                                                    print(
+                                                        f"[TRADER][EMERGENCY_HEDGE] close_balance_guard "
+                                                        f"label={opp.label} "
+                                                        f"pre_bal={_close_pre_bal:.4f} "
+                                                        f"cur_bal={_close_cur_bal:.4f} "
+                                                        f"sold={_close_sold_so_far:.4f} "
+                                                        f"— already sold, skipping retry"
+                                                    )
+                                                    _ne_close_result["filled_qty"] = _close_sold_so_far
+                                                    _close_total_sold = _close_sold_so_far
+                                                    break
+                                            except Exception:
+                                                pass
                                     _ne_close_result = _close_poly_temp_hedge(
                                         str(poly_leg.token_id), _ne_close_qty
                                     )
+                                    _close_total_sold += _ne_close_result.get("filled_qty", 0.0)
                                     if _ne_close_result.get("filled_qty", 0) > 0:
                                         break
                                     print(
@@ -6468,6 +6550,11 @@ def opportunity(opp: Opportunity) -> dict:
                                         f"attempt={_close_outer+1}/{_CLOSE_OUTER_RETRIES} "
                                         f"label={opp.label} status={_ne_close_result.get('status')}"
                                     )
+                                # Use max of reported filled and total sold for final status
+                                if _close_total_sold > 0 and _ne_close_result.get("filled_qty", 0) == 0:
+                                    _ne_close_result = dict(_ne_close_result)
+                                    _ne_close_result["filled_qty"] = _close_total_sold
+
 
                                 _ne_temp_hedge_state = (
                                     "released" if _ne_close_result.get("filled_qty", 0) > 0
