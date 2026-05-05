@@ -3832,6 +3832,7 @@ def _place_predict_limit_buy(
     all_creates: list[dict[str, Any]] = [out]
     need_final_get_check: bool = False
     _first_cancel_sent_ts: float | None = None   # when first cancel was sent (for WS timing)
+    _cleanup_state: str = _CANCEL_STATE_UNCERTAIN  # set by cleanup cancel block at end of poll loop
 
     def _limit_buy_mktk() -> tuple[int | None, int | None]:
         """On-chain taker-amount-from-BSC for BUY needs maker/taker in wei; prefer latest GET, else last create body."""
@@ -4416,7 +4417,6 @@ def _place_predict_limit_buy(
     # TX_SUBMITTED_RISK → force need_final_get_check=True (ghost_fill_watch will run).
     # FILLED → set filled flag; fill was captured during verify loop.
     remove_resp: dict[str, Any] | None = None
-    _cleanup_state: str = _CANCEL_STATE_UNCERTAIN
     if order_id and not _api_confirmed_filled:
         if _first_cancel_sent_ts is None:
             _first_cancel_sent_ts = time.time()
