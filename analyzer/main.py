@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from threading import Lock
@@ -181,6 +181,23 @@ def _check_arbitrage() -> None:
         _poly_meta_rate = poly.meta.poly_fee_rate
     poly_fee_rate = float(_poly_meta_rate) if _poly_meta_rate is not None and _poly_meta_rate > 0 else float(CFG.poly_fee_rate)
     ba_safety_buffer_bps = float(CFG.ba_safety_buffer_bps)
+    # Dynamic buffer: boost near market expiry to reduce risk of late fills
+    _ba_expiry_boost_bps = float(CFG.ba_expiry_boost_bps)
+    _ba_expiry_boost_sec = float(CFG.ba_expiry_boost_sec)
+    _pred_end_date = pred.meta.end_date if pred.meta else None
+    if _pred_end_date and _ba_expiry_boost_bps > 0:
+        try:
+            _end_dt = datetime.fromisoformat(_pred_end_date.rstrip("Z")).replace(tzinfo=timezone.utc)
+            _secs_to_end = (_end_dt - datetime.now(timezone.utc)).total_seconds()
+            if 0 < _secs_to_end <= _ba_expiry_boost_sec:
+                ba_safety_buffer_bps += _ba_expiry_boost_bps
+                print(
+                    f"[ANALYZER] expiry_boost +{_ba_expiry_boost_bps:.0f}bps "
+                    f"secs_to_end={_secs_to_end:.0f}s "
+                    f"safety_buffer_bps={ba_safety_buffer_bps:.0f}"
+                )
+        except Exception:
+            pass
     ba_min_net_edge_bps = float(CFG.ba_min_net_edge_bps)
     predict_max_bid_price = float(CFG.predict_max_bid_price)
     poly_max_hedge_price = float(CFG.poly_max_hedge_price)

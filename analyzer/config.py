@@ -97,6 +97,16 @@ class AnalyzerConfig:
         return sget_float("BA_SAFETY_BUFFER_BPS", 300.0)
 
     @property
+    def ba_expiry_boost_bps(self) -> float:
+        """Extra safety buffer bps added when time-to-expiry <= ba_expiry_boost_sec."""
+        return sget_float("BA_EXPIRY_BOOST_BPS", 100.0)
+
+    @property
+    def ba_expiry_boost_sec(self) -> float:
+        """Seconds threshold before expiry that triggers the safety buffer boost."""
+        return sget_float("BA_EXPIRY_BOOST_SEC", 120.0)
+
+    @property
     def ba_min_net_edge_bps(self) -> float:
         return sget_float("BA_MIN_NET_EDGE_BPS", 0.0)
 

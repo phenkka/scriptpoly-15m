@@ -54,6 +54,8 @@ SETTINGS_FILE = Path("/data/settings.json")
 PAGE_GROUPS: list[tuple[str, list[tuple[str, str, str, Any]]]] = [
     ("⚔️ Strategy", [
         ("BA_SAFETY_BUFFER_BPS",               "Safety buffer bps",    "int",   300),
+        ("BA_EXPIRY_BOOST_BPS",                "Expiry boost bps",     "int",   100),
+        ("BA_EXPIRY_BOOST_SEC",                "Expiry boost sec",     "int",   120),
         ("BA_MIN_NET_EDGE_BPS",                "Min net edge bps",     "int",   0),
         ("PREDICT_PASSIVE_BID_MAX_TICKS_MISS", "Max ticks miss",       "int",   0),
         ("PREDICT_MAX_BID_PRICE",              "Max bid price",        "float", 0.99),
