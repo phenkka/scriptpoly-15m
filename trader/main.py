@@ -2279,7 +2279,8 @@ def _predict_cancel_and_verify(
             # REST verify
             try:
                 cv = _predict_get_order_by_hash(session, order_hash)
-                cv_status = _get_status(cv)
+                _cv_data = cv.get("data") if isinstance(cv, dict) else None
+                cv_status = str((_cv_data.get("status") if isinstance(_cv_data, dict) else None) or "").upper()
                 cv_filled = _get_filled_wei(cv)
                 if cv_filled > filled_wei:
                     filled_wei = cv_filled
