@@ -2177,6 +2177,191 @@ def _predict_cancel_all_open_orders(session: requests.Session) -> int:
         return 0
 
 
+# ── Cancel state constants ────────────────────────────────────────────────────
+# Cancel is NOT an action — it is a transition into uncertainty.
+# These states drive downstream routing: ghost_fill_watch, reconcile, hedge, etc.
+_CANCEL_STATE_FINAL     = "PRACTICALLY_FINAL_CANCELLED"  # terminal + no fill + no WS risk
+_CANCEL_STATE_TX_RISK   = "TX_SUBMITTED_RISK"            # WS saw tx_submitted near cancel
+_CANCEL_STATE_FILLED    = "FILLED"                       # fill confirmed during verify
+_CANCEL_STATE_UNCERTAIN = "UNCERTAIN"                    # retries exhausted, state unknown
+
+
+def _predict_cancel_and_verify(
+    session: requests.Session,
+    order_id: str | None,
+    order_hash: str | None,
+    quote_post_ts: float,
+    *,
+    reason: str,
+    max_attempts: int = 5,
+    verify_interval_sec: float = 1.0,
+    strict: bool = False,
+    _trace: str = "",
+) -> dict[str, Any]:
+    """Unified cancel helper: send cancel + verify until terminal state.
+
+    State machine:
+      PRACTICALLY_FINAL_CANCELLED  — REST confirmed terminal, filled_wei==0, no WS risk
+      TX_SUBMITTED_RISK            — WS saw orderTransactionSubmitted near cancel time
+      FILLED                       — fill detected during verification loop
+      UNCERTAIN                    — retries exhausted without reaching terminal state
+
+    offbook_cancelled: API returned CANCELLED/EXPIRED/REJECTED (order off orderbook)
+    final_cancelled:   offbook_cancelled + filled_wei==0 + no WS risk
+    filled_wei:        cumulative fill in wei detected during verification
+
+    strict=True (cleanup after poll deadline): halved verify_interval, same attempt count.
+    Front-scan: attempt 0 polls every 250 ms; subsequent attempts use verify_interval_sec.
+    WS tx_submitted is checked before each cancel send AND on every scan cycle — if seen,
+    immediately returns TX_SUBMITTED_RISK without further cancel attempts.
+    """
+    _vi = verify_interval_sec * 0.5 if strict else verify_interval_sec
+    offbook_cancelled = False
+    filled_wei = 0
+
+    def _ws_risk() -> bool:
+        return _predict_ws_had_tx_submitted(order_id, order_hash, not_before_ts=quote_post_ts)
+
+    for attempt in range(max_attempts):
+        # ── Pre-send WS check: tx in-flight → any further cancel attempt is meaningless ──
+        if _ws_risk():
+            print(
+                f"[CANCEL]{_trace} reason={reason} attempt={attempt + 1} "
+                f"ws_tx_submitted_pre_send → TX_SUBMITTED_RISK"
+            )
+            return {
+                "state": _CANCEL_STATE_TX_RISK,
+                "offbook_cancelled": offbook_cancelled,
+                "final_cancelled": False,
+                "filled_wei": filled_wei,
+                "tx_submitted": True,
+                "attempts": attempt + 1,
+                "reason": reason,
+            }
+
+        # ── Send cancel ──
+        try:
+            if order_id:
+                _predict_remove_orders(session, [order_id])
+            print(f"[CANCEL]{_trace} reason={reason} sent attempt={attempt + 1}/{max_attempts}")
+        except Exception as _ce:
+            print(f"[CANCEL]{_trace} reason={reason} send_err attempt={attempt + 1} err={_ce}")
+
+        # ── Verification scan ──────────────────────────────────────────────────
+        # attempt 0: aggressive front-scan at 250 ms intervals (catches fast terminal states)
+        # attempt 1+: one GET at _vi seconds (normal verify)
+        _poll_ms = 0.25 if attempt == 0 else _vi
+        _scan_end = time.time() + _vi
+        _terminal_in_scan = False
+
+        while time.time() < _scan_end:
+            # WS check every cycle — cheap, high-signal
+            if _ws_risk():
+                print(
+                    f"[CANCEL]{_trace} reason={reason} ws_tx_submitted_in_scan "
+                    f"attempt={attempt + 1} → TX_SUBMITTED_RISK"
+                )
+                return {
+                    "state": _CANCEL_STATE_TX_RISK,
+                    "offbook_cancelled": offbook_cancelled,
+                    "final_cancelled": False,
+                    "filled_wei": filled_wei,
+                    "tx_submitted": True,
+                    "attempts": attempt + 1,
+                    "reason": reason,
+                }
+
+            _remaining = _scan_end - time.time()
+            if _remaining <= 0.01:
+                break
+            time.sleep(min(_poll_ms, _remaining))
+
+            # REST verify
+            try:
+                cv = _predict_get_order_by_hash(session, order_hash)
+                cv_status = _get_status(cv)
+                cv_filled = _get_filled_wei(cv)
+                if cv_filled > filled_wei:
+                    filled_wei = cv_filled
+                print(
+                    f"[CANCEL]{_trace} reason={reason} verify "
+                    f"attempt={attempt + 1} status={cv_status} filled_wei={cv_filled}"
+                )
+                if cv_status in {"CANCELLED", "EXPIRED", "REJECTED"}:
+                    offbook_cancelled = True
+                    if cv_filled > 0:
+                        return {
+                            "state": _CANCEL_STATE_FILLED,
+                            "offbook_cancelled": True,
+                            "final_cancelled": False,
+                            "filled_wei": cv_filled,
+                            "tx_submitted": _ws_risk(),
+                            "attempts": attempt + 1,
+                            "reason": reason,
+                        }
+                    # One last WS check before declaring PRACTICALLY_FINAL
+                    if _ws_risk():
+                        return {
+                            "state": _CANCEL_STATE_TX_RISK,
+                            "offbook_cancelled": True,
+                            "final_cancelled": False,
+                            "filled_wei": 0,
+                            "tx_submitted": True,
+                            "attempts": attempt + 1,
+                            "reason": reason,
+                        }
+                    _terminal_in_scan = True
+                    break
+                elif cv_status == "FILLED":
+                    return {
+                        "state": _CANCEL_STATE_FILLED,
+                        "offbook_cancelled": False,
+                        "final_cancelled": False,
+                        "filled_wei": cv_filled,
+                        "tx_submitted": _ws_risk(),
+                        "attempts": attempt + 1,
+                        "reason": reason,
+                    }
+                # Still OPEN — continue scan (will send another cancel on next attempt)
+            except Exception as _ve:
+                print(f"[CANCEL]{_trace} reason={reason} verify_err attempt={attempt + 1} err={_ve}")
+
+        if _terminal_in_scan:
+            break
+
+    # ── Post-attempts final WS check ──────────────────────────────────────────
+    _ws_final = _ws_risk()
+    if _ws_final:
+        return {
+            "state": _CANCEL_STATE_TX_RISK,
+            "offbook_cancelled": offbook_cancelled,
+            "final_cancelled": False,
+            "filled_wei": filled_wei,
+            "tx_submitted": True,
+            "attempts": max_attempts,
+            "reason": reason,
+        }
+    if offbook_cancelled and filled_wei == 0:
+        return {
+            "state": _CANCEL_STATE_FINAL,
+            "offbook_cancelled": True,
+            "final_cancelled": True,
+            "filled_wei": 0,
+            "tx_submitted": False,
+            "attempts": max_attempts,
+            "reason": reason,
+        }
+    return {
+        "state": _CANCEL_STATE_UNCERTAIN,
+        "offbook_cancelled": offbook_cancelled,
+        "final_cancelled": False,
+        "filled_wei": filled_wei,
+        "tx_submitted": False,
+        "attempts": max_attempts,
+        "reason": reason,
+    }
+
+
 def _predict_reconcile_watcher(
     session: requests.Session,
     order_id: str | None,
@@ -3658,6 +3843,15 @@ def _place_predict_limit_buy(
     t_deadline = time.time() + max(0.0, fill_timeout_sec)
     filled = False
 
+    # Armed hedge: pre-computed vwap/worst refreshed each poll iteration from cached book.
+    # After fill, caller uses this to skip redundant live-book re-fetch on the hedge path.
+    _armed_vwap: float | None = None
+    _armed_worst: float | None = None
+    _armed_ts: float = 0.0
+    # WS tx_submitted: set True as soon as WS sees orderTransactionSubmitted — lets caller
+    # apply fast-hedge mode (tighter limit, shorter GTC) even before API confirms.
+    _ws_early_tx_sub: bool = False
+
     _book_check_interval = float(os.environ.get("PREDICT_BOOK_CHECK_INTERVAL_SEC", "0.1") or "0.1")
     _last_book_check_ts = 0.0
 
@@ -3680,48 +3874,40 @@ def _place_predict_limit_buy(
                                 f"our_bid={current_bid_price:.4f} best_bid={float(_ab_bb):.4f} "
                                 f"queue=${_ab_queue:.1f} threshold=${queue_threshold_usd:.0f}"
                             )
-                            # Retry cancel with verify — prevent ghost fills from dropped HTTP requests
                             if _first_cancel_sent_ts is None:
                                 _first_cancel_sent_ts = time.time()
-                            _OBQ_CANCEL_RETRIES = 5
-                            _OBQ_VERIFY_SEC = 1.0
-                            for _obq_ci in range(_OBQ_CANCEL_RETRIES):
-                                try:
-                                    if order_id:
-                                        _predict_remove_orders(session, [order_id])
-                                except Exception as _bce:
-                                    print(f"[PREDICT_LIMIT]{_trace} cancel_outbid_queue_err attempt={_obq_ci+1} err={_bce}")
-                                time.sleep(_OBQ_VERIFY_SEC)
-                                try:
-                                    _obq_cv = _predict_get_order_by_hash(session, order_hash)
-                                    _obq_status = _get_status(_obq_cv)
-                                    _obq_filled = _get_filled_wei(_obq_cv)
-                                    print(
-                                        f"[PREDICT_LIMIT]{_trace} cancel_obq_verify attempt={_obq_ci+1}/{_OBQ_CANCEL_RETRIES} "
-                                        f"status={_obq_status} filled_wei={_obq_filled}"
-                                    )
-                                    if _obq_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
-                                        if _obq_filled > prev_filled_wei:
-                                            delta_wei = _obq_filled - prev_filled_wei
-                                            now_ts = time.time()
-                                            if first_fill_ts is None:
-                                                first_fill_ts = now_ts
-                                            partial_fills.append({
-                                                "ts": now_ts,
-                                                "delta_wei": delta_wei,
-                                                "cumulative_wei": _obq_filled,
-                                                "delta_shares": delta_wei / 10**18,
-                                                "cumulative_shares": _obq_filled / 10**18,
-                                            })
-                                            prev_filled_wei = _obq_filled
-                                            print(
-                                                f"[PREDICT_LIMIT]{_trace} cancel_obq_fill_detected "
-                                                f"hash={order_hash} filled={_obq_filled / 10**18:.4f}"
-                                            )
-                                        break
-                                except Exception as _obq_cve:
-                                    print(f"[PREDICT_LIMIT]{_trace} cancel_obq_verify_err attempt={_obq_ci+1} err={_obq_cve}")
-                            need_final_get_check = True
+                            _cresult = _predict_cancel_and_verify(
+                                session, order_id, order_hash, quote_post_ts,
+                                reason=cancel_reason, max_attempts=5, verify_interval_sec=1.0,
+                                _trace=_trace,
+                            )
+                            if _cresult["filled_wei"] > prev_filled_wei:
+                                _c_delta = _cresult["filled_wei"] - prev_filled_wei
+                                _c_now = time.time()
+                                if first_fill_ts is None:
+                                    first_fill_ts = _c_now
+                                partial_fills.append({
+                                    "ts": _c_now,
+                                    "delta_wei": _c_delta,
+                                    "cumulative_wei": _cresult["filled_wei"],
+                                    "delta_shares": _c_delta / 10**18,
+                                    "cumulative_shares": _cresult["filled_wei"] / 10**18,
+                                })
+                                prev_filled_wei = _cresult["filled_wei"]
+                                print(
+                                    f"[PREDICT_LIMIT]{_trace} cancel_fill_detected "
+                                    f"reason={cancel_reason} hash={order_hash} "
+                                    f"filled={prev_filled_wei / 10**18:.4f} state={_cresult['state']}"
+                                )
+                            if _cresult["state"] == _CANCEL_STATE_FILLED:
+                                filled = True
+                                need_final_get_check = False
+                            elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
+                                need_final_get_check = True
+                            elif _cresult["state"] == _CANCEL_STATE_FINAL:
+                                need_final_get_check = False
+                            else:  # UNCERTAIN
+                                need_final_get_check = True
                             break
 
             # ── Poll fill status ──
@@ -3777,50 +3963,40 @@ def _place_predict_limit_buy(
                         f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age hash={order_hash} "
                         f"age={_quote_age:.1f}s limit={_max_quote_age_sec:.0f}s"
                     )
-                    # Retry cancel with verify — same pattern as poly_hedge_no_edge path.
-                    # A single HTTP cancel can be silently dropped by the API → order stays open
-                    # and gets filled later as a "ghost fill".
                     if _first_cancel_sent_ts is None:
                         _first_cancel_sent_ts = time.time()
-                    _MQA_CANCEL_RETRIES = 5
-                    _MQA_VERIFY_SEC = 1.0
-                    for _mqa_ci in range(_MQA_CANCEL_RETRIES):
-                        try:
-                            if order_id:
-                                _predict_remove_orders(session, [order_id])
-                        except Exception as _mqa_e:
-                            print(f"[PREDICT_LIMIT]{_trace} cancel_max_quote_age_err attempt={_mqa_ci+1} err={_mqa_e}")
-                        time.sleep(_MQA_VERIFY_SEC)
-                        try:
-                            _mqa_cv = _predict_get_order_by_hash(session, order_hash)
-                            _mqa_status = _get_status(_mqa_cv)
-                            _mqa_filled = _get_filled_wei(_mqa_cv)
-                            print(
-                                f"[PREDICT_LIMIT]{_trace} cancel_mqa_verify attempt={_mqa_ci+1}/{_MQA_CANCEL_RETRIES} "
-                                f"status={_mqa_status} filled_wei={_mqa_filled}"
-                            )
-                            if _mqa_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
-                                if _mqa_filled > prev_filled_wei:
-                                    delta_wei = _mqa_filled - prev_filled_wei
-                                    now_ts = time.time()
-                                    if first_fill_ts is None:
-                                        first_fill_ts = now_ts
-                                    partial_fills.append({
-                                        "ts": now_ts,
-                                        "delta_wei": delta_wei,
-                                        "cumulative_wei": _mqa_filled,
-                                        "delta_shares": delta_wei / 10**18,
-                                        "cumulative_shares": _mqa_filled / 10**18,
-                                    })
-                                    prev_filled_wei = _mqa_filled
-                                    print(
-                                        f"[PREDICT_LIMIT]{_trace} cancel_mqa_fill_detected "
-                                        f"hash={order_hash} filled={_mqa_filled / 10**18:.4f}"
-                                    )
-                                break  # terminal — stop retrying
-                        except Exception as _mqa_cve:
-                            print(f"[PREDICT_LIMIT]{_trace} cancel_mqa_verify_err attempt={_mqa_ci+1} err={_mqa_cve}")
-                    need_final_get_check = True
+                    _cresult = _predict_cancel_and_verify(
+                        session, order_id, order_hash, quote_post_ts,
+                        reason=cancel_reason, max_attempts=5, verify_interval_sec=1.0,
+                        _trace=_trace,
+                    )
+                    if _cresult["filled_wei"] > prev_filled_wei:
+                        _c_delta = _cresult["filled_wei"] - prev_filled_wei
+                        _c_now = time.time()
+                        if first_fill_ts is None:
+                            first_fill_ts = _c_now
+                        partial_fills.append({
+                            "ts": _c_now,
+                            "delta_wei": _c_delta,
+                            "cumulative_wei": _cresult["filled_wei"],
+                            "delta_shares": _c_delta / 10**18,
+                            "cumulative_shares": _cresult["filled_wei"] / 10**18,
+                        })
+                        prev_filled_wei = _cresult["filled_wei"]
+                        print(
+                            f"[PREDICT_LIMIT]{_trace} cancel_fill_detected "
+                            f"reason={cancel_reason} hash={order_hash} "
+                            f"filled={prev_filled_wei / 10**18:.4f} state={_cresult['state']}"
+                        )
+                    if _cresult["state"] == _CANCEL_STATE_FILLED:
+                        filled = True
+                        need_final_get_check = False
+                    elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
+                        need_final_get_check = True
+                    elif _cresult["state"] == _CANCEL_STATE_FINAL:
+                        need_final_get_check = False
+                    else:  # UNCERTAIN
+                        need_final_get_check = True
                     break
 
             # ── Live Poly hedge-viability check: cancel if hedge became unprofitable ──
@@ -3840,56 +4016,50 @@ def _place_predict_limit_buy(
                                 f"poly_ask={_pa_live:.4f} pred_bid={current_bid_price:.4f} "
                                 f"edge={_edge_live:.4f}"
                             )
-                            # Cancel + verify loop: retry cancel until status is no longer OPEN
-                            # BSC можно подтвердить транзакцию до того как cancel API успел —
-                            # поэтому проверяем что ордер реально отменился, иначе отменяем снова.
                             if _first_cancel_sent_ts is None:
                                 _first_cancel_sent_ts = time.time()
-                            _CANCEL_RETRIES = 5
-                            _CANCEL_VERIFY_SEC = 2.0
-                            for _ci in range(_CANCEL_RETRIES):
-                                try:
-                                    if order_id:
-                                        _predict_remove_orders(session, [order_id])
-                                except Exception as _ce:
-                                    print(f"[PREDICT_LIMIT]{_trace} cancel_attempt={_ci+1} err={_ce}")
-                                time.sleep(_CANCEL_VERIFY_SEC)
-                                try:
-                                    _cv_get = _predict_get_order_by_hash(session, order_hash)
-                                    _cv_status = _get_status(_cv_get)
-                                    _cv_filled = _get_filled_wei(_cv_get)
-                                    print(
-                                        f"[PREDICT_LIMIT]{_trace} cancel_verify attempt={_ci+1}/{_CANCEL_RETRIES} "
-                                        f"status={_cv_status} filled_wei={_cv_filled}"
-                                    )
-                                    if _cv_status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED"}:
-                                        # Reached terminal state — update prev_filled_wei if filled
-                                        if _cv_filled > prev_filled_wei:
-                                            delta_wei = _cv_filled - prev_filled_wei
-                                            now_ts = time.time()
-                                            if first_fill_ts is None:
-                                                first_fill_ts = now_ts
-                                            partial_fills.append({
-                                                "ts": now_ts,
-                                                "delta_wei": delta_wei,
-                                                "cumulative_wei": _cv_filled,
-                                                "delta_shares": delta_wei / 10**18,
-                                                "cumulative_shares": _cv_filled / 10**18,
-                                            })
-                                            prev_filled_wei = _cv_filled
-                                            print(
-                                                f"[PREDICT_LIMIT]{_trace} cancel_verify_fill_detected "
-                                                f"hash={order_hash} filled={_cv_filled / 10**18:.4f}"
-                                            )
-                                        break  # terminal — stop retrying cancel
-                                except Exception as _cve:
-                                    print(f"[PREDICT_LIMIT]{_trace} cancel_verify_get_err attempt={_ci+1} err={_cve}")
-                            need_final_get_check = True
+                            _cresult = _predict_cancel_and_verify(
+                                session, order_id, order_hash, quote_post_ts,
+                                reason=cancel_reason, max_attempts=5, verify_interval_sec=1.0,
+                                _trace=_trace,
+                            )
+                            if _cresult["filled_wei"] > prev_filled_wei:
+                                _c_delta = _cresult["filled_wei"] - prev_filled_wei
+                                _c_now = time.time()
+                                if first_fill_ts is None:
+                                    first_fill_ts = _c_now
+                                partial_fills.append({
+                                    "ts": _c_now,
+                                    "delta_wei": _c_delta,
+                                    "cumulative_wei": _cresult["filled_wei"],
+                                    "delta_shares": _c_delta / 10**18,
+                                    "cumulative_shares": _cresult["filled_wei"] / 10**18,
+                                })
+                                prev_filled_wei = _cresult["filled_wei"]
+                                print(
+                                    f"[PREDICT_LIMIT]{_trace} cancel_fill_detected "
+                                    f"reason={cancel_reason} hash={order_hash} "
+                                    f"filled={prev_filled_wei / 10**18:.4f} state={_cresult['state']}"
+                                )
+                            if _cresult["state"] == _CANCEL_STATE_FILLED:
+                                filled = True
+                                need_final_get_check = False
+                            elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
+                                need_final_get_check = True
+                            elif _cresult["state"] == _CANCEL_STATE_FINAL:
+                                need_final_get_check = False
+                            else:  # UNCERTAIN
+                                need_final_get_check = True
                             break
                         # Also refresh max_bid so outbid check below uses latest
                         _live_dyn_fee2 = poly_fee_rate * _pa_live * (1.0 - _pa_live)
                         _live_max2 = (1.0 - _pa_live - _live_dyn_fee2 - safety_buffer_bps / 10_000) / _fee_mult if _fee_mult > 0 else 0.0
                         max_bid = min(_live_max2, _predict_max_bid_price)
+                        # Update armed hedge: pre-compute vwap+worst for instant use after fill
+                        _vw_arm = _vwap_and_worst_from_poly_book(_pb_live, float(leg.shares))
+                        if _vw_arm:
+                            _armed_vwap, _armed_worst = _vw_arm
+                            _armed_ts = time.time()
                 except Exception:
                     pass  # non-fatal: keep order open on API error
 
@@ -3976,6 +4146,13 @@ def _place_predict_limit_buy(
                         break
                     continue  # skip sleep, immediately poll new order
 
+            # ── WS tx_submitted: flag hedge pre-arm (doesn't break loop — fill not yet confirmed) ──
+            if not _ws_early_tx_sub and _predict_ws_had_tx_submitted(
+                order_id, order_hash, not_before_ts=quote_post_ts
+            ):
+                _ws_early_tx_sub = True
+                print(f"[PREDICT_LIMIT]{_trace} ws_tx_submitted hash={order_hash} — pre-arming hedge")
+
             _poll_prev = _bsc_head_gen_snapshot()
             # Cap wait at 0.1s so the book check loop (above) runs every ~0.1s.
             _poll_new = _bsc_wait_new_head_or_timeout(_poll_prev, min(0.1, max(0.05, poll_interval_sec)))
@@ -4024,13 +4201,16 @@ def _place_predict_limit_buy(
         _first_cancel_sent_ts = time.time()
 
     # ── WS / reconcile pre-check before 60s ghost_fill_watch ──────────────────
-    # orderTransactionSubmitted = off-chain match submitted to BSC → treat as in-flight fill.
-    # If WS saw tx_submitted → let ghost_fill_watch run (it'll confirm via BSC/REST).
-    # If no WS signal → run _predict_reconcile_watcher to check practically_final.
-    #   practically_final → skip the full 60s ghost_fill_watch (cancel is done, no fill).
-    #   tx_submitted during reconcile window → mark in-flight, fall through to ghost_fill_watch.
+    # Cancel is a state machine, not an action. After all cancel paths above, we enter
+    # one of: PRACTICALLY_FINAL_CANCELLED, TX_SUBMITTED_RISK, FILLED, UNCERTAIN.
+    #
+    # The inline cancel paths (outbid, no_edge, max_quote_age) and cleanup all return a
+    # _cancel_state/_cleanup_state. If any produced TX_SUBMITTED_RISK, force WS risk flag.
+    # If PRACTICALLY_FINAL from cancel verify → no reconcile needed (already verified).
+    # Remaining cases: run reconcile (12s) to confirm via activity/matches; skip ghost_fill_watch
+    # if reconcile concludes practically_final. TX_SUBMITTED_RISK → skip reconcile, run ghost.
     _ws_pre_cancel_ts = _first_cancel_sent_ts or time.time()
-    _ws_all_order_ids = [order_id] + [None]  # extend if we track all replaced order IDs
+    _ws_all_order_ids = [order_id] + [None]
     _ws_all_hashes = ([order_hash] if order_hash else []) + replaced_order_hashes
     _ws_tx_sub_pre = any(
         _predict_ws_had_tx_submitted(_oid, _oh, not_before_ts=quote_post_ts)
@@ -4042,12 +4222,17 @@ def _place_predict_limit_buy(
         for _oid in _ws_all_order_ids
         for _oh in (_ws_all_hashes or [None])
     )
+    # Cancel-state WS risk: any cancel path returning TX_SUBMITTED_RISK forces ghost_fill_watch.
+    # (The cancel_and_verify helper already checked WS before returning, so this is belt+suspenders.)
+    if _cleanup_state == _CANCEL_STATE_TX_RISK:
+        _ws_tx_sub_pre = True
     _reconcile_result: dict[str, Any] = {}
     if (order_hash and need_final_get_check and not filled
             and not _ws_tx_sub_pre and not _ws_tx_ok_pre
             and order_id and _first_cancel_sent_ts is not None):
-        # No WS risk signal — check if cancel is practically final via activity + matches.
-        # This can save 50+ seconds of unnecessary ghost_fill_watch polling.
+        # No WS risk, need_final_get_check still True → run reconcile (activity + matches).
+        # If cancel_verify already confirmed PRACTICALLY_FINAL, need_final_get_check would be
+        # False here, so we skip reconcile entirely (terminal already confirmed).
         _recon_quiet = float(os.environ.get("PREDICT_RECONCILE_QUIET_SEC", "6") or "6")
         _recon_window = float(os.environ.get("PREDICT_RECONCILE_WINDOW_SEC", "12") or "12")
         _reconcile_result = _predict_reconcile_watcher(
@@ -4203,6 +4388,18 @@ def _place_predict_limit_buy(
     if not filled and prev_filled_wei > 0:
         filled = True  # partial fill → still hedge what we got
 
+    # Fast API confirm: if filled via BSC ws_head but API not yet confirmed → poll once.
+    # If API confirms FILLED → _api_confirmed_filled=True → skip cancel + 5s post-cancel sweep.
+    # Cost: ~100ms; saves: 100-300ms cancel + up to 5s sweep.
+    if filled and order_hash and (last_get is None or not _predict_resp_is_filled(last_get)):
+        try:
+            _fc_get = _predict_get_order_by_hash(session, order_hash)
+            if _predict_resp_is_filled(_fc_get):
+                last_get = _fc_get
+                print(f"[PREDICT_LIMIT]{_trace} fast_api_confirm_filled hash={order_hash}")
+        except Exception:
+            pass
+
     # Detect if the order is API-confirmed fully filled — in that case we skip cancel and
     # post-cancel sweep entirely to reduce predict_fill_to_poly_submit_ms by ~800ms.
     # cancel() on a FILLED order is a no-op on-chain; the poll would also immediately break.
@@ -4212,21 +4409,62 @@ def _place_predict_limit_buy(
         and _predict_resp_is_filled(last_get)
     )
 
-    # ── Cleanup: cancel unfilled remainder ──
+    # ── Cleanup: cancel + verify (strict mode) ──────────────────────────────
+    # Cleanup is not a "send and forget" — it's a state machine phase.
+    # strict=True: 0.5× verify interval, same max_attempts (more aggressive initial scan).
+    # PRACTICALLY_FINAL → skip post-cancel sweep (already confirmed terminal, no fill).
+    # TX_SUBMITTED_RISK → force need_final_get_check=True (ghost_fill_watch will run).
+    # FILLED → set filled flag; fill was captured during verify loop.
     remove_resp: dict[str, Any] | None = None
+    _cleanup_state: str = _CANCEL_STATE_UNCERTAIN
     if order_id and not _api_confirmed_filled:
-        try:
-            # Skip cancel if API already confirmed FILLED — saves ~200–300ms round-trip
-            remove_resp = _predict_remove_orders(session, [order_id])
-        except Exception as _re:
-            remove_resp = {"success": False, "error": str(_re)}
+        if _first_cancel_sent_ts is None:
+            _first_cancel_sent_ts = time.time()
+        _cleanup_result = _predict_cancel_and_verify(
+            session, order_id, order_hash, quote_post_ts,
+            reason="cleanup_cancel", max_attempts=5, verify_interval_sec=1.0,
+            strict=True,  # 0.5× intervals: tighter scan since cancel comes after deadline
+            _trace=_trace,
+        )
+        _cleanup_state = _cleanup_result["state"]
+        remove_resp = {
+            "state": _cleanup_state,
+            "offbook_cancelled": _cleanup_result["offbook_cancelled"],
+            "cancel_attempts": _cleanup_result["attempts"],
+            "filled_wei": _cleanup_result["filled_wei"],
+        }
+        if _cleanup_result["filled_wei"] > prev_filled_wei:
+            _c_delta = _cleanup_result["filled_wei"] - prev_filled_wei
+            _c_now = time.time()
+            if first_fill_ts is None:
+                first_fill_ts = _c_now
+            partial_fills.append({
+                "ts": _c_now,
+                "delta_wei": _c_delta,
+                "cumulative_wei": _cleanup_result["filled_wei"],
+                "delta_shares": _c_delta / 10**18,
+                "cumulative_shares": _cleanup_result["filled_wei"] / 10**18,
+            })
+            prev_filled_wei = _cleanup_result["filled_wei"]
+            print(
+                f"[PREDICT_LIMIT]{_trace} cleanup_fill_detected "
+                f"hash={order_hash} filled={prev_filled_wei / 10**18:.4f} state={_cleanup_state}"
+            )
+        if _cleanup_result["state"] == _CANCEL_STATE_FILLED:
+            filled = True
+        elif _cleanup_result["state"] == _CANCEL_STATE_TX_RISK:
+            need_final_get_check = True  # force ghost_fill_watch
+        elif _cleanup_result["state"] == _CANCEL_STATE_FINAL:
+            if not filled:
+                need_final_get_check = False  # confirmed terminal, skip post-cancel sweep
+        # UNCERTAIN → leave need_final_get_check as-is (will run reconcile/ghost_fill_watch)
 
     # ── Post-cancel fill sweep ──
-    # BSC block confirmation lag: fills can land AFTER the cancel API call returns.
-    # Poll until terminal state to capture ALL fills and size the hedge correctly.
-    # Without this, partially-filled orders that cancel slowly leave unhedged positions.
-    # Skip entirely when the API has already confirmed FILLED — saves 500ms+ (sleep) + HTTP.
-    if order_hash and not _api_confirmed_filled:
+    # BSC block confirmation lag: fills can land AFTER cleanup cancel verify completes.
+    # Skip when already confirmed PRACTICALLY_FINAL (cancel+verify loop already confirmed
+    # terminal, no fill present) or when API has confirmed FILLED (no cancel needed).
+    _skip_postcancel = _api_confirmed_filled or _cleanup_state == _CANCEL_STATE_FINAL
+    if order_hash and not _skip_postcancel:
         _PC_MAX_SEC = float(os.environ.get("PREDICT_POSTCANCEL_SWEEP_SEC", "5.0") or "5.0")
         _PC_POLL_SEC = 0.5
         _pc_deadline = time.time() + _PC_MAX_SEC
@@ -4317,6 +4555,13 @@ def _place_predict_limit_buy(
         "total_filled_wei": total_filled_wei,
         "total_filled_shares": total_filled_wei / 10**18 if total_filled_wei > 0 else 0.0,
         "pre_pos_bal": _pre_pos_bal,
+        "armed_hedge": {
+            "vwap": _armed_vwap,
+            "worst": _armed_worst,
+            "ts": _armed_ts,
+            "qty": float(leg.shares),
+        } if _armed_vwap is not None and _armed_worst is not None else None,
+        "ws_early_tx_sub": _ws_early_tx_sub,
         "quote_meta": {
             "quote_age_ms": round((time.time() - quote_post_ts) * 1000.0, 1),
             "quote_total_age_ms": round(quote_total_age_ms, 1),
@@ -5376,108 +5621,95 @@ def opportunity(opp: Opportunity) -> dict:
             return {"status": "skipped", "reason": "poly_min_order_usd_static"}
 
         # ────────────────────────────────────────────────────
-        # LIVE POLY NET-EDGE CHECK — отключён: poly book пулится
-        # коллектором каждые ~0.1с, live-запрос только замедляет
-        # размещение ордера на Predict (~100–200ms лишних).
-        # Проверки net-edge и hedge-price работают на данных из Analyzer.
+        # LIVE POLY NET-EDGE PRE-CHECK — uses cached book (sub-ms),
+        # no HTTP call. Guards against entering a Predict limit order
+        # when Poly has already moved against us since the Analyzer quote.
+        # Controlled by BA_PRECHECK_ENABLED env var (default 1 = enabled).
         # ────────────────────────────────────────────────────
-        # _pre_fee_rate = float(opp.poly_fee_rate or 0.072)
-        # _pre_pred_fee_bps = float(opp.predict_fee_bps or 0)
-        # _pre_safety_bps = float(opp.safety_buffer_bps or 0)
-        # try:
-        #     live_book = _polymarket_book(str(poly_leg.token_id))
-        #     _vwap_worst_pre = _vwap_and_worst_from_poly_book(live_book, float(opp.shares))
-        #     if _vwap_worst_pre is None:
-        #         _poly_min_pre2 = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
-        #         row["skipped"] = True
-        #         row["skip_reason"] = {"code": "poly_insufficient_depth", "shares": float(opp.shares)}
-        #         row["summary"]["status"] = "skipped"
-        #         row["summary"]["reason_code"] = "poly_insufficient_depth"
-        #         row["summary"]["reason"] = row["skip_reason"]
-        #         print(f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_insufficient_depth shares={opp.shares:.4f}")
-        #         if _market_id_int is not None:
-        #             with _predict_market_in_flight_lock:
-        #                 _predict_market_in_flight.discard(_market_id_int)
-        #         _append_jsonl(trades_file, row)
-        #         return {"status": "skipped", "reason": "poly_insufficient_depth"}
-        #     _live_vwap_pre = _vwap_worst_pre[0]
-        #     if _live_vwap_pre is not None:
-        #         _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
-        #         _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
-        #         _poly_eff_pre = _live_vwap_pre + _live_fee_pre
-        #         _live_net_edge_pre = 1.0 - _pred_eff_pre - _poly_eff_pre - _pre_safety_bps / 10_000
-        #         row["live_poly_precheck"] = {
-        #             "stale_poly_ask": float(poly_leg.ask),
-        #             "live_poly_vwap": round(_live_vwap_pre, 6),
-        #             "live_poly_fee": round(_live_fee_pre, 6),
-        #             "pred_ask": float(pred_leg.ask),
-        #             "live_net_edge": round(_live_net_edge_pre, 6),
-        #             "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
-        #         }
-        #         print(
-        #             f"[TRADER]{_t} poly_live_precheck "
-        #             f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
-        #             f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
-        #             f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
-        #         )
-        #         if _live_net_edge_pre <= 0:
-        #             row["skipped"] = True
-        #             row["skip_reason"] = {
-        #                 "code": "poly_live_no_edge",
-        #                 "stale_poly_ask": float(poly_leg.ask),
-        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
-        #                 "live_net_edge": round(_live_net_edge_pre, 6),
-        #             }
-        #             row["summary"]["status"] = "skipped"
-        #             row["summary"]["reason_code"] = "poly_live_no_edge"
-        #             row["summary"]["reason"] = row["skip_reason"]
-        #             print(
-        #                 f"[TRADER]{_t}[SKIP] "
-        #                 f"label={opp.label} reason=poly_live_no_edge "
-        #                 f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
-        #             )
-        #             _append_jsonl(trades_file, row)
-        #             return {"status": "skipped", "reason": "poly_live_no_edge"}
-        #         _pre_poly_max_hedge = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0.58") or "0.58")
-        #         if _live_vwap_pre >= _pre_poly_max_hedge:
-        #             row["skipped"] = True
-        #             row["skip_reason"] = {
-        #                 "code": "poly_live_hedge_price_cap",
-        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
-        #                 "poly_max_hedge_price": _pre_poly_max_hedge,
-        #             }
-        #             row["summary"]["status"] = "skipped"
-        #             row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
-        #             row["summary"]["reason"] = row["skip_reason"]
-        #             print(
-        #                 f"[TRADER]{_t}[SKIP] "
-        #                 f"label={opp.label} reason=poly_live_hedge_price_cap "
-        #                 f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
-        #             )
-        #             _append_jsonl(trades_file, row)
-        #             return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
-        #         _poly_min_pre = float(os.environ.get("POLY_MIN_ORDER_USD", "1.0") or "1.0")
-        #         _hedge_cost_full = float(opp.shares) * _live_vwap_pre
-        #         if _hedge_cost_full < _poly_min_pre:
-        #             row["skipped"] = True
-        #             row["skip_reason"] = {
-        #                 "code": "poly_min_order_usd",
-        #                 "live_poly_vwap": round(_live_vwap_pre, 6),
-        #                 "hedge_cost_usd": round(_hedge_cost_full, 4),
-        #                 "poly_min_order_usd": _poly_min_pre,
-        #             }
-        #             row["summary"]["status"] = "skipped"
-        #             row["summary"]["reason_code"] = "poly_min_order_usd"
-        #             row["summary"]["reason"] = row["skip_reason"]
-        #             print(
-        #                 "[TRADER][SKIP] "
-        #                 f"label={opp.label} reason=poly_min_order_usd "
-        #                 f"hedge_cost=${_hedge_cost_full:.2f} min=${_poly_min_pre}"
-        #             )
-        #             _append_jsonl(trades_file, row)
-        #             return {"status": "skipped", "reason": "poly_min_order_usd"}
-        # except Exception as _e_poly_check:
-        #     print(f"[TRADER]{_t} poly_live_precheck_failed (non-fatal): {_e_poly_check}")
+        _precheck_enabled = int(os.environ.get("BA_PRECHECK_ENABLED", "1") or "1")
+        if _precheck_enabled:
+            _pre_fee_rate = float(opp.poly_fee_rate or 0.072)
+            _pre_pred_fee_bps = float(opp.predict_fee_bps or 0)
+            _pre_safety_bps = float(opp.safety_buffer_bps or 0)
+            try:
+                live_book = _polymarket_book_cached(str(poly_leg.token_id))
+                _vwap_worst_pre = _vwap_and_worst_from_poly_book(live_book, float(opp.shares))
+                if _vwap_worst_pre is None:
+                    row["skipped"] = True
+                    row["skip_reason"] = {"code": "poly_insufficient_depth", "shares": float(opp.shares)}
+                    row["summary"]["status"] = "skipped"
+                    row["summary"]["reason_code"] = "poly_insufficient_depth"
+                    row["summary"]["reason"] = row["skip_reason"]
+                    print(f"[TRADER]{_t}[SKIP] label={opp.label} reason=poly_insufficient_depth shares={opp.shares:.4f}")
+                    if _market_id_int is not None:
+                        with _predict_market_in_flight_lock:
+                            _predict_market_in_flight.discard(_market_id_int)
+                    _append_jsonl(trades_file, row)
+                    return {"status": "skipped", "reason": "poly_insufficient_depth"}
+                _live_vwap_pre = _vwap_worst_pre[0]
+                if _live_vwap_pre is not None:
+                    _live_fee_pre = _pre_fee_rate * _live_vwap_pre * (1.0 - _live_vwap_pre)
+                    _pred_eff_pre = float(pred_leg.ask) * (1.0 + _pre_pred_fee_bps / 10_000)
+                    _poly_eff_pre = _live_vwap_pre + _live_fee_pre
+                    _live_net_edge_pre = 1.0 - _pred_eff_pre - _poly_eff_pre - _pre_safety_bps / 10_000
+                    row["live_poly_precheck"] = {
+                        "stale_poly_ask": float(poly_leg.ask),
+                        "live_poly_vwap": round(_live_vwap_pre, 6),
+                        "live_poly_fee": round(_live_fee_pre, 6),
+                        "pred_ask": float(pred_leg.ask),
+                        "live_net_edge": round(_live_net_edge_pre, 6),
+                        "live_net_edge_bps": round(_live_net_edge_pre * 10_000, 1),
+                    }
+                    print(
+                        f"[TRADER]{_t} poly_precheck_cached "
+                        f"stale={poly_leg.ask} live_vwap={_live_vwap_pre:.4f} "
+                        f"live_fee={_live_fee_pre:.4f} pred={pred_leg.ask} "
+                        f"net_edge={_live_net_edge_pre:.4f} ({_live_net_edge_pre * 10_000:.1f}bps)"
+                    )
+                    if _live_net_edge_pre <= 0:
+                        row["skipped"] = True
+                        row["skip_reason"] = {
+                            "code": "poly_live_no_edge",
+                            "stale_poly_ask": float(poly_leg.ask),
+                            "live_poly_vwap": round(_live_vwap_pre, 6),
+                            "live_net_edge": round(_live_net_edge_pre, 6),
+                        }
+                        row["summary"]["status"] = "skipped"
+                        row["summary"]["reason_code"] = "poly_live_no_edge"
+                        row["summary"]["reason"] = row["skip_reason"]
+                        print(
+                            f"[TRADER]{_t}[SKIP] "
+                            f"label={opp.label} reason=poly_live_no_edge "
+                            f"live_vwap={_live_vwap_pre:.4f} net_edge={_live_net_edge_pre:.4f}"
+                        )
+                        if _market_id_int is not None:
+                            with _predict_market_in_flight_lock:
+                                _predict_market_in_flight.discard(_market_id_int)
+                        _append_jsonl(trades_file, row)
+                        return {"status": "skipped", "reason": "poly_live_no_edge"}
+                    _pre_poly_max_hedge = float(os.environ.get("POLY_MAX_HEDGE_PRICE", "0") or "0")
+                    if _pre_poly_max_hedge > 0 and _live_vwap_pre >= _pre_poly_max_hedge:
+                        row["skipped"] = True
+                        row["skip_reason"] = {
+                            "code": "poly_live_hedge_price_cap",
+                            "live_poly_vwap": round(_live_vwap_pre, 6),
+                            "poly_max_hedge_price": _pre_poly_max_hedge,
+                        }
+                        row["summary"]["status"] = "skipped"
+                        row["summary"]["reason_code"] = "poly_live_hedge_price_cap"
+                        row["summary"]["reason"] = row["skip_reason"]
+                        print(
+                            f"[TRADER]{_t}[SKIP] "
+                            f"label={opp.label} reason=poly_live_hedge_price_cap "
+                            f"live_vwap={_live_vwap_pre:.4f} cap={_pre_poly_max_hedge:.4f}"
+                        )
+                        if _market_id_int is not None:
+                            with _predict_market_in_flight_lock:
+                                _predict_market_in_flight.discard(_market_id_int)
+                        _append_jsonl(trades_file, row)
+                        return {"status": "skipped", "reason": "poly_live_hedge_price_cap"}
+            except Exception as _e_poly_check:
+                print(f"[TRADER]{_t} poly_precheck_cached_failed (non-fatal): {_e_poly_check}")
 
         # ════════════════════════════════════════════════════════════════
         # ПАРАЛЛЕЛЬНАЯ отправка обеих ног через ThreadPoolExecutor.
@@ -5785,20 +6017,42 @@ def opportunity(opp: Opportunity) -> dict:
             _live_worst_ba: float | None = None
             _live_poly_fee_ba: float | None = None
 
-            for _lbc_attempt in range(2):
-                try:
-                    _live_book_ba = _polymarket_book_cached(str(poly_leg.token_id))
-                    _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
-                    if _vwap_worst:
-                        _live_vwap_ba, _live_worst_ba = _vwap_worst
-                    break
-                except Exception as _e_ba_live:
-                    print(
-                        f"[TRADER] bid_ask_hedge_live_check attempt={_lbc_attempt + 1}/2 "
-                        f"failed: {_e_ba_live}"
-                    )
-                    if _lbc_attempt == 0:
-                        time.sleep(1.0)
+            # Extract armed hedge pre-computed during Predict poll loop
+            _ba_armed_hedge = _ba_pred_resp.get("armed_hedge")
+            _ba_ws_early_tx_sub = bool(_ba_pred_resp.get("ws_early_tx_sub", False))
+            _ba_armed_max_age = float(os.environ.get("BA_ARMED_HEDGE_MAX_AGE_SEC", "2.0") or "2.0")
+
+            _ba_armed_used = False
+            if (
+                _ba_armed_hedge
+                and _ba_armed_hedge.get("vwap") is not None
+                and _ba_armed_hedge.get("worst") is not None
+                and (time.time() - float(_ba_armed_hedge.get("ts", 0))) < _ba_armed_max_age
+            ):
+                _live_vwap_ba = float(_ba_armed_hedge["vwap"])
+                _live_worst_ba = float(_ba_armed_hedge["worst"])
+                _ba_armed_used = True
+                print(
+                    f"[TRADER]{_t}[HEDGE_ARMED] pre-computed book: "
+                    f"vwap={_live_vwap_ba:.4f} worst={_live_worst_ba:.4f} "
+                    f"age={(time.time() - float(_ba_armed_hedge['ts'])) * 1000:.0f}ms"
+                )
+
+            if not _ba_armed_used:
+                for _lbc_attempt in range(2):
+                    try:
+                        _live_book_ba = _polymarket_book_cached(str(poly_leg.token_id))
+                        _vwap_worst = _vwap_and_worst_from_poly_book(_live_book_ba, _ba_hedge_qty)
+                        if _vwap_worst:
+                            _live_vwap_ba, _live_worst_ba = _vwap_worst
+                        break
+                    except Exception as _e_ba_live:
+                        print(
+                            f"[TRADER] bid_ask_hedge_live_check attempt={_lbc_attempt + 1}/2 "
+                            f"failed: {_e_ba_live}"
+                        )
+                        if _lbc_attempt == 0:
+                            time.sleep(1.0)
 
             if _live_vwap_ba is None:
                 # Cannot verify net edge without live Poly book.
@@ -6625,6 +6879,20 @@ def opportunity(opp: Opportunity) -> dict:
             import math as _math
             _ba_worst_price = _live_worst_ba if _live_worst_ba else _ba_hedge_vwap * 1.02
             _ba_lp_mult = float(os.environ.get("POLY_BA_HEDGE_LIMIT_MULT", "1.02") or "1.02")
+            _poly_ba_gtc = os.environ.get("POLY_BA_HEDGE_GTC_SEC", "").strip()
+            _ba_gtc_to = float(_poly_ba_gtc) if _poly_ba_gtc else 25.0
+            # Fast hedge mode: use a tighter limit-price multiplier and shorter GTC timeout
+            # when orderTransactionSubmitted was seen during the Predict wait. This means
+            # the fill is already on BSC → Poly hedge can afford to be more aggressive
+            # (less time to expiry, narrower limit needed to guarantee execution).
+            _ba_fast_hedge = _ba_ws_early_tx_sub
+            if _ba_fast_hedge:
+                _ba_lp_mult = float(os.environ.get("BA_FAST_HEDGE_LIMIT_MULT", "1.03") or "1.03")
+                _ba_gtc_to = float(os.environ.get("BA_FAST_HEDGE_GTC_SEC", "12.0") or "12.0")
+                print(
+                    f"[TRADER]{_t}[HEDGE_FAST] ws_tx_sub mode: "
+                    f"lp_mult={_ba_lp_mult} gtc_to={_ba_gtc_to}s"
+                )
             _ba_limit_price = min(
                 0.99, _math.ceil(_ba_worst_price * _ba_lp_mult * 1000) / 1000
             )
@@ -6643,8 +6911,6 @@ def opportunity(opp: Opportunity) -> dict:
             _poly_api_key = os.environ.get("POLY_API_KEY", "").strip()
             _poly_secret = os.environ.get("POLY_SECRET", "").strip()
             _poly_passphrase = os.environ.get("POLY_PASSPHRASE", "").strip()
-            _poly_ba_gtc = os.environ.get("POLY_BA_HEDGE_GTC_SEC", "").strip()
-            _ba_gtc_to = float(_poly_ba_gtc) if _poly_ba_gtc else 25.0
             # Retry poly hedge on network errors — predict is already filled so hedge is critical
             _POLY_HEDGE_RETRIES = 3
             for _poly_attempt in range(_POLY_HEDGE_RETRIES):
