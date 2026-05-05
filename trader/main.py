@@ -2260,6 +2260,8 @@ def _predict_cancel_and_verify_inner(
 ) -> dict[str, Any]:
     """Inner (unwrapped) implementation — called only from _predict_cancel_and_verify."""
     _vi = verify_interval_sec * 0.5 if strict else verify_interval_sec
+    offbook_cancelled = False
+    filled_wei = 0
 
     def _ws_risk() -> bool:
         return _predict_ws_had_tx_submitted(order_id, order_hash, not_before_ts=quote_post_ts)
