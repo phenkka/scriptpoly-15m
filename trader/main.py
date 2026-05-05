@@ -6274,18 +6274,35 @@ def opportunity(opp: Opportunity) -> dict:
                             )
                         else:
                             _ba_no_edge_chose_hedge = False
+                    # Pair cost guard: if pred_eff + poly_eff > BA_MAX_PAIR_COST, override
+                    # HEDGE_POLY_FIRST → UNWIND_FIRST regardless of L_hedge vs L_unwind.
+                    # Prevents locking in catastrophic pair cost when BTC moves hard
+                    # (e.g. 0.29 pred + 0.90 poly = 1.19 → guaranteed -$0.90/sh loss).
+                    _ba_max_pair_cost = float(os.environ.get("BA_MAX_PAIR_COST", "1.05") or "1.05")
+                    _ba_pair_cost_gross = _ne_pred_eff_loss + _ne_poly_eff_loss
+                    if _ba_no_edge_chose_hedge and _ba_pair_cost_gross > _ba_max_pair_cost:
+                        _ba_no_edge_chose_hedge = False
+                        print(
+                            f"[TRADER] no_edge_pair_cost_guard label={opp.label} "
+                            f"pair_cost={_ba_pair_cost_gross:.4f} max={_ba_max_pair_cost:.4f} "
+                            f"pred_eff={_ne_pred_eff_loss:.4f} poly_eff={_ne_poly_eff_loss:.4f} "
+                            f"→ overriding HEDGE_POLY_FIRST to UNWIND_FIRST"
+                        )
                     row["no_edge_loss_pick"] = {
                         "L_hedge_usd": round(_L_hedge_usd, 6),
                         "L_unwind_usd": round(_L_unwind_usd, 6),
                         "P_unwind_est": round(_Puw_est, 6),
                         "pred_eff": round(_ne_pred_eff_loss, 6),
                         "poly_eff": round(_ne_poly_eff_loss, 6),
+                        "pair_cost_gross": round(_ba_pair_cost_gross, 6),
+                        "max_pair_cost": _ba_max_pair_cost,
                         "hedge_size_feasible": _hedge_size_feasible,
                         "chose_hedge_first": _ba_no_edge_chose_hedge,
                     }
                     print(
                         f"[TRADER] no_edge_loss_cmp label={opp.label} "
                         f"L_hedge=${_L_hedge_usd:.4f} L_unwind=${_L_unwind_usd:.4f} "
+                        f"pair_cost={_ba_pair_cost_gross:.4f} "
                         f"tie_pref={_ne_tie} → {'HEDGE_POLY_FIRST' if _ba_no_edge_chose_hedge else 'UNWIND_FIRST'}"
                     )
 
@@ -7288,21 +7305,35 @@ def opportunity(opp: Opportunity) -> dict:
                         _mm_remaining_usd = (_ba_hedge_qty - _ba_mismatch_shares) * _ba_pred_price
                         _mm_sell_all = _mm_remaining_usd < _mm_min_usd
                         _mm_sell_qty = _ba_hedge_qty if _mm_sell_all else _ba_mismatch_shares
-                        try:
-                            _ba_mismatch_sell_result = _place_predict_limit_sell(
-                                pred_leg,
-                                sell_qty=_mm_sell_qty,
-                                sell_price=_mm_unwind_price,
-                                fill_timeout_sec=20.0,
-                                replace_interval_sec=1.0,
-                                fast_exit=True,
-                                trace_id=trace_id,
+                        # Dust guard: if mismatch notional (entry-price proxy) < threshold,
+                        # skip predict sell on dying market — 6 replacements for $0.07 revenue
+                        # is not worth blocking the bot for 25+ seconds.
+                        # Only applies to non-sell-all cases; sell_all path always executes.
+                        _mm_dust_max_usd = float(os.environ.get("MISMATCH_DUST_MAX_USD", "0.25") or "0.25")
+                        _mm_dust_value = _ba_mismatch_shares * _ba_actual_pred_bid
+                        if not _mm_sell_all and _mm_dust_value < _mm_dust_max_usd:
+                            print(
+                                f"[TRADER][MISMATCH_DUST_SKIP] label={opp.label} "
+                                f"excess={_ba_mismatch_shares:.4f} value=${_mm_dust_value:.4f} "
+                                f"< ${_mm_dust_max_usd:.2f} → accept as dust, skip predict sell"
                             )
-                            _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
-                            if _ba_mismatch_sell_result.get("positions_seen_sec") is not None:
-                                row["timing"]["positions_seen_sec"] = _ba_mismatch_sell_result["positions_seen_sec"]
-                        except Exception as _mm_e:
-                            _ba_mismatch_sell_err = str(_mm_e)
+                            _mm_action = "dust_skip"
+                        else:
+                            try:
+                                _ba_mismatch_sell_result = _place_predict_limit_sell(
+                                    pred_leg,
+                                    sell_qty=_mm_sell_qty,
+                                    sell_price=_mm_unwind_price,
+                                    fill_timeout_sec=20.0,
+                                    replace_interval_sec=1.0,
+                                    fast_exit=True,
+                                    trace_id=trace_id,
+                                )
+                                _ba_mismatch_corrected = _ba_mismatch_sell_result.get("filled", False)
+                                if _ba_mismatch_sell_result.get("positions_seen_sec") is not None:
+                                    row["timing"]["positions_seen_sec"] = _ba_mismatch_sell_result["positions_seen_sec"]
+                            except Exception as _mm_e:
+                                _ba_mismatch_sell_err = str(_mm_e)
 
                         # If we sold ALL Predict shares, also sell the Poly position
                         _mm_poly_sell_qty = 0.0
