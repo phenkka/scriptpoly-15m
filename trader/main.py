@@ -2184,6 +2184,7 @@ _CANCEL_STATE_FINAL     = "PRACTICALLY_FINAL_CANCELLED"  # terminal + no fill + 
 _CANCEL_STATE_TX_RISK   = "TX_SUBMITTED_RISK"            # WS saw tx_submitted near cancel
 _CANCEL_STATE_FILLED    = "FILLED"                       # fill confirmed during verify
 _CANCEL_STATE_UNCERTAIN = "UNCERTAIN"                    # retries exhausted, state unknown
+_CANCEL_STATE_UNKNOWN   = "CANCEL_UNKNOWN"               # helper threw exception — fail-closed
 
 
 def _predict_cancel_and_verify(
@@ -2214,10 +2215,51 @@ def _predict_cancel_and_verify(
     Front-scan: attempt 0 polls every 250 ms; subsequent attempts use verify_interval_sec.
     WS tx_submitted is checked before each cancel send AND on every scan cycle — if seen,
     immediately returns TX_SUBMITTED_RISK without further cancel attempts.
+
+    FAIL-CLOSED: any unhandled exception returns CANCEL_UNKNOWN (not UNCERTAIN).
+    Callers treat UNKNOWN the same as TX_SUBMITTED_RISK — force need_final_get_check=True
+    and run full ghost_fill_watch. No optimistic assumptions are made.
     """
+    def _unknown(exc: Exception) -> dict[str, Any]:
+        print(
+            f"[CANCEL]{_trace} reason={reason} CANCEL_UNKNOWN — helper exception: {exc!r} "
+            f"order_id={order_id} hash={order_hash}"
+        )
+        return {
+            "state": _CANCEL_STATE_UNKNOWN,
+            "offbook_cancelled": False,
+            "final_cancelled": False,
+            "filled_wei": 0,
+            "tx_submitted": False,
+            "attempts": 0,
+            "reason": reason,
+            "exception": str(exc),
+        }
+
+    try:
+        return _predict_cancel_and_verify_inner(
+            session, order_id, order_hash, quote_post_ts,
+            reason=reason, max_attempts=max_attempts,
+            verify_interval_sec=verify_interval_sec, strict=strict, _trace=_trace,
+        )
+    except Exception as _outer_exc:
+        return _unknown(_outer_exc)
+
+
+def _predict_cancel_and_verify_inner(
+    session: requests.Session,
+    order_id: str | None,
+    order_hash: str | None,
+    quote_post_ts: float,
+    *,
+    reason: str,
+    max_attempts: int = 5,
+    verify_interval_sec: float = 1.0,
+    strict: bool = False,
+    _trace: str = "",
+) -> dict[str, Any]:
+    """Inner (unwrapped) implementation — called only from _predict_cancel_and_verify."""
     _vi = verify_interval_sec * 0.5 if strict else verify_interval_sec
-    offbook_cancelled = False
-    filled_wei = 0
 
     def _ws_risk() -> bool:
         return _predict_ws_had_tx_submitted(order_id, order_hash, not_before_ts=quote_post_ts)
@@ -3906,6 +3948,8 @@ def _place_predict_limit_buy(
                                 need_final_get_check = False
                             elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
                                 need_final_get_check = True
+                            elif _cresult["state"] == _CANCEL_STATE_UNKNOWN:
+                                need_final_get_check = True  # fail-closed: must watch
                             elif _cresult["state"] == _CANCEL_STATE_FINAL:
                                 need_final_get_check = False
                             else:  # UNCERTAIN
@@ -3995,6 +4039,8 @@ def _place_predict_limit_buy(
                         need_final_get_check = False
                     elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
                         need_final_get_check = True
+                    elif _cresult["state"] == _CANCEL_STATE_UNKNOWN:
+                        need_final_get_check = True  # fail-closed: must watch
                     elif _cresult["state"] == _CANCEL_STATE_FINAL:
                         need_final_get_check = False
                     else:  # UNCERTAIN
@@ -4048,6 +4094,8 @@ def _place_predict_limit_buy(
                                 need_final_get_check = False
                             elif _cresult["state"] == _CANCEL_STATE_TX_RISK:
                                 need_final_get_check = True
+                            elif _cresult["state"] == _CANCEL_STATE_UNKNOWN:
+                                need_final_get_check = True  # fail-closed: must watch
                             elif _cresult["state"] == _CANCEL_STATE_FINAL:
                                 need_final_get_check = False
                             else:  # UNCERTAIN
@@ -4224,9 +4272,9 @@ def _place_predict_limit_buy(
         for _oid in _ws_all_order_ids
         for _oh in (_ws_all_hashes or [None])
     )
-    # Cancel-state WS risk: any cancel path returning TX_SUBMITTED_RISK forces ghost_fill_watch.
-    # (The cancel_and_verify helper already checked WS before returning, so this is belt+suspenders.)
-    if _cleanup_state == _CANCEL_STATE_TX_RISK:
+    # Cancel-state WS risk: any cancel path returning TX_SUBMITTED_RISK or CANCEL_UNKNOWN
+    # forces ghost_fill_watch. UNKNOWN = exception during cancel → treat as worst-case.
+    if _cleanup_state in (_CANCEL_STATE_TX_RISK, _CANCEL_STATE_UNKNOWN):
         _ws_tx_sub_pre = True
     _reconcile_result: dict[str, Any] = {}
     if (order_hash and need_final_get_check and not filled
@@ -4455,6 +4503,8 @@ def _place_predict_limit_buy(
             filled = True
         elif _cleanup_result["state"] == _CANCEL_STATE_TX_RISK:
             need_final_get_check = True  # force ghost_fill_watch
+        elif _cleanup_result["state"] == _CANCEL_STATE_UNKNOWN:
+            need_final_get_check = True  # fail-closed: exception → must watch
         elif _cleanup_result["state"] == _CANCEL_STATE_FINAL:
             if not filled:
                 need_final_get_check = False  # confirmed terminal, skip post-cancel sweep
@@ -6279,7 +6329,7 @@ def opportunity(opp: Opportunity) -> dict:
                     # HEDGE_POLY_FIRST → UNWIND_FIRST regardless of L_hedge vs L_unwind.
                     # Prevents locking in catastrophic pair cost when BTC moves hard
                     # (e.g. 0.29 pred + 0.90 poly = 1.19 → guaranteed -$0.90/sh loss).
-                    _ba_max_pair_cost = float(os.environ.get("BA_MAX_PAIR_COST", "1.05") or "1.05")
+                    _ba_max_pair_cost = float(os.environ.get("BA_MAX_PAIR_COST", "1.03") or "1.03")
                     _ba_pair_cost_gross = _ne_pred_eff_loss + _ne_poly_eff_loss
                     if _ba_no_edge_chose_hedge and _ba_pair_cost_gross > _ba_max_pair_cost:
                         _ba_no_edge_chose_hedge = False
